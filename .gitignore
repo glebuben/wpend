@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 animations/
+
+# Мусор от переноса веток (файлы живут в git на refactor/architecture)
+_to_delete/
+.pytest_cache/
+*.egg-info/
+.venv/

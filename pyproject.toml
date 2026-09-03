@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wpend"
+version = "0.1.0"
+description = "Минимальная лаборатория динамики и управления: система, датчик, оцениватель, регулятор, интегратор"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Gleb" }]
+
+# Ядру нужен только numpy. Это не аскеза, а инвариант: как только для запуска
+# rollout понадобится что-то ещё, значит в ядро попало лишнее.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["wpend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
