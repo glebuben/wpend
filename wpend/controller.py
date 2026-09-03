@@ -30,7 +30,7 @@ class ZeroController(Controller):
         self.n_action = int(n_action)
 
     def act(self, t: float, x_hat: np.ndarray) -> np.ndarray:
-        return np.zeros(self.n_action)
+        return np.zeros(np.shape(x_hat)[:-1] + (self.n_action,))
 
 
 class ConstantController(Controller):
@@ -42,7 +42,8 @@ class ConstantController(Controller):
         self.u = np.atleast_1d(np.asarray(u, dtype=float))
 
     def act(self, t: float, x_hat: np.ndarray) -> np.ndarray:
-        return self.u.copy()
+        shape = np.shape(x_hat)[:-1] + (self.u.shape[-1],)
+        return np.broadcast_to(self.u, shape).copy()
 
 
 class LinearFeedbackController(Controller):
@@ -67,4 +68,6 @@ class LinearFeedbackController(Controller):
     def act(self, t: float, x_hat: np.ndarray) -> np.ndarray:
         x_hat = np.asarray(x_hat, dtype=float)
         error = x_hat if self.x_ref is None else x_hat - self.x_ref
-        return -self.K @ error
+        # error @ K.T, а не K @ error: так формула одинаково работает и для
+        # одного состояния (n,) -> (n_u,), и для пачки (M, n) -> (M, n_u).
+        return -error @ self.K.T

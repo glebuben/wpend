@@ -125,11 +125,15 @@ class WheeledPendulum(System):
     # --- динамика ----------------------------------------------------------
 
     def f(self, t, x, u):
-        theta, _phi, dtheta, _dphi = x
+        # Индексы x[..., i], а не распаковка: так одна и та же формула считает
+        # и одно состояние (4,), и пачку (M, 4) -- см. System.f.
+        theta = x[..., 0]
+        dtheta = x[..., 2]
+        dphi = x[..., 3]
         p = self.p
         s, c = np.sin(theta), np.cos(theta)
         Delta = p.alpha * p.gamma - p.beta ** 2 * c ** 2
-        torque = u[0]
+        torque = u[..., 0]
 
         ddtheta = ((p.gamma + p.beta * c) * torque
                    + p.gamma * p.D * s
@@ -139,7 +143,7 @@ class WheeledPendulum(System):
                  - p.beta * p.D * s * c
                  - (p.alpha + p.beta * c) * torque) / Delta
 
-        return np.array([dtheta, _dphi, ddtheta, ddphi])
+        return np.stack([dtheta, dphi, ddtheta, ddphi], axis=-1)
 
     # --- оракулы для тестов и анализа --------------------------------------
 
@@ -153,7 +157,8 @@ class WheeledPendulum(System):
         состояний.  Для тестов это точный оракул: RK4 обязан сохранять H с
         точностью O(dt^4).
         """
-        theta, _phi, dtheta, _dphi = x
+        x = np.asarray(x, dtype=float)
+        theta, dtheta = x[..., 0], x[..., 2]
         p = self.p
         return (0.5 * self.Delta(theta) * dtheta ** 2
                 - u_const * (p.gamma * theta + p.beta * np.sin(theta))

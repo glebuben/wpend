@@ -21,7 +21,7 @@ from .controller import (
 )
 from .estimator import Estimator, PassthroughEstimator
 from .integrator import EulerIntegrator, Integrator, RK4Integrator
-from .rollout import Trajectory, rollout
+from .rollout import Trajectory, TrajectoryBatch, rollout, rollout_many
 from .sensor import FullStateSensor, GaussianNoiseSensor, Sensor
 from .system import System
 
@@ -40,7 +40,9 @@ __all__ = [
     "EulerIntegrator",
     "RK4Integrator",
     "rollout",
+    "rollout_many",
     "Trajectory",
+    "TrajectoryBatch",
 ]
 
 __version__ = "0.1.0"

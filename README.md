@@ -24,6 +24,19 @@ python -m pytest tests -q
 python examples/balance.py
 ```
 
+## Окно исследователя
+
+```bash
+pip install "wpend[viz]"
+python -m wpend.viz.explorer                  # сетка 21x21 считается заранее
+python -m wpend.viz.explorer --grid 41        # 1681 НУ за ~2 с
+python -m wpend.viz.explorer --no-precompute  # считать клетку по клику
+python -m wpend.viz.explorer --help           # u_max, горизонт, dt, границы карты
+```
+
+Слева карта начальных условий `(theta0, dtheta0)`, справа робот и графики
+`theta(t)`, `u(t)`. Клик по клетке проигрывает её траекторию.
+
 ## Документы
 
 * `ARCHITECTURE.md` — контракт слоёв и правила, которые не обсуждаются.
@@ -36,6 +49,7 @@ python examples/balance.py
 ```
 wpend/            ядро: пять слоёв + rollout
 wpend/models/     конкретные системы: маятник, колёсный маятник
+wpend/viz/        окно pygame и классификация исходов (читает только Trajectory)
 tests/            оракулы: порядок схем, сохранение энергии и первого интеграла
 examples/         запускаемые сценарии
 src/, scripts/    код второго семестра (numpy), достался от master, не трогаем

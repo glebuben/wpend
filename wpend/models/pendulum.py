@@ -70,16 +70,20 @@ class Pendulum(System):
         return (np.array([-self.p.u_max]), np.array([self.p.u_max]))
 
     def f(self, t, x, u):
-        theta, dtheta = x
+        # Индексы x[..., i], а не распаковка: так одна и та же формула считает
+        # и одно состояние (2,), и пачку (M, 2) -- см. System.f.
+        theta = x[..., 0]
+        dtheta = x[..., 1]
         p = self.p
-        ddtheta = (p.m * p.g * p.l * np.sin(theta) - p.c * dtheta + u[0]) / p.I
-        return np.array([dtheta, ddtheta])
+        ddtheta = (p.m * p.g * p.l * np.sin(theta) - p.c * dtheta + u[..., 0]) / p.I
+        return np.stack([dtheta, ddtheta], axis=-1)
 
     # --- оракулы для тестов и анализа ------------------------------------
 
     def energy(self, x) -> float:
         """E = 1/2 I dtheta^2 + m g l cos(theta); сохраняется при u = 0, c = 0."""
-        theta, dtheta = x
+        x = np.asarray(x, dtype=float)
+        theta, dtheta = x[..., 0], x[..., 1]
         p = self.p
         return 0.5 * p.I * dtheta ** 2 + p.m * p.g * p.l * np.cos(theta)
 

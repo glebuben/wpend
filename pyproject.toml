@@ -16,7 +16,9 @@ authors = [{ name = "Gleb" }]
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# Окно исследователя (wpend/viz). Ядро pygame не импортирует.
+viz = ["pygame>=2.5"]
+dev = ["pytest>=8.0", "pygame>=2.5"]
 
 [tool.setuptools.packages.find]
 include = ["wpend*"]
@@ -24,3 +26,4 @@ include = ["wpend*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["slow: запуск окна и прогоны сетки"]
