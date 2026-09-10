@@ -7,3 +7,14 @@ _to_delete/
 .pytest_cache/
 *.egg-info/
 .venv/
+ARCHITECTURE.MD
+CLAUDE.MD
+PROPOSALS.MD
+tasks/
+Claude outputs/
+docs/
+exercises/
+learning/
+figures/
+tests/
+concept audit.md

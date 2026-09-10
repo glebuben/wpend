@@ -18,7 +18,10 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 # Окно исследователя (wpend/viz). Ядро pygame не импортирует.
 viz = ["pygame>=2.5"]
-dev = ["pytest>=8.0", "pygame>=2.5"]
+# Синтез ЛКР (wpend/lqr.py): уравнение Риккати через scipy. Ядро scipy не
+# импортирует -- import происходит внутри функции lqr().
+design = ["scipy>=1.10"]
+dev = ["pytest>=8.0", "pygame>=2.5", "scipy>=1.10"]
 
 [tool.setuptools.packages.find]
 include = ["wpend*"]

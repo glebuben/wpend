@@ -14,15 +14,31 @@
 """
 
 from .controller import (
+    BangBangLQRController,
     ConstantController,
     Controller,
     LinearFeedbackController,
     ZeroController,
+    ellipsoid_region,
+    grid_region,
 )
-from .estimator import Estimator, PassthroughEstimator
+from .estimator import (
+    ComplementaryEstimator,
+    Estimator,
+    PassthroughEstimator,
+    optimal_tau,
+    tilt_error_model,
+)
 from .integrator import EulerIntegrator, Integrator, RK4Integrator
 from .rollout import Trajectory, TrajectoryBatch, rollout, rollout_many
-from .sensor import FullStateSensor, GaussianNoiseSensor, Sensor
+from .sensor import (
+    EncoderSensor,
+    FullStateSensor,
+    GaussianNoiseSensor,
+    IMUSensor,
+    Sensor,
+    StackedSensor,
+)
 from .system import System
 
 __all__ = [
@@ -30,12 +46,21 @@ __all__ = [
     "Sensor",
     "FullStateSensor",
     "GaussianNoiseSensor",
+    "IMUSensor",
+    "EncoderSensor",
+    "StackedSensor",
     "Estimator",
     "PassthroughEstimator",
+    "ComplementaryEstimator",
+    "optimal_tau",
+    "tilt_error_model",
     "Controller",
     "ZeroController",
     "ConstantController",
     "LinearFeedbackController",
+    "BangBangLQRController",
+    "ellipsoid_region",
+    "grid_region",
     "Integrator",
     "EulerIntegrator",
     "RK4Integrator",
