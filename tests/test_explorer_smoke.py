@@ -164,6 +164,9 @@ def test_estimator_row_changes_the_map_and_records_the_estimate():
     def held(est):
         args = build_parser().parse_args(
             ["--grid", "9", "--horizon", "2.0", "--stride", "20",
+             # Узкая карта прежнего умолчания (u_max = 3): на широкой стандартной
+             # почти все клетки падают при любом оценивателе, и разницы не видно.
+             "--theta-max", "0.15", "--dtheta-max", "0.7",
              "--main", "lqr", "--estimator", est]
         )
         app = Explorer(args)

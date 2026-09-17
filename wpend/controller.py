@@ -148,6 +148,38 @@ def grid_region(mask, thetas, dthetas, i_theta=0, i_dtheta=2):
     return inside
 
 
+def theta_band_region(eps, i_theta=0):
+    """Предикат «корпус в eps-окрестности вертикали»: |theta| < eps.
+
+    Самый грубый ответ на вопрос «когда отдавать управление ЛКР» -- и
+    сознательно грубый. Ни dtheta, ни колесо в проверку не входят.
+
+    Почему dtheta можно не проверять. Реле едет по сепаратрисе, а на ней
+    при theta -> 0 и dtheta -> 0 (из H(θ, θ̇; ∓u_max) = γD, Key_Formulas §3:
+    θ̇² ~ |θ| вблизи нуля). Значит первый вход в полосу обычно происходит уже с
+    малой скоростью. Обычно, но не всегда: траектория выше сепаратрисы
+    пролетает theta = 0 на скорости, и полоса её пропустит. Замер
+    (PROPOSALS.md A26): при u_max = 10 |dtheta| в момент передачи доходит до 1.8,
+    а ЛКР с мягким колесом ловит и эти состояния.
+
+    Сертификата у такой пары НЕТ: полоса не множество уровня V и не
+    инвариантна (ЛКР может вывести наклон обратно за eps, поэтому переключение
+    имеет смысл только с защёлкой, `latch=True`). Это измеренный, а не
+    доказанный критерий, как `grid_region`.
+
+    eps -- настраиваемый параметр, в радианах.
+    """
+    eps = float(eps)
+    if not eps > 0.0:
+        raise ValueError(f"eps должен быть > 0, а не {eps}")
+
+    def inside(x):
+        x = np.asarray(x, dtype=float)
+        return np.abs(x[..., i_theta]) < eps
+
+    return inside
+
+
 class BangBangLQRController(Controller):
     """Релейное управление до входа в регион, ЛКР -- внутри.
 
@@ -248,13 +280,41 @@ class BangBangLQRController(Controller):
         корректности, но снимает дребезг на границе от численного шума.
         False -- регион проверяется заново каждый шаг.
 
-    Память (флаг защёлки) живёт в регуляторе -- правило 2 архитектуры; для
-    пачки (M, n) это вектор из M флагов, независимых по строкам. `reset()`
+    K_final, final_region : необязательная ТРЕТЬЯ фаза (A27)
+        None, None (по умолчанию) -- двухфазная схема, поведение побитово
+        прежнее. Иначе: после передачи на K регулятор ждёт, пока состояние
+        войдёт в final_region, и с этого шага навсегда (до `reset()`) подаёт
+        u = -K_final x.
+
+        Зачем. Вторая фаза отвечает за то, чтобы НЕ УРОНИТЬ: мягкий ЛКР
+        (пониженные гейны по phi, dphi) ловит состояния, которые жёсткий
+        роняет, но возвращает колесо медленно. Третья фаза -- за то, чтобы
+        ДОВЕСТИ: когда мягкий уже привёл состояние туда, где жёсткий
+        доказуемо работает, отдаём управление жёсткому.
+
+        Какой регион законен. Эллипсоид x^T P_final x <= c* из
+        `certified_level` для ТОЙ ЖЕ пары (K_final, P_final) и того же u_max:
+        внутри него V̇ < 0 при обрезанном управлении, множество инвариантно,
+        и сходимость -K_final x доказана (Khalil, гл. 8.2). Поэтому здесь, в
+        отличие от полосы по theta, пара «критерий + регулятор» честная.
+        Проверка идёт по полному состоянию: колесо в сертификате участвует.
+
+        При wheel_ref=True третья фаза видит то же состояние, что вторая,
+        -- x с вычтенным phi_ref: phi циклична, сертификат переносится.
+
+        Третья фаза следует ТОЛЬКО за второй: попадание в final_region
+        во время релейной фазы не считается. Иначе при широком c* реле
+        отдавало бы управление жёсткому ЛКР в обход мягкого, а это ровно та
+        передача, которая по замеру A26 теряет клетки.
+
+    Память (флаги защёлок) живёт в регуляторе -- правило 2 архитектуры; для
+    пачки (M, n) это векторы из M флагов, независимых по строкам. `reset()`
     вызывается `rollout`-ом один раз перед прогоном.
     """
 
     def __init__(self, K, u_max, region, system, *, i_theta=0, i_phi=1,
-                 i_dtheta=2, latch=True, wheel_ref=False):
+                 i_dtheta=2, latch=True, wheel_ref=False,
+                 K_final=None, final_region=None):
         self.K = np.atleast_2d(np.asarray(K, dtype=float))
         self.u_max = float(u_max)
         self.region = region
@@ -264,16 +324,24 @@ class BangBangLQRController(Controller):
         self.i_dtheta = int(i_dtheta)
         self.latch = bool(latch)
         self.wheel_ref = bool(wheel_ref)
+        if (K_final is None) != (final_region is None):
+            raise ValueError("K_final и final_region задаются только вместе: "
+                             "критерий и регулятор после него -- одна пара")
+        self.K_final = (None if K_final is None
+                        else np.atleast_2d(np.asarray(K_final, dtype=float)))
+        self.final_region = final_region
         # H(0, 0; u) = γ D при любом u -- уровень, на котором лежит кривая,
         # приходящая в верхнее положение.
         self.H_upright = float(system.first_integral(
             np.zeros(system.n_state), 0.0))
         self._engaged = None
         self._phi_ref = None
+        self._final = None
 
     def reset(self) -> None:
         self._engaged = None
         self._phi_ref = None
+        self._final = None
 
     def switching_function(self, x_hat):
         """σ(θ, θ̇) из докстринга класса. Вынесено отдельно ради теста:
@@ -327,8 +395,20 @@ class BangBangLQRController(Controller):
         # кривой, вдоль которой и надо ехать.
         u_bang = np.where(self.switching_function(x) >= 0.0,
                           -self.u_max, self.u_max)[..., None]
-        u_lqr = -self._error(x) @ self.K.T
-        return np.where(self._engaged[..., None], u_lqr, u_bang)
+        err = self._error(x)
+        u_lqr = -err @ self.K.T
+        u = np.where(self._engaged[..., None], u_lqr, u_bang)
+        if self.K_final is None:
+            return u
+
+        # Третья фаза: защёлка, взводимая только поверх второй. Проверяется
+        # после обновления _engaged, поэтому вход во вторую и третью на одном
+        # шаге законен -- состояние уже внутри сертифицированного эллипсоида.
+        if self._final is None or self._final.shape != inside.shape:
+            self._final = np.zeros(inside.shape, dtype=bool)
+        in_final = np.asarray(self.final_region(err), dtype=bool) & self._engaged
+        self._final = self._final | in_final
+        return np.where(self._final[..., None], -err @ self.K_final.T, u)
 
 
 class TrajectoryTrackingController(Controller):

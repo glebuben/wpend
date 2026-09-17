@@ -11,8 +11,9 @@
 «какой лучше в среднем», а что именно эти двое делают из ОДНОГО состояния.
 
 Управление: клик по клетке -- проиграть её траекторию; кнопки сверху либо
-1..6 (основной) и Shift+1..6 (сравнение, Shift+0 -- выключить); слайдер u_max
-или клавиши [ и ]; ПРОБЕЛ -- пауза; R -- сначала; Esc -- выход.
+1..8 (основной) и Shift+1..8 (сравнение, Shift+0 -- выключить); слайдер u_max
+или клавиши [ и ]; кнопка settings или S -- панель цен ЛКР (Q, R), eps и
+горизонта; ПРОБЕЛ -- пауза; R -- сначала; Esc -- выход.
 
 Раскладка окна -- фиксированные 1280x940 (см. W, H и прямоугольники ниже).
 Если экран меньше, окно не перевёрстывается, а ужимается целиком: рисунок
@@ -29,8 +30,9 @@
 разные вещи: множество восстановимых состояний (свойство системы, замкнутая
 форма) и сертифицированный уровень c* (свойство проекта, считается численно).
 Поэтому слайдер во время перетаскивания двигает только первое -- это даром, --
-а второе и сетку пересчитывает на отпускании. Границы карты идут за
-восстановимым множеством, см. Explorer._map_bounds.
+а второе и сетку пересчитывает на отпускании. Границы карты -- по стандарту
+проекта: theta до ±1.3·pi/2, dtheta -- 1.3 от восстановимого множества на
+[-pi/2, pi/2], см. Explorer._map_bounds.
 
 Модуль читает только Trajectory / TrajectoryBatch: ни одной формулы динамики
 здесь нет. Регуляторы он не изобретает, а собирает из готовых -- см.
@@ -50,6 +52,7 @@ from ..controller import (
     LinearFeedbackController,
     ellipsoid_region,
     grid_region,
+    theta_band_region,
 )
 from ..estimator import ComplementaryEstimator, optimal_tau
 from ..integrator import RK4Integrator
@@ -98,7 +101,25 @@ U_MIN, U_MAX, U_STEP = 0.25, 10.0, 0.25
 #: переключается по сепаратрисе при том же пределе. Без предела не определено
 #: ни то, ни другое, поэтому окно их отключает -- как отключает эллипсоид без
 #: scipy: кнопка перечёркнута, и рядом написано, чего не хватает.
-RELAY_KEYS = ("bang", "bang-ell", "bang-ell-phi", "bang-tilt", "bang-map")
+RELAY_KEYS = ("bang", "bang-ell", "bang-ell-phi", "bang-tilt", "bang-map",
+              "bang-eps", "bang-eps-ell")
+
+#: Цена ЛКР второй фазы у `bang-eps`: веса колеса в сто раз меньше базовых.
+#: Замер (PROPOSALS.md A26, карта 31x31, theta +-pi/2): с этой ценой и ЛКР, и
+#: реле -> |theta| < eps -> ЛКР удерживают всё восстановимое при u_max = 1.5, 3, 10;
+#: с базовой ценой реле -> eps теряет 4 и 10 клеток при 3 и 10 Н*м.
+Q_SOFT_WHEEL = np.diag([100.0, 1e-2, 10.0, 1e-2])
+
+#: Цены ЛКР, с которыми окно стартует: (q_theta, q_phi, q_dtheta, q_dphi, R).
+#: Панель настроек (кнопка `settings`, клавиша S) меняет КОПИЮ -- app.cost, --
+#: а эти числа остаются опорой: кнопка `defaults` возвращает ровно их.
+#: base -- K для `lqr`, `bang-ell*`, `bang-map` и третьей фазы `bang-eps-ell`;
+#: soft -- K второй фазы `bang-eps*`. ЛКР наклона (`bang-tilt`) панель не трогает.
+DEFAULT_COST = {
+    "base": (100.0, 1.0, 10.0, 1.0, 1.0),
+    "soft": (100.0, 1e-2, 10.0, 1e-2, 1.0),
+}
+COST_LABELS = ("q_theta", "q_phi", "q_dtheta", "q_dphi", "R")
 
 #: Во сколько раз карта шире восстановимого множества. 1.0 -- граница ровно по
 #: краю, и не видно, что снаружи неё карта обязана быть красной у любого
@@ -106,6 +127,9 @@ RELAY_KEYS = ("bang", "bang-ell", "bang-ell-phi", "bang-tilt", "bang-map")
 MAP_FIT = 1.3
 #: Горизонт корпуса. Отмечается на карте пунктиром, когда попадает в границы.
 HORIZON_ANGLE = float(np.pi / 2)
+#: Стандарт карт (CLAUDE.md, Глеб 16.09 и 17.09): интересен theta в
+#: [-pi/2, pi/2], сетка берётся с запасом MAP_FIT по обеим осям.
+THETA_MAP = HORIZON_ANGLE
 
 BG = (22, 24, 28)
 PANEL = (33, 36, 42)
@@ -144,6 +168,23 @@ OUTCOME_COLOR = {
     FELL_BACKWARD: (150, 108, 190),
 }
 UNKNOWN = (58, 62, 70)
+
+
+def _cost_matrices(cost):
+    """(q_theta, q_phi, q_dtheta, q_dphi, R) -> (Q, R) для `wpend.lqr.lqr`.
+    Порядок весов -- порядок состояния (I_THETA, I_PHI, I_DTHETA, I_DPHI)."""
+    q = np.zeros(4)
+    q[[I_THETA, I_PHI, I_DTHETA, I_DPHI]] = cost[:4]
+    return np.diag(q), np.array([[float(cost[4])]])
+
+
+#: Поля панели настроек в порядке обхода по Tab: сначала столбец base, потом
+#: soft, потом eps и горизонт.
+SETTINGS_KEYS = ([f"base.{i}" for i in range(5)] + [f"soft.{i}" for i in range(5)]
+                 + ["eps", "horizon"])
+SETTINGS = (300, 190, 680, 520)     # панель настроек: x, y, w, h
+#: Символы, которые принимает поле ввода: число в любой записи Python.
+SETTINGS_CHARS = set("0123456789.eE-+")
 
 
 def _finite_or_none(value):
@@ -218,23 +259,39 @@ CONTROLLERS = [
      lambda app: LinearFeedbackController(app.K)),
     ("bang", "bang-bang",
      lambda app: BangBangLQRController(app.K, app.u_max, _never, app.system)),
-    ("bang-ell", "bang -> LQR: ellipsoid",
+    ("bang-ell", "bang -> ell",
      lambda app: BangBangLQRController(app.K, app.u_max,
                                        ellipsoid_region(app.P, app.c_star),
                                        app.system)),
-    ("bang-ell-phi", "bang -> LQR: ellipsoid+phi",
+    ("bang-ell-phi", "bang -> ell+phi",
      lambda app: BangBangLQRController(app.K, app.u_max,
                                        ellipsoid_region(app.P, app.c_star),
                                        app.system, wheel_ref=True)),
-    ("bang-tilt", "bang -> tilt-LQR",
+    ("bang-tilt", "bang -> tilt",
      lambda app: BangBangLQRController(app.K_tilt, app.u_max,
                                        ellipsoid_region(app.P_tilt, app.c_tilt),
                                        app.system)),
-    ("bang-map", "bang -> LQR: map",
+    ("bang-map", "bang -> map",
      lambda app: BangBangLQRController(app.K, app.u_max,
                                        grid_region(app.lqr_mask(), app.spec.thetas,
                                                    app.spec.dthetas),
                                        app.system)),
+    # Реле сразу, передача по |theta| < eps (eps -- --eps), дальше ЛКР с
+    # пониженными гейнами по phi, dphi. Критерий без сертификата, поэтому
+    # K_soft, а не K: базовый ЛКР после такой передачи роняет корпус чаще.
+    ("bang-eps", "bang -> eps",
+     lambda app: BangBangLQRController(app.K_soft, app.u_max,
+                                       theta_band_region(app.args.eps),
+                                       app.system)),
+    # То же, плюс третья фаза (A27): мягкий ЛКР отдаёт управление базовому K,
+    # когда состояние входит в ЕГО сертифицированный эллипсоид x^T P x <= c*.
+    # c* окно и так пересчитывает под текущий u_max (_certify), поэтому пара
+    # «критерий + регулятор» здесь честная.
+    ("bang-eps-ell", "bang -> eps -> ell",
+     lambda app: BangBangLQRController(app.K_soft, app.u_max,
+                                       theta_band_region(app.args.eps),
+                                       app.system, K_final=app.K,
+                                       final_region=ellipsoid_region(app.P, app.c_star))),
 ]
 CONTROLLER_KEYS = [key for key, _, _ in CONTROLLERS]
 CONTROLLER_LABEL = {key: label for key, label, _ in CONTROLLERS}
@@ -326,7 +383,14 @@ class Explorer:
         # идёт прямо во время перетаскивания.
         self._refresh_limits()
 
+        # Цены ЛКР -- копия DEFAULT_COST, которую двигает панель настроек.
+        self.cost = {k: tuple(v) for k, v in DEFAULT_COST.items()}
+        self.settings_open = False
+        self.settings_text = {}
+        self.settings_focus = None
+        self.settings_error = ""
         self.K, self.P, self.K_tilt, self.P_tilt, self._drift = self._synthesize()
+        self.K_soft = self._synthesize_soft()
         self.design_note = "no scipy"
         self.c_star, self.c_tilt = self._certify()
         self._refresh_hint()
@@ -383,7 +447,10 @@ class Explorer:
         self.traj_est_cmp = None
         self.playing = True
         self.play_time = 0.0
-        self._select_nearest(0.6 * self.spec.theta_max, 0.0)
+        # Стартовая клетка -- внутри множества восстановимости (_start_state):
+        # на широкой карте «0.6 края» -- это уже лёгший корпус, и первое, что
+        # видит пользователь, была бы падающая траектория.
+        self._select_nearest(*self._start_state())
 
     # --- проект регулятора -------------------------------------------------
 
@@ -407,8 +474,7 @@ class Explorer:
         цилиндр, а не эллипсоид.
         """
         A, B = self.system.linearize_upright()
-        Q = np.diag([100.0, 1.0, 10.0, 1.0])
-        R = np.array([[1.0]])
+        Q, R = _cost_matrices(self.cost["base"])
         try:
             from ..lqr import lqr, lqr_tilt
             K, P = lqr(A, B, Q, R)
@@ -418,9 +484,141 @@ class Explorer:
             return K_LQR, None, None, None, ""
         drift = float(np.abs(K - K_LQR).max())
         note = ""
-        if drift > 1e-4:                                 # pragma: no cover
+        # Сверка с константой имеет смысл только для той цены, под которую
+        # константа записана: при цене из панели K обязано отличаться.
+        if drift > 1e-4 and self.cost["base"] == DEFAULT_COST["base"]:  # pragma: no cover
             note = f"  (!) K ушло от константы на {drift:.2g}"
         return K, P, K_t, P_t, note
+
+    def _synthesize_soft(self):
+        """ЛКР второй фазы `bang-eps`: та же задача, что в _synthesize, но с
+        ценой self.cost["soft"]. По умолчанию это Q_SOFT_WHEEL, R = 1 -- гейны
+        по phi и dphi ниже базовых в 10 и 4.4 раза.
+
+        Без scipy -- None, и `bang-eps` окно отключает, как эллипсоид.
+        """
+        A, B = self.system.linearize_upright()
+        try:
+            from ..lqr import lqr
+        except ImportError:                              # pragma: no cover
+            return None
+        K_soft, _ = lqr(A, B, *_cost_matrices(self.cost["soft"]))
+        return K_soft
+
+    def _start_state(self):
+        """(theta, dtheta) стартовой клетки: узел сетки с |theta| <= pi/2 внутри
+        множества восстановимости и, если сетка уже посчитана, удержанный
+        основным регулятором; из таких -- с наибольшим |theta| (при равенстве
+        ближе к середине отрезка скоростей). На широкой карте наугад
+        выбранная клетка почти всегда -- лёгший корпус, а центр -- неподвижный
+        робот; ни то, ни другое не показывает, что делает регулятор."""
+        u = self.u_finite if self.u_max is None else self.u_max
+        X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)
+        th, dth = X0[:, I_THETA], X0[:, I_DTHETA]
+        ok = self.system.is_recoverable(u, th, dth) & (np.abs(th) <= THETA_MAP)
+        if (self.outcome >= 0).all() and (ok & (self.outcome == HELD)).any():
+            ok &= self.outcome == HELD
+        if not ok.any():
+            return 0.0, 0.0
+        floor, ceiling = self.system.recoverable_bounds(u, th)
+        score = np.where(ok, np.abs(th) - 1e-6 * np.abs(dth - 0.5 * (floor + ceiling)),
+                         -np.inf)
+        m = int(np.argmax(score))
+        return float(th[m]), float(dth[m])
+
+    # --- панель настроек ---------------------------------------------------
+
+    def settings_values(self) -> dict:
+        """Текущие настраиваемые числа под ключами полей панели."""
+        values = {}
+        for group in ("base", "soft"):
+            for i, v in enumerate(self.cost[group]):
+                values[f"{group}.{i}"] = float(v)
+        values["eps"] = float(self.args.eps)
+        values["horizon"] = float(self.args.horizon)
+        return values
+
+    def open_settings(self):
+        """Поля заполняются текущими числами: панель показывает то, чем сейчас
+        посчитана карта, а не то, что вводили в прошлый раз."""
+        self.settings_text = {k: f"{v:g}" for k, v in self.settings_values().items()}
+        self.settings_focus = SETTINGS_KEYS[0]
+        self.settings_error = ""
+        self.settings_open = True
+
+    def apply_settings(self, values: dict):
+        """Принять новые цены ЛКР, eps и горизонт; пересчитать всё зависимое.
+
+        Значения -- числа или строки из полей панели. Возвращает None при
+        успехе либо строку с причиной отказа; при отказе окно не меняется ни в
+        чём -- ни K, ни карта. Проверка до пересчёта, а синтез -- в пробном
+        прогоне: Риккати с нулевым весом, при котором пара (A, Q) теряет
+        обнаружимость, может не решиться, и узнать это можно только решив.
+
+        Что поедет. K и P базы, K второй фазы -- синтез; c* -- сертификат под
+        новую P при текущем u_max (иначе эллипсоид от старой цены при новом K --
+        пара «критерий + регулятор» разошлась бы, CLAUDE.md); маска чистого ЛКР
+        и сетка -- заново; горизонт меняет число шагов. ЛКР наклона не зависит
+        от этих цен и не пересчитывается.
+        """
+        merged = self.settings_values()
+        try:
+            for key, value in values.items():
+                if key not in merged:
+                    return f"unknown field {key}"
+                merged[key] = float(value)
+        except (TypeError, ValueError):
+            return f"not a number: {key} = {value!r}"
+        if not all(np.isfinite(v) for v in merged.values()):
+            return "all values must be finite"
+        cost = {g: tuple(merged[f"{g}.{i}"] for i in range(5)) for g in ("base", "soft")}
+        for g, c in cost.items():
+            if min(c[:4]) < 0:
+                return f"{g}: Q weights must be >= 0"
+            if c[4] <= 0:
+                return f"{g}: R must be > 0"
+        if merged["eps"] <= 0:
+            return "eps must be > 0"
+        if merged["horizon"] < 5 * self.args.dt * self.args.stride:
+            return "horizon too short"
+
+        A, B = self.system.linearize_upright()
+        try:
+            from ..lqr import lqr
+            with np.errstate(all="raise"):
+                trial = {g: lqr(A, B, *_cost_matrices(c)) for g, c in cost.items()}
+        except ImportError:                              # pragma: no cover
+            return "needs scipy:  uv sync --extra dev"
+        except Exception as exc:                         # noqa: BLE001
+            return f"Riccati failed: {type(exc).__name__}"
+        for g, (K, P) in trial.items():
+            if not (np.isfinite(K).all() and np.isfinite(P).all()):
+                return f"{g}: Riccati gave non-finite K"
+            closed = np.linalg.eigvals(A - B @ K)
+            if closed.real.max() >= 0:
+                return f"{g}: closed loop not stable (Q too small?)"
+
+        self.cost = cost
+        self.args.eps = merged["eps"]
+        self.args.horizon = merged["horizon"]
+        self.n_steps = int(round(self.args.horizon / self.args.dt))
+        if self.n_steps % self.args.stride:
+            self.n_steps += self.args.stride - self.n_steps % self.args.stride
+        self.K, self.P, self.K_tilt, self.P_tilt, self._drift = self._synthesize()
+        self.K_soft = self._synthesize_soft()
+        self.c_star, self.c_tilt = self._certify()
+        self._refresh_hint()
+        if not self.available(self.main_key):
+            self.main_key = "lqr"
+        if self.cmp_key is not None and not self.available(self.cmp_key):
+            self.cmp_key = None
+        self._invalidate(mask=True)
+        self.controller = CONTROLLER_BUILD[self.main_key](self)
+        if self.args.precompute:
+            self._precompute()
+        self._select_nearest(*self.selected_state)
+        self.settings_error = ""
+        return None
 
     def _certify(self):
         """Сертифицированные уровни (c*, c*_наклон) для ТЕКУЩЕГО предела.
@@ -454,30 +652,34 @@ class Explorer:
     # --- карта под предел момента ------------------------------------------
 
     def _map_bounds(self):
-        """Границы карты (theta_max, dtheta_max) под текущий предел момента.
+        """Границы карты (theta_max, dtheta_max) по стандарту проекта.
 
-        Восстановимое множество растёт с u_max почти линейно: «горло» при
-        theta = 0 -- 0.86 рад/с при 0.25 Н*м и 9.25 при 6. Значит одни и те же
-        границы годятся ровно для одного мотора: при слабом всё интересное
-        сжимается в точку в центре, при сильном граница уходит за край и не
-        видно, ЧТО именно регулятор не смог. Поэтому карта подгоняется под
-        систему -- в MAP_FIT раз шире восстановимого множества.
+        Стандарт (CLAUDE.md, решения Глеба 16.09 и 17.09): интересен наклон
+        theta в [-pi/2, pi/2], а сетка берётся с запасом MAP_FIT по обеим осям.
+        По theta граница поэтому постоянная, MAP_FIT * pi/2 ≈ 2.04 рад: карта
+        одна и та же при любом моторе, и пунктир pi/2 на ней виден всегда.
 
-        По theta карта обрезается по theta_fall: за ним клетка считается
-        упавшей уже в начальный момент, и красить её исходом прогона
-        бессмысленно. Явные --theta-max / --dtheta-max замораживают границы:
-        тогда карты при разных u_max сравнимы по пикселям, а не только по
-        подписям.
+        По dtheta граница по-прежнему идёт за мотором: восстановимое множество
+        растёт с u_max почти линейно, и одни и те же границы годятся ровно для
+        одного мотора. Берётся MAP_FIT от наибольшего |dtheta| на границе
+        восстановимости при theta в [-pi/2, pi/2] -- не «горло» при theta = 0:
+        множество наклонное, и у края отрезка оно шире, чем в центре.
+
+        theta_fall по умолчанию -- pi («упал», земли в модели нет), так что
+        карта до него не доходит. Явные --theta-max / --dtheta-max
+        замораживают границы: тогда карты при разных u_max сравнимы по
+        пикселям, а не только по подписям.
         """
         # При выключенном пределе восстановимо ВСЁ, и подгонять карту не подо
         # что: границы замораживаются на последнем конечном пределе. Это и есть
         # смысл опыта -- те же клетки, другой мотор: видно, какие поменяли
         # цвет, а не как поехали оси.
         u = self.u_finite if self.u_max is None else self.u_max
-        theta_max = MAP_FIT * self.system.saddle_angle(u)
-        theta_max = min(theta_max, 0.98 * self.args.theta_fall)
-        _, ceiling = self.system.recoverable_bounds(u, np.zeros(1))
-        dtheta_max = MAP_FIT * float(ceiling[0])
+        theta_max = min(MAP_FIT * THETA_MAP, 0.98 * self.args.theta_fall)
+        th = np.linspace(-THETA_MAP, THETA_MAP, 401)
+        floor, ceiling = self.system.recoverable_bounds(u, th)
+        reach = np.abs(np.concatenate([floor, ceiling]))
+        dtheta_max = MAP_FIT * float(reach[np.isfinite(reach)].max())
         if self.args.theta_max is not None:
             theta_max = self.args.theta_max
         if self.args.dtheta_max is not None:
@@ -485,23 +687,13 @@ class Explorer:
         return theta_max, dtheta_max
 
     def _clip_u_max(self):
-        """Предел момента, с которого карта упирается в theta_fall и перестаёт
-        следовать за седлом. Дальше по слайдеру подпись говорит об этом вслух:
-        иначе карта молча перестанет содержать всё восстановимое множество.
-
-        saddle_angle монотонно растёт по u_max, поэтому хватает деления
-        пополам; None -- если во всём диапазоне слайдера этого не случается.
-        """
-        cap = 0.98 * self.args.theta_fall / MAP_FIT
-        if self.system.saddle_angle(U_MAX) <= cap:
+        """Предел момента, с которого карта перестаёт содержать множество
+        восстановимости по theta. При стандартной карте (±1.3·pi/2 до
+        theta_fall = pi) такого нет -- None. Остаётся для --theta-fall меньше
+        MAP_FIT·pi/2, где карта обрезается и окно обязано сказать об этом."""
+        if MAP_FIT * THETA_MAP <= 0.98 * self.args.theta_fall:
             return None
-        if self.system.saddle_angle(U_MIN) >= cap:
-            return U_MIN
-        lo, hi = U_MIN, U_MAX
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            lo, hi = (mid, hi) if self.system.saddle_angle(mid) < cap else (lo, mid)
-        return 0.5 * (lo + hi)
+        return U_MIN
 
     def _refresh_limits(self):
         """Границу восстановимости и седло -- под текущий предел и текущие
@@ -753,6 +945,10 @@ class Explorer:
             return self.P is not None
         if key == "bang-tilt":
             return self.P_tilt is not None
+        if key == "bang-eps":
+            return self.K_soft is not None
+        if key == "bang-eps-ell":
+            return self.K_soft is not None and self.P is not None
         return True
 
     def _refresh_hint(self):
@@ -1058,8 +1254,8 @@ def _draw_horizon(app, screen, pg, font):
     всегда тяжелее» перестаёт быть правдой. Без линии на широкой карте это
     место ничем не отмечено, а глаз ищет его первым.
 
-    Рисуется только когда pi/2 попал в границы: на карте по умолчанию
-    (theta_max около 0.15) линия ушла бы за край, и pygame нарисовал бы её по
+    Рисуется только когда pi/2 попал в границы: на приколоченной узкой
+    карте (--theta-max 0.15) линия ушла бы за край, и pygame нарисовал бы её по
     самой кромке панели -- отметка не там, где написано, хуже, чем её
     отсутствие.
     """
@@ -1651,9 +1847,146 @@ def draw_slider(app, screen, pg, font):
         note = f"map clipped by theta_fall = {app.args.theta_fall:g}"
         color = LIMIT
     else:
-        note = f"map fitted to {MAP_FIT:g}x recoverable set"
+        note = f"map: theta +-{MAP_FIT:g}*pi/2, dtheta {MAP_FIT:g}x recoverable"
         color = DIM
     screen.blit(font.render(note, True, color), (rect[0] + rect[2] + 16, y - 1))
+
+    srect = settings_button_rect(font)
+    pg.draw.rect(screen, BTN_ON if app.settings_open else BTN, srect, border_radius=4)
+    pg.draw.rect(screen, GRID_LINE, srect, 1, border_radius=4)
+    screen.blit(font.render("settings", True, BG if app.settings_open else TEXT),
+                (srect[0] + 9, srect[1] + 3))
+
+
+def settings_button_rect(font):
+    """Кнопка «settings» в правом конце ряда u_max. Чистая функция, как
+    limit_button_rect: одна раскладка и на отрисовку, и на обработку клика."""
+    w = font.size("settings")[0] + 18
+    return (W - 24 - w, SLIDER[1] - 4, w, 22)
+
+
+def settings_layout(font):
+    """Раскладка панели настроек: [(kind, key, rect)], kind -- "field" или
+    "button". Чистая функция: отрисовка и клик читают одну и ту же раскладку."""
+    x, y, w, h = SETTINGS
+    out = []
+    col_x = {"base": x + 160, "soft": x + 340}
+    for group in ("base", "soft"):
+        for i in range(5):
+            out.append(("field", f"{group}.{i}", (col_x[group], y + 90 + i * 30, 150, 24)))
+    out.append(("field", "eps", (col_x["base"], y + 250, 150, 24)))
+    out.append(("field", "horizon", (col_x["base"], y + 280, 150, 24)))
+    bx = x + 24
+    for key in ("apply", "defaults", "close"):
+        bw = font.size(key)[0] + 24
+        out.append(("button", key, (bx, y + h - 44, bw, 26)))
+        bx += bw + 10
+    return out
+
+
+def draw_settings(app, screen, pg, font):
+    """Панель настроек поверх окна: веса Q и R двух ЛКР, eps и горизонт.
+
+    Рисует только текст полей и числа K, посчитанные окном; сама проверка и
+    синтез -- в Explorer.apply_settings.
+    """
+    if not app.settings_open:
+        return
+    veil = pg.Surface((W, H), pg.SRCALPHA)
+    veil.fill(BG + (150,))
+    screen.blit(veil, (0, 0))
+    x, y, w, h = SETTINGS
+    pg.draw.rect(screen, PANEL, SETTINGS, border_radius=6)
+    pg.draw.rect(screen, GRID_LINE, SETTINGS, 1, border_radius=6)
+    screen.blit(font.render("SETTINGS  --  LQR cost  Q = diag(q_theta, q_phi, q_dtheta, q_dphi)",
+                            True, TEXT), (x + 24, y + 16))
+    screen.blit(font.render("base: lqr, bang-ell*, bang-map, phase 3;  soft: phase 2 of bang-eps*",
+                            True, DIM), (x + 24, y + 38))
+    screen.blit(font.render("base", True, TEXT), (x + 160, y + 66))
+    screen.blit(font.render("soft", True, TEXT), (x + 340, y + 66))
+    for i, label in enumerate(COST_LABELS):
+        screen.blit(font.render(label, True, DIM), (x + 24, y + 94 + i * 30))
+    screen.blit(font.render("eps, rad", True, DIM), (x + 24, y + 254))
+    screen.blit(font.render("horizon, s", True, DIM), (x + 24, y + 284))
+
+    for kind, key, rect in settings_layout(font):
+        if kind == "field":
+            focused = key == app.settings_focus
+            pg.draw.rect(screen, BG, rect, border_radius=3)
+            pg.draw.rect(screen, ACCENT if focused else GRID_LINE, rect, 1, border_radius=3)
+            text = app.settings_text.get(key, "")
+            screen.blit(font.render(text + ("_" if focused else ""), True, TEXT),
+                        (rect[0] + 6, rect[1] + 4))
+        else:
+            fill = BTN_ON if key == "apply" else BTN
+            pg.draw.rect(screen, fill, rect, border_radius=4)
+            screen.blit(font.render(key, True, BG if key == "apply" else TEXT),
+                        (rect[0] + 12, rect[1] + 5))
+
+    # Числа, которыми посчитана ТЕКУЩАЯ карта: видно, что именно сделала цена.
+    lines = []
+    for name, K in (("K base", app.K), ("K soft", app.K_soft)):
+        if K is not None:
+            lines.append(f"{name} = [" + ", ".join(f"{v:.3g}" for v in K[0]) + "]")
+    if app.P is not None and app.K is not None:
+        A, B = app.system.linearize_upright()
+        for name, K in (("base", app.K), ("soft", app.K_soft)):
+            if K is None:
+                continue
+            slow = float(np.linalg.eigvals(A - B @ K).real.max())
+            lines.append(f"slowest pole {name}: {slow:.3g}  (~{-4.0 / slow:.0f} s to 2%)")
+    for i, line in enumerate(lines):
+        screen.blit(font.render(line, True, DIM), (x + 24, y + 330 + i * 20))
+    if app.settings_error:
+        screen.blit(font.render(app.settings_error, True, (235, 110, 90)),
+                    (x + 24, y + h - 78))
+    hint = "Enter apply   Tab next   Esc close"
+    screen.blit(font.render(hint, True, DIM), (x + w - 24 - font.size(hint)[0], y + h - 39))
+
+
+def settings_click(app, pos, font):
+    """Клик при открытой панели: фокус поля или кнопка. Вне панели -- ничего:
+    панель модальная, иначе клик по карте молча пересчитал бы клетку под ней."""
+    for kind, key, (rx, ry, rw, rh) in settings_layout(font):
+        if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
+            if kind == "field":
+                app.settings_focus = key
+            elif key == "apply":
+                settings_submit(app)
+            elif key == "defaults":
+                for group in ("base", "soft"):
+                    for i, v in enumerate(DEFAULT_COST[group]):
+                        app.settings_text[f"{group}.{i}"] = f"{v:g}"
+            elif key == "close":
+                app.settings_open = False
+            return
+
+
+def settings_submit(app):
+    """Применить введённое. Ошибка остаётся на панели, окно -- прежним."""
+    error = app.apply_settings(dict(app.settings_text))
+    app.settings_error = error or ""
+    if error is None:
+        app.settings_open = False
+
+
+def settings_key(app, event, pg):
+    """Клавиша при открытой панели. Возвращает True, если её съела панель."""
+    if event.key == pg.K_ESCAPE:
+        app.settings_open = False
+    elif event.key in (pg.K_RETURN, pg.K_KP_ENTER):
+        settings_submit(app)
+    elif event.key in (pg.K_TAB, pg.K_DOWN, pg.K_UP):
+        step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
+        i = SETTINGS_KEYS.index(app.settings_focus) if app.settings_focus else -1
+        app.settings_focus = SETTINGS_KEYS[(i + step) % len(SETTINGS_KEYS)]
+    elif app.settings_focus is not None:
+        text = app.settings_text.get(app.settings_focus, "")
+        if event.key == pg.K_BACKSPACE:
+            app.settings_text[app.settings_focus] = text[:-1]
+        elif event.unicode and event.unicode in SETTINGS_CHARS:
+            app.settings_text[app.settings_focus] = text + event.unicode
+    return True
 
 
 def draw_picker(app, screen, pg, font):
@@ -1743,7 +2076,7 @@ def draw_header(app, screen, pg, font, big):
         pg.draw.rect(screen, GHOST_EST, (lx, H - 52, 14, 14))
         screen.blit(font.render(f"vs est: {ESTIMATOR_LABEL[app.est_cmp_key]}",
                                 True, GHOST_EST), (lx + 20, H - 52))
-    hint = ("click a cell  |  1-6 main, Shift+1-6 compare  |  "
+    hint = ("click a cell  |  1-8 main, Shift+1-8 compare  |  "
             "E / Shift+E estimator, T measure tau*  |  [ ] u_max, L no limit  |  "
             "SPACE pause  R restart  ESC quit")
     screen.blit(font.render(hint, True, GRID_LINE), (W - 24 - font.size(hint)[0], H - 26))
@@ -1835,6 +2168,13 @@ def run(app, max_frames=None, screenshot=None):
             elif event.type == pg.VIDEORESIZE:
                 window = pg.display.set_mode(event.size, pg.RESIZABLE)
                 view = view_rect(pg, window.get_size())
+            elif app.settings_open and event.type == pg.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    settings_click(app, canvas_pos(event.pos, view), font)
+            elif app.settings_open and event.type == pg.KEYDOWN:
+                settings_key(app, event, pg)
+            elif app.settings_open and event.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONUP):
+                continue
             elif event.type == pg.MOUSEMOTION:
                 mx, my = canvas_pos(event.pos, view)
                 if app.dragging:
@@ -1854,6 +2194,10 @@ def run(app, max_frames=None, screenshot=None):
                 bx, by, bw, bh = limit_button_rect(font)
                 if bx <= pos[0] < bx + bw and by <= pos[1] < by + bh:
                     app.toggle_limit()
+                    continue
+                sx, sy, sw, sh = settings_button_rect(font)
+                if sx <= pos[0] < sx + sw and sy <= pos[1] < sy + sh:
+                    app.open_settings()
                     continue
                 if slider_hit(pos):
                     app.dragging = True
@@ -1905,6 +2249,8 @@ def run(app, max_frames=None, screenshot=None):
                     app.play_time, app.playing = 0.0, True
                 elif event.key == pg.K_l:
                     app.toggle_limit()
+                elif event.key == pg.K_s:
+                    app.open_settings()
                 elif event.key == pg.K_t:
                     # Дорого (секунды), поэтому по явной просьбе, а не на
                     # каждом движении слайдера.
@@ -1943,6 +2289,7 @@ def run(app, max_frames=None, screenshot=None):
         draw_map(app, screen, pg, font)
         draw_robot(app, screen, pg, font)
         draw_plots(app, screen, pg, font)
+        draw_settings(app, screen, pg, font)
         if view.size == (W, H):
             # Масштаб 1 -- кладём как есть: пересемплировать нечего, и текст
             # остаётся ровно тем, что нарисовал шрифт.
@@ -1994,6 +2341,8 @@ def build_parser():
                    help="меток на оборот у энкодера (вариант IMU+encoder)")
     p.add_argument("--seed", type=int, default=0,
                    help="зерно шума датчика (при --estimator, отличном от ideal)")
+    p.add_argument("--eps", type=float, default=0.05,
+                   help="bang-eps: реле отдаёт управление ЛКР, когда |theta| < eps, рад")
     p.add_argument("--u-max", type=float, default=3.0,
                    help="предел момента, Н*м -- начальное положение слайдера "
                         f"(диапазон {U_MIN:g}..{U_MAX:g}); inf -- запустить "
@@ -2008,8 +2357,9 @@ def build_parser():
     p.add_argument("--dtheta-max", type=float, default=None,
                    help="границы карты по dtheta0; по умолчанию подгоняются под "
                         "u_max, явное значение их замораживает")
-    p.add_argument("--theta-fall", type=float, default=1.3,
-                   help="угол, начиная с которого считаем, что корпус упал")
+    p.add_argument("--theta-fall", type=float, default=float(np.pi),
+                   help="угол, начиная с которого считаем, что корпус упал "
+                        "(по умолчанию pi: земли в модели нет)")
     p.add_argument("--speed", type=float, default=1.0, help="скорость воспроизведения")
     p.add_argument("--frames", type=int, default=None,
                    help="закрыть окно после N кадров (для headless-проверки)")

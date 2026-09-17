@@ -23,6 +23,7 @@ from .controller import (
     ZeroController,
     ellipsoid_region,
     grid_region,
+    theta_band_region,
 )
 from .estimator import (
     ComplementaryEstimator,
@@ -65,6 +66,7 @@ __all__ = [
     "MPCController",
     "ellipsoid_region",
     "grid_region",
+    "theta_band_region",
     "Integrator",
     "EulerIntegrator",
     "RK4Integrator",
