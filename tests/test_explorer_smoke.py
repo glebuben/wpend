@@ -298,3 +298,69 @@ def test_measured_optimum_differs_from_the_analytic_one():
     app.set_estimator("ideal")
     app.measure_tau_star()
     assert app.tau_star_measured is None           # мерить нечего
+
+
+def test_window_fits_a_desktop_smaller_than_the_canvas():
+    """Холст 1280x940 не влезает в распространённые 1366x768 -- окно обязано
+    ужаться, и не абы как: с общим масштабом по обеим осям.
+
+    Не тавтология: проверяется неравенство «окно <= рабочая область», а не
+    равенство формуле. Разное сжатие по x и y превратило бы квадратные клетки
+    карты в прямоугольники, и это ловится сравнением пропорции.
+    """
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    import pygame as pg
+
+    from wpend.viz.explorer import H, TASKBAR, W, view_rect
+
+    pg.init()
+    for dw, dh in [(1366, 768), (1280, 800), (1440, 900), (1920, 1080)]:
+        k = max(min(dw / W, (dh - TASKBAR) / H, 1.0), 0.2)
+        assert round(W * k) <= dw and round(H * k) <= dh - TASKBAR + 1
+        view = view_rect(pg, (round(W * k), round(H * k)))
+        assert abs(view.w / view.h - W / H) < 0.01
+    assert min(3840 / W, (2160 - TASKBAR) / H, 1.0) == 1.0     # не растягиваем
+    pg.quit()
+
+
+@pytest.mark.slow
+def test_a_click_in_a_shrunken_window_hits_the_same_cell(monkeypatch):
+    """Оракул для ужатого окна: наведение на одну и ту же точку холста даёт
+    ОДНУ И ТУ ЖЕ клетку при любом масштабе.
+
+    Сравнение идёт с прогоном 1:1, а не с записанным числом: раскладка может
+    меняться, а совпадение обязано держаться. Ошибка здесь тихая -- окно
+    рисуется правильно, но клик попадает мимо тем сильнее, чем меньше экран.
+    """
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+    import pygame as pg
+
+    from wpend.viz import explorer as ex
+    from wpend.viz.explorer import H, MAP, W, build_parser, Explorer, run, view_rect
+
+    args = build_parser().parse_args(["--grid", "7", "--horizon", "1.0",
+                                      "--stride", "20"])
+    x, y, w, h = MAP
+    targets = [(x + w // 2, y + h // 2), (x + 3, y + h - 3), (x + w - 3, y + 3)]
+
+    def hover_at(k, canvas_xy):
+        pg.init()
+        # Подменяем именно fit_scale: в headless она честно возвращает 1, и
+        # без подмены ужатый путь остался бы непроверенным.
+        monkeypatch.setattr(ex, "fit_scale", lambda _pg, _k=k: _k)
+        app = Explorer(args)
+        view = view_rect(pg, (round(W * k), round(H * k)))
+        pg.event.post(pg.event.Event(
+            pg.MOUSEMOTION,
+            pos=(view.x + canvas_xy[0] * view.w / W,
+                 view.y + canvas_xy[1] * view.h / H),
+            rel=(0, 0), buttons=(0, 0, 0)))
+        run(app, max_frames=1)
+        return app.hover
+
+    for target in targets:
+        base = hover_at(1.0, target)
+        assert base is not None                     # точка вообще на карте
+        for k in (0.715, 0.55):
+            assert hover_at(k, target) == base

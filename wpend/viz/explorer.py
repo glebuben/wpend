@@ -14,6 +14,12 @@
 1..6 (основной) и Shift+1..6 (сравнение, Shift+0 -- выключить); слайдер u_max
 или клавиши [ и ]; ПРОБЕЛ -- пауза; R -- сначала; Esc -- выход.
 
+Раскладка окна -- фиксированные 1280x940 (см. W, H и прямоугольники ниже).
+Если экран меньше, окно не перевёрстывается, а ужимается целиком: рисунок
+идёт на холст своего размера, а в окно кладётся масштабированная копия. Окно
+можно тянуть мышью, пропорция при этом сохраняется. Скриншоты (--screenshot)
+снимаются с холста и всегда 1280x940, иначе их было бы не сравнить.
+
 Предел момента можно и выключить (кнопка `no limit`, клавиша L, `--u-max inf`):
 мотор становится безграничным, и видно, чего стоит «может всё» -- ЛКР удерживает
 всю карту, запрашивая около 175 Н*м при весе корпуса D = 29.4 Н*м. Реле в этом
@@ -98,6 +104,8 @@ RELAY_KEYS = ("bang", "bang-ell", "bang-ell-phi", "bang-tilt", "bang-map")
 #: краю, и не видно, что снаружи неё карта обязана быть красной у любого
 #: регулятора; 1.3 оставляет поля, в которых это видно.
 MAP_FIT = 1.3
+#: Горизонт корпуса. Отмечается на карте пунктиром, когда попадает в границы.
+HORIZON_ANGLE = float(np.pi / 2)
 
 BG = (22, 24, 28)
 PANEL = (33, 36, 42)
@@ -1042,6 +1050,34 @@ def _draw_limits(app, screen, pg):
     screen.set_clip(clip)
 
 
+def _draw_horizon(app, screen, pg, font):
+    """Пунктир на theta = +-pi/2: корпус лёг горизонтально.
+
+    Отметка не про регулятор, а про задачу. Момент тяжести идёт как D*sin(theta)
+    и ровно на pi/2 проходит максимум: правее он снова УБЫВАЕТ, и «дальше --
+    всегда тяжелее» перестаёт быть правдой. Без линии на широкой карте это
+    место ничем не отмечено, а глаз ищет его первым.
+
+    Рисуется только когда pi/2 попал в границы: на карте по умолчанию
+    (theta_max около 0.15) линия ушла бы за край, и pygame нарисовал бы её по
+    самой кромке панели -- отметка не там, где написано, хуже, чем её
+    отсутствие.
+    """
+    x, y, w, h = MAP
+    if app.spec.theta_max < HORIZON_ANGLE:
+        return
+    for sign in (+1, -1):
+        px, _ = _to_map_px(app, sign * HORIZON_ANGLE, 0.0)
+        if not x <= px <= x + w:
+            continue
+        for top in range(int(y), int(y + h), 11):       # штрих 6, пропуск 5
+            pg.draw.line(screen, DIM, (px, top), (px, min(top + 6, y + h)))
+        label = font.render("pi/2", True, DIM)
+        # Подпись уводится внутрь карты, чтобы не залезть на рамку панели.
+        lx = px + 4 if sign > 0 else px - 4 - label.get_width()
+        screen.blit(label, (min(max(lx, x + 2), x + w - label.get_width() - 2), y + 4))
+
+
 def draw_map(app, screen, pg, font):
     x, y, w, h = MAP
     _panel(screen, pg, MAP, "INITIAL CONDITIONS  theta0 (rad) x dtheta0 (rad/s)", font)
@@ -1059,6 +1095,7 @@ def draw_map(app, screen, pg, font):
         pg.draw.line(screen, GRID_LINE, (x + frac * w, y), (x + frac * w, y + h))
         pg.draw.line(screen, GRID_LINE, (x, y + frac * h), (x + w, y + frac * h))
 
+    _draw_horizon(app, screen, pg, font)
     _draw_limits(app, screen, pg)
 
     # Сравнение рисуется ПОД основным: основная кривая должна оставаться
@@ -1712,11 +1749,75 @@ def draw_header(app, screen, pg, font, big):
     screen.blit(font.render(hint, True, GRID_LINE), (W - 24 - font.size(hint)[0], H - 26))
 
 
+# Раскладка выше (W, H, MAP, ANIM, PLOT, SLIDER) задана в пикселях и подогнана
+# вручную: панели стоят впритык, а отступы внутри draw_* записаны литералами.
+# Поэтому под маленький экран окно НЕ перевёрстывается. Оно рисуется в свой
+# размер на холсте W x H, а на экран кладётся уменьшенной копией: геометрия
+# остаётся одна на всех машинах, скриншоты сравнимы между запусками, и ни одна
+# из отрисовок не знает, что её ужали.
+#
+# Флаг pg.SCALED сделал бы то же силами SDL, но он не ужимает: при экране
+# меньше холста окно всё равно создаётся 1280x940 и уезжает за край, а менять
+# его размер SCALED не даёт (проверено на pygame 2.6.1 / SDL 2.28.4). Отсюда
+# масштаб руками.
+
+TASKBAR = 96                        # запас под заголовок окна и панель задач
+
+
+def fit_scale(pg):
+    """Во сколько раз ужать холст, чтобы он поместился на рабочий стол.
+
+    Больше единицы не возвращает: растягивать пятнадцатый шрифт незачем, а на
+    большом экране окно и так на своём месте.
+
+    Отдельная функция, а не пара строк в run: в headless её ответ подменяется,
+    и тогда путь «клик в ужатом окне» становится проверяемым.
+    """
+    if os.environ.get("SDL_VIDEODRIVER") == "dummy":
+        # Экрана нет, dummy-драйвер сообщает выдуманные 1024x768.
+        return 1.0
+    try:
+        dw, dh = pg.display.get_desktop_sizes()[0]
+    except (AttributeError, IndexError, pg.error):
+        return 1.0                  # старый pygame или экрана нет -- как было
+    return max(min(dw / W, (dh - TASKBAR) / H, 1.0), 0.2)
+
+
+def view_rect(pg, size):
+    """Куда лечь холсту в окне: масштаб общий по осям, остаток -- поля.
+
+    Общий, а не по каждой оси отдельно, потому что карта -- квадратная сетка
+    начальных условий: разное сжатие по x и y превратило бы клетки в
+    прямоугольники, а робота -- в эллипс, и картинка начала бы врать о том,
+    что нарисовано.
+    """
+    ww, wh = size
+    k = min(ww / W, wh / H)
+    w, h = max(round(W * k), 1), max(round(H * k), 1)
+    return pg.Rect((ww - w) // 2, (wh - h) // 2, w, h)
+
+
+def canvas_pos(pos, view):
+    """Координаты мыши из окна в холст.
+
+    Обработчики сравнивают позицию с прямоугольниками раскладки (MAP, SLIDER,
+    кнопки), а те заданы в координатах холста. Забыть перевод -- получить окно,
+    где всё нарисовано верно, но клик попадает мимо, и промах тем больше, чем
+    сильнее ужато окно. Ошибка тихая: программа не падает.
+    """
+    return (round((pos[0] - view.x) * W / view.w),
+            round((pos[1] - view.y) * H / view.h))
+
+
 def run(app, max_frames=None, screenshot=None):
     import pygame as pg
 
     pg.init()
-    screen = pg.display.set_mode((W, H))
+    k = fit_scale(pg)
+    window = pg.display.set_mode((round(W * k), round(H * k)), pg.RESIZABLE)
+    # Холст заводится ПОСЛЕ set_mode: так он берёт формат дисплея, и
+    # smoothscale ниже не упирается в неподходящую глубину цвета.
+    screen = pg.Surface((W, H))
     pg.display.set_caption("wpend explorer")
     font = pg.font.SysFont("consolas,dejavusansmono,monospace", 15)
     big = pg.font.SysFont("consolas,dejavusansmono,monospace", 20, bold=True)
@@ -1727,11 +1828,15 @@ def run(app, max_frames=None, screenshot=None):
     running, frames = True, 0
     while running:
         dt_wall = clock.tick(60) / 1000.0
+        view = view_rect(pg, window.get_size())
         for event in pg.event.get():
             if event.type == pg.QUIT:
                 running = False
+            elif event.type == pg.VIDEORESIZE:
+                window = pg.display.set_mode(event.size, pg.RESIZABLE)
+                view = view_rect(pg, window.get_size())
             elif event.type == pg.MOUSEMOTION:
-                mx, my = event.pos
+                mx, my = canvas_pos(event.pos, view)
                 if app.dragging:
                     app.preview_u_max(u_max_from_px(mx))
                     continue
@@ -1744,27 +1849,28 @@ def run(app, max_frames=None, screenshot=None):
                 app.hover = ((int((mx - x) / cell_w),
                               app.spec.n - 1 - int((my - y) / cell_h)) if inside else None)
             elif event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+                pos = canvas_pos(event.pos, view)
                 shift = bool(pg.key.get_mods() & pg.KMOD_SHIFT)
                 bx, by, bw, bh = limit_button_rect(font)
-                if bx <= event.pos[0] < bx + bw and by <= event.pos[1] < by + bh:
+                if bx <= pos[0] < bx + bw and by <= pos[1] < by + bh:
                     app.toggle_limit()
                     continue
-                if slider_hit(event.pos):
+                if slider_hit(pos):
                     app.dragging = True
-                    app.preview_u_max(u_max_from_px(event.pos[0]))
+                    app.preview_u_max(u_max_from_px(pos[0]))
                     continue
                 if app.est_key != "ideal":
                     hit = next((sp for sp, _, tr, _ in noise_layout(font)
-                                if noise_hit(tr, event.pos)), None)
+                                if noise_hit(tr, pos)), None)
                     if hit is not None:
                         track = next(tr for sp, _, tr, _ in noise_layout(font)
                                      if sp[0] == hit[0])
                         app.noise_drag = hit[0]
-                        app.preview_noise(hit[0], noise_from_px(hit, event.pos[0], track))
+                        app.preview_noise(hit[0], noise_from_px(hit, pos[0], track))
                         continue
                 for rect, row, key in picker_layout(app, font):
                     rx, ry, rw, rh = rect
-                    if rx <= event.pos[0] < rx + rw and ry <= event.pos[1] < ry + rh:
+                    if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
                         if row == 2 and shift:
                             # Повторный Shift-клик по той же кнопке выключает
                             # сравнение: отдельной кнопки "off" ряду не нужно.
@@ -1837,6 +1943,13 @@ def run(app, max_frames=None, screenshot=None):
         draw_map(app, screen, pg, font)
         draw_robot(app, screen, pg, font)
         draw_plots(app, screen, pg, font)
+        if view.size == (W, H):
+            # Масштаб 1 -- кладём как есть: пересемплировать нечего, и текст
+            # остаётся ровно тем, что нарисовал шрифт.
+            window.blit(screen, view)
+        else:
+            window.fill(BG)         # поля, если окно другой пропорции
+            window.blit(pg.transform.smoothscale(screen, view.size), view)
         pg.display.flip()
 
         frames += 1

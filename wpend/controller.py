@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -328,3 +329,234 @@ class BangBangLQRController(Controller):
                           -self.u_max, self.u_max)[..., None]
         u_lqr = -self._error(x) @ self.K.T
         return np.where(self._engaged[..., None], u_lqr, u_bang)
+
+
+class TrajectoryTrackingController(Controller):
+    """Слежение за заранее рассчитанной траекторией: ЛКР, меняющийся во времени.
+
+        k = round((t - t0) / dt),
+        u = u_bar_k - K_k (x_hat - x_bar_k).
+
+    Откуда числа. `wpend.ddp.ilqr` один раз до прогона считает номинальную
+    траекторию (x_bar, u_bar) и матрицы K_k. Синтеза здесь нет, как и у
+    `LinearFeedbackController`: регулятор только исполняет план.
+
+    Зачем обратная связь, если план оптимален. Без неё (u = u_bar_k) это
+    разомкнутое управление: любое отклонение -- другой x0, шум, неточная
+    модель -- растёт вдоль неустойчивой траектории маятника. K_k -- это
+    линеаризация оптимального закона вокруг плана: оно говорит, как исправлять
+    отклонение δx на шаге k. Это та же K, что в обратном проходе iLQR
+    (Tassa, Erez & Todorov, IROS 2012, §II; Tedrake, *Underactuated Robotics*,
+    глава про LQR-слежение за траекторией).
+
+    Что происходит за горизонтом. Шаг k обрезается до N-1, и используется
+    последняя точка плана x_bar_N. Закон тогда постоянный:
+    u = -K_{N-1} x + (u_bar_{N-1} + K_{N-1} x_bar_N). Если цель плана --
+    ноль, а Q_f = P из `lqr()`, то конец плана уже живёт в режиме ЛКР,
+    u_bar_{N-1} ≈ -K_{N-1} x_bar_N, скобка ≈ 0, и регулятор превращается в
+    обычный ЛКР с K_{N-1} ≈ K. Замер (theta0 = 0.3, план 3 с, dt = 0.01):
+    скобка ≈ 0.004 Н·м, к 9 с |theta| ≈ 1e-4. Для других целей это не
+    гарантировано, и прогон длиннее плана -- отдельный вопрос.
+
+    Время. Индекс считается из t, а не счётчиком вызовов: так регулятор не
+    хранит памяти, и `reset()` ему не нужен. `rollout` даёт t = t0 + k·dt
+    точно (формулой, без накопления), поэтому round безопасен. dt регулятора
+    ОБЯЗАН совпадать с dt прогона: иначе план исполняется в другом темпе.
+
+    Пачка (M, n) поддерживается: t общее для всех строк, поэтому k одно и то
+    же, а x_hat - x_bar_k транслируется по строкам.
+
+    Параметры
+    ---------
+    x_bar : (N+1, n)
+    u_bar : (N, m)
+    K : (N, m, n)
+    dt : float
+    t0 : float
+        Момент, которому соответствует x_bar_0.
+    """
+
+    def __init__(self, x_bar, u_bar, K, dt, t0=0.0):
+        self.x_bar = np.asarray(x_bar, dtype=float)
+        self.u_bar = np.asarray(u_bar, dtype=float)
+        self.K = np.asarray(K, dtype=float)
+        self.dt = float(dt)
+        self.t0 = float(t0)
+        n_steps = self.u_bar.shape[0]
+        if self.x_bar.shape[0] != n_steps + 1 or self.K.shape[0] != n_steps:
+            raise ValueError(
+                f"форма плана не согласована: x_bar {self.x_bar.shape}, "
+                f"u_bar {self.u_bar.shape}, K {self.K.shape} -- нужно "
+                "(N+1, n), (N, m), (N, m, n)")
+
+    def act(self, t: float, x_hat: np.ndarray) -> np.ndarray:
+        x = np.asarray(x_hat, dtype=float)
+        n_steps = self.u_bar.shape[0]
+        k = int(round((t - self.t0) / self.dt))
+        k_u = min(max(k, 0), n_steps - 1)
+        k_x = min(max(k, 0), n_steps)       # за горизонтом держим x_bar_N
+        error = x - self.x_bar[k_x]
+        return self.u_bar[k_u] - error @ self.K[k_u].T
+
+
+class MPCController(Controller):
+    """Управление с прогнозирующей моделью (MPC) на основе `wpend.ddp.ilqr`.
+
+    Раз в такт управления dt_plan регулятор:
+      1. берёт текущую оценку x_hat как начальное состояние;
+      2. решает задачу iLQR на горизонте N шагов dt_plan по СВОЕЙ модели,
+         начиная с прошлого плана, сдвинутого на шаг (тёплый старт);
+      3. прикладывает первое управление плана u_bar_0 и держит его до
+         следующего такта (zero-order hold).
+    Остальной план выбрасывается; от него остаётся только тёплый старт.
+
+    Где здесь обратная связь. Явной матрицы K в законе нет: обратная связь --
+    это само перепланирование из измеренного состояния. На линейной системе с
+    квадратичной ценой это можно проверить точно: решение задачи из любого x
+    -- линейная функция u = -K_0 x, и MPC обязан совпасть с этой постоянной
+    обратной связью (`tests/test_mpc.py`).
+
+    Почему это законно в пяти слоях
+    -------------------------------
+    * Память (прошлый план, момент следующего такта, удерживаемое u) живёт
+      в регуляторе -- правило 2. `reset()` её стирает.
+    * Модель внутри регулятора -- это модель РЕГУЛЯТОРА, а не мир: `rollout`
+      по-прежнему двигает истинную систему. Их можно намеренно сделать
+      разными (другая масса, другой интегратор) -- опыт «MPC с неточной
+      моделью» получается подменой аргумента.
+    * Правило 5 (один dt) не нарушено: rollout зовёт `act` каждый шаг, а
+      регулятор сам решает, что между тактами управление не меняется. dt_plan
+      должен быть кратен dt прогона, иначе такт «плывёт» относительно сетки
+      прогона (такт срабатывает на первом шаге, где t >= t_next). Честное
+      разделение dt_control / dt_sim -- по-прежнему PROPOSALS.md §B2.
+    * Предел момента планировщик берёт из СВОЕЙ модели: `model.u_bounds`.
+      Модель с `u_max` -- планирование с пределом (box-DDP, `wpend/ddp.py`),
+      план допустим, и `System.clip_action` мира его не меняет. Модель без
+      предела -- прежний опыт «планировщик не знает, мир обрезает».
+
+    Устойчивость. Терминальная цена Q_f = P из `lqr()` -- классическое
+    условие устойчивости MPC: хвост за горизонтом оценён ценой ЛКР, который
+    доведёт систему до нуля (Rawlings, Mayne & Diehl, *Model Predictive
+    Control*, 2-е изд., гл. 2). Строго это доказано для точного решения и
+    терминального множества; здесь ни того, ни другого нет, так что это
+    ориентир, а не сертификат.
+
+    Параметры
+    ---------
+    model, integrator
+        Модель планировщика (обычно та же система, что в прогоне).
+    dt_plan : float
+        Шаг плана и такт перепланирования.
+    horizon : int
+        N -- число шагов плана. Горизонт в секундах -- N·dt_plan.
+    Q, R, Q_f
+        Веса цены, как в `ilqr`.
+    x_goal : (n,) | None
+    n_iter : int
+        Итераций iLQR на такт. Тёплый старт уже почти оптимален, поэтому
+        хватает 1-2 (Tassa, Erez & Todorov, IROS 2012, §III).
+    first_iter : int
+        Итераций на ПЕРВОМ такте, где тёплого старта ещё нет.
+    K_init : (m, n) | None
+        Как получить начальное приближение на первом такте: прогон модели
+        под u = -K_init x. None -- нули. Для неустойчивой системы нули плохи:
+        прогон падает, и iLQR застревает в локальном минимуме (замер в
+        `tests/test_ddp.py`: цена 3653 против 84.1).
+    record_plans : bool
+        Писать в `self.plans` каждый план (t, x_bar, u_bar, итерации, время
+        расчёта). Только для просмотра поведения; на управление не влияет.
+    mu : float
+        Регуляризация Q_uu в iLQR (см. `ilqr`). Она сдвигает не только шаг, но
+        и матрицы G: на линейной задаче при mu = 1e-6 управление отличается от
+        точного на 4e-5 относительно (Q_uu ≈ 0.05). Для прогонов это шум, для
+        точного оракула в тестах ставится mu = 0.
+
+    Пачка (M, n): каждая строка -- независимая задача со своим планом; цена
+    растёт в M раз. Для сетки начальных условий это самая дорогая вещь в
+    проекте, окно так её вызывать не должно.
+    """
+
+    def __init__(self, model, integrator, dt_plan, horizon, Q, R, Q_f, *,
+                 x_goal=None, n_iter=2, first_iter=50, K_init=None, mu=1e-6,
+                 record_plans=False):
+        self.model = model
+        self.integrator = integrator
+        self.dt_plan = float(dt_plan)
+        self.horizon = int(horizon)
+        self.Q, self.R, self.Q_f = Q, R, Q_f
+        self.x_goal = x_goal
+        self.n_iter = int(n_iter)
+        self.first_iter = int(first_iter)
+        self.K_init = None if K_init is None else np.atleast_2d(
+            np.asarray(K_init, dtype=float))
+        self.mu = float(mu)
+        self.record_plans = bool(record_plans)
+        self.reset()
+
+    def reset(self) -> None:
+        self._plans = None        # (M, N, m): u_bar последнего плана по строкам
+        self._u_hold = None       # (M, m): управление, которое держим до такта
+        self._t_next = None       # момент следующего перепланирования
+        self.n_replans = 0        # счётчик для замеров
+        # Журнал планов (record_plans=True): что регулятор ПРЕДСКАЗЫВАЛ на каждом
+        # такте. Нужен окну, которое показывает поведение алгоритма; для
+        # пачки пишется только строка 0, иначе память росла бы в M раз.
+        self.plans = []
+
+    def _initial_guess(self, x0):
+        """Прогон модели под u = -K_init x -- начальное приближение."""
+        m = self.model.n_action
+        u = np.zeros((self.horizon, m))
+        if self.K_init is None:
+            return u
+        x = np.array(x0, dtype=float)
+        for k in range(self.horizon):
+            # clip_action модели: если модель знает предел, начальный план
+            # стартует допустимым -- это ЛКР с насыщением, а не без него.
+            u[k] = self.model.clip_action(-self.K_init @ x)
+            x = self.integrator.step(self.model.f, k * self.dt_plan, x, u[k],
+                                     self.dt_plan)
+        return u
+
+    def _replan(self, t, x_row, i):
+        from .ddp import ilqr     # отложенный импорт: ddp -- не слой, см. модуль
+
+        if self._plans[i] is None:
+            u_init, max_iter = self._initial_guess(x_row), self.first_iter
+        else:
+            # Тёплый старт: план сдвигается на шаг, последнее управление
+            # повторяется. На конце плана система уже в режиме ЛКР, поэтому
+            # повтор -- разумное продолжение.
+            prev = self._plans[i]
+            u_init = np.concatenate([prev[1:], prev[-1:]], axis=0)
+            max_iter = self.n_iter
+        t_wall = time.perf_counter()
+        x_bar, u_bar, _, costs = ilqr(self.model, self.integrator, x_row, self.dt_plan,
+                                      self.horizon, self.Q, self.R, self.Q_f,
+                                      x_goal=self.x_goal, u_init=u_init, t0=t,
+                                      max_iter=max_iter, mu=self.mu,
+                                      u_bounds=self.model.u_bounds)
+        if self.record_plans and i == 0:
+            self.plans.append(dict(t=t, x=x_bar, u=u_bar[:, 0], iters=len(costs) - 1,
+                                   wall=time.perf_counter() - t_wall))
+        self._plans[i] = u_bar
+        return u_bar[0]
+
+    def act(self, t: float, x_hat: np.ndarray) -> np.ndarray:
+        x = np.asarray(x_hat, dtype=float)
+        rows = x.reshape(-1, x.shape[-1])
+        M = rows.shape[0]
+        if self._plans is None or len(self._plans) != M:
+            self._plans = [None] * M
+            self._u_hold = np.zeros((M, self.model.n_action))
+            self._t_next = None
+
+        # 1e-9 -- допуск на округление: t приходит как t0 + k·dt, а t_next
+        # копится суммой, и точное равенство может не выполниться.
+        if self._t_next is None or t >= self._t_next - 1e-9:
+            for i in range(M):
+                self._u_hold[i] = self._replan(t, rows[i], i)
+            self.n_replans += 1
+            base = t if self._t_next is None else self._t_next
+            self._t_next = base + self.dt_plan
+        return self._u_hold.reshape(x.shape[:-1] + (self.model.n_action,)).copy()
