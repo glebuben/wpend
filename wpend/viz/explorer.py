@@ -13,7 +13,7 @@
 Управление: клик по клетке -- проиграть её траекторию; кнопки сверху либо
 1..8 (основной) и Shift+1..8 (сравнение, Shift+0 -- выключить); слайдер u_max
 или клавиши [ и ]; кнопка settings или S -- панель цен ЛКР (Q, R), eps и
-горизонта; ПРОБЕЛ -- пауза; R -- сначала; Esc -- выход.
+горизонта; кнопка noise или N -- панель корреляций каналов ИДУ; ПРОБЕЛ -- пауза; R -- сначала; Esc -- выход.
 
 Раскладка окна -- фиксированные 1280x940 (см. W, H и прямоугольники ниже).
 Если экран меньше, окно не перевёрстывается, а ужимается целиком: рисунок
@@ -186,6 +186,29 @@ SETTINGS = (300, 190, 680, 520)     # панель настроек: x, y, w, h
 #: Символы, которые принимает поле ввода: число в любой записи Python.
 SETTINGS_CHARS = set("0123456789.eE-+")
 
+#: Панель шума (кнопка `noise`, клавиша N): корреляции каналов ИДУ
+#: [a_x, a_z, gyro] -- по матрице на компоненту, как в IMUSensor
+#: (PROPOSALS.md A29).  Матрица 3x3 с единицами на диагонали задаётся тремя
+#: числами над диагональю; остальное -- симметрия, поэтому несимметричную
+#: матрицу из панели ввести нельзя в принципе.
+CORR_MATRICES = (("w", "white n", "corr_w"),
+                 ("b", "drift b", "corr_b"),
+                 ("b0", "turn-on b0", "corr_b0"))
+CORR_PAIRS = ((0, 1, "a_x - a_z"), (0, 2, "a_x - gyro"), (1, 2, "a_z - gyro"))
+#: Старт -- каналы независимы, ровно прежняя модель.
+DEFAULT_CORR = {m: (0.0, 0.0, 0.0) for m, _, _ in CORR_MATRICES}
+#: Порядок обхода по Tab: матрица за матрицей (столбец за столбцом панели).
+NOISE_KEYS = [f"{m}.{i}" for m, _, _ in CORR_MATRICES for i in range(len(CORR_PAIRS))]
+NOISE_PANEL = (300, 190, 680, 400)  # панель шума: x, y, w, h
+
+
+def corr_matrix(rho):
+    """Три числа над диагональью (порядок CORR_PAIRS) -> матрица корреляции 3x3."""
+    R = np.eye(3)
+    for (i, j, _), r in zip(CORR_PAIRS, rho):
+        R[i, j] = R[j, i] = float(r)
+    return R
+
 
 def _finite_or_none(value):
     """Число -> число, inf/nan/None -> None («предела нет»).
@@ -306,16 +329,25 @@ CONTROLLER_BUILD = {key: build for key, _, build in CONTROLLERS}
 #  PassthroughEstimator, то есть регулятор увидит истину побитово.  Это опора
 #  сравнения: разница карт с ней и есть цена оценки.
 #
-#  Колесо при одном ИДУ НЕНАБЛЮДАЕМО (docs/imu_noise.md, ER-008), поэтому все
-#  неидеальные варианты идут с wheel="zero": выдуманное число в оценку колеса
-#  не кладётся вовсе.  Законно это ровно с регулятором, у которого нули в
-#  столбцах phi и dphi (bang-tilt); про остальные окно предупреждает строкой.
+#  Все неидеальные варианты -- ИДУ ПЛЮС МОТОРНЫЙ ЭНКОДЕР (решение Глеба и
+#  куратора 17.09): при одном ИДУ колесо ненаблюдаемо (rank 2 из 4), и любой
+#  регулятор с K[phi], K[dphi] != 0 получал выдуманное колесо -- смотреть на
+#  такую карту нет смысла.  С энкодером rank 4, ошибка колеса ограничена.
+#
+#  Все с компенсацией кажущейся вертикали (accel_offset = IMU_D, PROPOSALS.md
+#  A31): после смены l, r модели 17.09 без неё ЛКР с фильтром раскачивается
+#  при любом tau.  Вынос у датчика и у оценивателя -- одно число, IMU_D:
+#  разъехавшись, они молча вычитали бы не ту инерционную часть.
+
+#: Вынос ИДУ от оси колеса вдоль корпуса [м] (значение IMUSensor по умолчанию).
+IMU_D = 0.20
 
 
 def _imu(app):
-    return IMUSensor(app.system, dt=app.args.dt, mode="imu", seed=app.args.seed,
+    return IMUSensor(app.system, dt=app.args.dt, mode="imu", seed=app.args.seed, d=IMU_D,
                      sigma_g=app.noise["sigma_g"], sigma_a=app.noise["sigma_a"],
-                     b0_g=app.noise["b0_g"], b0_a=app.noise["b0_g"] * 9.8)
+                     b0_g=app.noise["b0_g"], b0_a=app.noise["b0_g"] * 9.8,
+                     **{name: corr_matrix(app.corr[m]) for m, _, name in CORR_MATRICES})
 
 
 def _imu_enc(app):
@@ -325,25 +357,22 @@ def _imu_enc(app):
                                        counts_per_rev=app.args.counts))
 
 
-def _comp(tau=None, wheel="zero"):
+def _comp(tau=None):
     """tau=None -- взять со слайдера; число -- вырожденный режим (0 или inf)."""
     return lambda app: ComplementaryEstimator(
         app.system, dt=app.args.dt,
-        tau=app.noise["tau"] if tau is None else tau, wheel=wheel)
+        tau=app.noise["tau"] if tau is None else tau,
+        wheel="encoder", accel_offset=IMU_D)
 
 
 ESTIMATORS = [
     ("ideal", "ideal", None, None),
-    ("comp", "complementary", _imu, _comp()),
+    ("comp", "comp+enc", _imu_enc, _comp()),
     # Вырожденные концы шкалы tau держим отдельными кнопками: слайдер до 0 и
     # до бесконечности не доезжает, а именно они показывают, что каждый
-    # датчик умеет в одиночку.
-    ("gyro", "gyro only", _imu, _comp(np.inf)),
-    ("acc", "accel only", _imu, _comp(0.0)),
-    # С энкодером колесо перестаёт быть ненаблюдаемым (rank 4 против 2), и
-    # ошибка колеса из растущей становится ограниченной -- её задаёт уже
-    # разрешение энкодера, а не фильтр.
-    ("enc", "IMU+encoder", _imu_enc, _comp(wheel="encoder")),
+    # датчик ИДУ умеет в одиночку (колесо -- от энкодера в обоих).
+    ("gyro", "gyro+enc", _imu_enc, _comp(np.inf)),
+    ("acc", "accel+enc", _imu_enc, _comp(0.0)),
 ]
 ESTIMATOR_KEYS = [key for key, _, _, _ in ESTIMATORS]
 ESTIMATOR_LABEL = {key: label for key, label, _, _ in ESTIMATORS}
@@ -421,6 +450,15 @@ class Explorer:
         self.noise = {"sigma_g": args.sigma_g, "sigma_a": args.sigma_a,
                       "b0_g": args.b0_g, "tau": args.tau}
         self.noise_drag = None          # какой слайдер тащат
+        # Корреляции каналов ИДУ -- тоже параметры датчика, но не слайдеры:
+        # у матрицы есть условие допустимости (положительная определённость),
+        # которое у отдельного числа не проверить, поэтому они вводятся
+        # панелью и принимаются целиком или никак -- как цены ЛКР.
+        self.corr = {k: tuple(v) for k, v in DEFAULT_CORR.items()}
+        self.noise_open = False
+        self.noise_text = {}
+        self.noise_focus = None
+        self.noise_error = ""
         self.tau_star_measured = None   # argmin замера; None -- ещё не мерили
         self.est_key = args.estimator
         # Оцениватель СРАВНЕНИЯ считается только для выбранной клетки -- ровно
@@ -545,6 +583,7 @@ class Explorer:
         self.settings_focus = SETTINGS_KEYS[0]
         self.settings_error = ""
         self.settings_open = True
+        self.noise_open = False         # модальная панель -- одна за раз
 
     def apply_settings(self, values: dict):
         """Принять новые цены ЛКР, eps и горизонт; пересчитать всё зависимое.
@@ -618,6 +657,63 @@ class Explorer:
             self._precompute()
         self._select_nearest(*self.selected_state)
         self.settings_error = ""
+        return None
+
+    # --- панель шума -------------------------------------------------------
+
+    def noise_values(self) -> dict:
+        """Текущие корреляции под ключами полей панели шума."""
+        return {f"{m}.{i}": float(r)
+                for m, _, _ in CORR_MATRICES for i, r in enumerate(self.corr[m])}
+
+    def open_noise(self):
+        """Как open_settings: поля -- то, чем посчитана текущая карта."""
+        self.noise_text = {k: f"{v:g}" for k, v in self.noise_values().items()}
+        self.noise_focus = NOISE_KEYS[0]
+        self.noise_error = ""
+        self.noise_open = True
+        self.settings_open = False
+
+    def apply_noise(self, values: dict):
+        """Принять корреляции каналов ИДУ; None -- успех, строка -- отказ.
+
+        Допустимость матрицы проверяет сам IMUSensor (пробная сборка), а не
+        окно: правило одно и живёт в одном месте.  Каждая матрица пробуется
+        отдельно, чтобы в отказе назвать, какая именно невозможна.  При отказе
+        окно не меняется ни в чём.
+
+        Пересчёт -- как у слайдеров шума (commit_noise), но только если датчик
+        сейчас кому-то нужен: при ideal у основного и без второго оценивателя
+        карта от корреляций не зависит, и платить за неё секунды незачем.
+        Фабрики датчиков читают app.corr при каждой сборке, поэтому
+        переключиться на comp позже -- уже с новыми числами.
+        """
+        merged = self.noise_values()
+        try:
+            for key, value in values.items():
+                if key not in merged:
+                    return f"unknown field {key}"
+                merged[key] = float(value)
+        except (TypeError, ValueError):
+            return f"not a number: {key} = {value!r}"
+        if not all(np.isfinite(v) for v in merged.values()):
+            return "all values must be finite"
+        corr = {m: tuple(merged[f"{m}.{i}"] for i in range(len(CORR_PAIRS)))
+                for m, _, _ in CORR_MATRICES}
+        for m, label, name in CORR_MATRICES:
+            if max(abs(r) for r in corr[m]) >= 1.0:
+                return f"{label}: need |rho| < 1"
+            try:
+                IMUSensor(self.system, dt=self.args.dt, mode="imu",
+                          **{name: corr_matrix(corr[m])})
+            except ValueError:
+                return f"{label}: impossible correlations (not positive definite)"
+
+        changed = corr != self.corr
+        self.corr = corr
+        self.noise_error = ""
+        if changed and (self.est_key != "ideal" or self.est_cmp_key is not None):
+            self.commit_noise()
         return None
 
     def _certify(self):
@@ -958,12 +1054,6 @@ class Explorer:
         # длинная фраза не помещается и обрезается краем окна.
         if self.P is None:
             self.design_hint = "ellipsoid needs scipy:  uv sync --extra dev"
-        elif getattr(self, "est_key", "ideal") != "ideal" and self.K is not None \
-                and not np.allclose(self.K[0, [I_PHI, I_DPHI]], 0.0):
-            # Колесо при одном ИДУ ненаблюдаемо, а K его всё равно спрашивает.
-            # Не отключаем -- увидеть, как это ломается, полезно, -- но молчать
-            # нельзя: иначе карта врёт, а причина не написана.
-            self.design_hint = "IMU cannot see the wheel, yet K[phi], K[dphi] != 0"
         else:
             self.design_hint = ""
 
@@ -1857,12 +1947,25 @@ def draw_slider(app, screen, pg, font):
     screen.blit(font.render("settings", True, BG if app.settings_open else TEXT),
                 (srect[0] + 9, srect[1] + 3))
 
+    nrect = noise_button_rect(font)
+    pg.draw.rect(screen, BTN_ON if app.noise_open else BTN, nrect, border_radius=4)
+    pg.draw.rect(screen, GRID_LINE, nrect, 1, border_radius=4)
+    screen.blit(font.render("noise", True, BG if app.noise_open else TEXT),
+                (nrect[0] + 9, nrect[1] + 3))
+
 
 def settings_button_rect(font):
     """Кнопка «settings» в правом конце ряда u_max. Чистая функция, как
     limit_button_rect: одна раскладка и на отрисовку, и на обработку клика."""
     w = font.size("settings")[0] + 18
     return (W - 24 - w, SLIDER[1] - 4, w, 22)
+
+
+def noise_button_rect(font):
+    """Кнопка «noise» слева от «settings», в том же ряду."""
+    sx = settings_button_rect(font)[0]
+    w = font.size("noise")[0] + 18
+    return (sx - 10 - w, SLIDER[1] - 4, w, 22)
 
 
 def settings_layout(font):
@@ -1986,6 +2089,125 @@ def settings_key(app, event, pg):
             app.settings_text[app.settings_focus] = text[:-1]
         elif event.unicode and event.unicode in SETTINGS_CHARS:
             app.settings_text[app.settings_focus] = text + event.unicode
+    return True
+
+
+# --- панель шума ---------------------------------------------------------------
+#  Устроена ровно как панель настроек: чистая раскладка, отрисовка, клик,
+#  клавиши.  Проверка и пересчёт -- в Explorer.apply_noise.
+
+
+def noise_panel_layout(font):
+    """Раскладка панели шума: [(kind, key, rect)], как settings_layout."""
+    x, y, w, h = NOISE_PANEL
+    out = []
+    for c, (m, _, _) in enumerate(CORR_MATRICES):
+        for i in range(len(CORR_PAIRS)):
+            out.append(("field", f"{m}.{i}", (x + 170 + c * 165, y + 110 + i * 30, 140, 24)))
+    bx = x + 24
+    for key in ("apply", "defaults", "close"):
+        bw = font.size(key)[0] + 24
+        out.append(("button", key, (bx, y + h - 44, bw, 26)))
+        bx += bw + 10
+    return out
+
+
+def draw_noise_panel(app, screen, pg, font):
+    """Панель шума поверх окна: корреляции каналов ИДУ, три матрицы."""
+    if not app.noise_open:
+        return
+    veil = pg.Surface((W, H), pg.SRCALPHA)
+    veil.fill(BG + (150,))
+    screen.blit(veil, (0, 0))
+    x, y, w, h = NOISE_PANEL
+    pg.draw.rect(screen, PANEL, NOISE_PANEL, border_radius=6)
+    pg.draw.rect(screen, GRID_LINE, NOISE_PANEL, 1, border_radius=6)
+    screen.blit(font.render("NOISE  --  IMU channel correlation  Sigma = D R D",
+                            True, TEXT), (x + 24, y + 16))
+    screen.blit(font.render("R: 3x3, ones on the diagonal, symmetric -- enter the upper triangle",
+                            True, DIM), (x + 24, y + 38))
+    screen.blit(font.render("rho", True, DIM), (x + 24, y + 86))
+    for c, (_, label, _) in enumerate(CORR_MATRICES):
+        screen.blit(font.render(label, True, TEXT), (x + 170 + c * 165, y + 86))
+    for i, (_, _, label) in enumerate(CORR_PAIRS):
+        screen.blit(font.render(label, True, DIM), (x + 24, y + 114 + i * 30))
+
+    for kind, key, rect in noise_panel_layout(font):
+        if kind == "field":
+            focused = key == app.noise_focus
+            pg.draw.rect(screen, BG, rect, border_radius=3)
+            pg.draw.rect(screen, ACCENT if focused else GRID_LINE, rect, 1, border_radius=3)
+            text = app.noise_text.get(key, "")
+            screen.blit(font.render(text + ("_" if focused else ""), True, TEXT),
+                        (rect[0] + 6, rect[1] + 4))
+        else:
+            fill = BTN_ON if key == "apply" else BTN
+            pg.draw.rect(screen, fill, rect, border_radius=4)
+            screen.blit(font.render(key, True, BG if key == "apply" else TEXT),
+                        (rect[0] + 12, rect[1] + 5))
+
+    # Чем датчик окна посчитан сейчас: у ухода окно не задаёт sigma, берутся
+    # значения IMUSensor по умолчанию -- и на горизонте в секунды уход мал,
+    # так что корреляция drift почти не видна.  Лучше сказать это прямо, чем
+    # оставить гадать, почему столбец ничего не меняет.
+    s = IMUSensor(app.system, dt=app.args.dt, mode="imu")
+    lines = [
+        f"white:   sig_a {app.noise['sigma_a']:.1e}, sig_g {app.noise['sigma_g']:.1e}  (sliders)",
+        f"drift:   sig_ba {s.sigma_b[0]:.0e}, sig_bg {s.sigma_b[2]:.0e}, tau inf  (sensor defaults)",
+        f"turn-on: b0_g {app.noise['b0_g']:.1e}, b0_a = 9.8 * b0_g  (slider)",
+    ]
+    if app.est_key == "ideal" and app.est_cmp_key is None:
+        lines.append("estimator ideal: the map does not use the IMU")
+    for i, line in enumerate(lines):
+        screen.blit(font.render(line, True, DIM), (x + 24, y + 220 + i * 20))
+    if app.noise_error:
+        screen.blit(font.render(app.noise_error, True, (235, 110, 90)),
+                    (x + 24, y + h - 78))
+    hint = "Enter apply   Tab next   Esc close"
+    screen.blit(font.render(hint, True, DIM), (x + w - 24 - font.size(hint)[0], y + h - 39))
+
+
+def noise_click(app, pos, font):
+    """Клик при открытой панели шума. Вне панели -- ничего (модальная)."""
+    for kind, key, (rx, ry, rw, rh) in noise_panel_layout(font):
+        if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
+            if kind == "field":
+                app.noise_focus = key
+            elif key == "apply":
+                noise_submit(app)
+            elif key == "defaults":
+                for m, _, _ in CORR_MATRICES:
+                    for i, v in enumerate(DEFAULT_CORR[m]):
+                        app.noise_text[f"{m}.{i}"] = f"{v:g}"
+            elif key == "close":
+                app.noise_open = False
+            return
+
+
+def noise_submit(app):
+    """Применить введённое. Ошибка остаётся на панели, окно -- прежним."""
+    error = app.apply_noise(dict(app.noise_text))
+    app.noise_error = error or ""
+    if error is None:
+        app.noise_open = False
+
+
+def noise_key(app, event, pg):
+    """Клавиша при открытой панели шума; то же поведение, что settings_key."""
+    if event.key == pg.K_ESCAPE:
+        app.noise_open = False
+    elif event.key in (pg.K_RETURN, pg.K_KP_ENTER):
+        noise_submit(app)
+    elif event.key in (pg.K_TAB, pg.K_DOWN, pg.K_UP):
+        step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
+        i = NOISE_KEYS.index(app.noise_focus) if app.noise_focus else -1
+        app.noise_focus = NOISE_KEYS[(i + step) % len(NOISE_KEYS)]
+    elif app.noise_focus is not None:
+        text = app.noise_text.get(app.noise_focus, "")
+        if event.key == pg.K_BACKSPACE:
+            app.noise_text[app.noise_focus] = text[:-1]
+        elif event.unicode and event.unicode in SETTINGS_CHARS:
+            app.noise_text[app.noise_focus] = text + event.unicode
     return True
 
 
@@ -2175,6 +2397,13 @@ def run(app, max_frames=None, screenshot=None):
                 settings_key(app, event, pg)
             elif app.settings_open and event.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONUP):
                 continue
+            elif app.noise_open and event.type == pg.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    noise_click(app, canvas_pos(event.pos, view), font)
+            elif app.noise_open and event.type == pg.KEYDOWN:
+                noise_key(app, event, pg)
+            elif app.noise_open and event.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONUP):
+                continue
             elif event.type == pg.MOUSEMOTION:
                 mx, my = canvas_pos(event.pos, view)
                 if app.dragging:
@@ -2198,6 +2427,10 @@ def run(app, max_frames=None, screenshot=None):
                 sx, sy, sw, sh = settings_button_rect(font)
                 if sx <= pos[0] < sx + sw and sy <= pos[1] < sy + sh:
                     app.open_settings()
+                    continue
+                nx, ny, nw, nh = noise_button_rect(font)
+                if nx <= pos[0] < nx + nw and ny <= pos[1] < ny + nh:
+                    app.open_noise()
                     continue
                 if slider_hit(pos):
                     app.dragging = True
@@ -2251,6 +2484,8 @@ def run(app, max_frames=None, screenshot=None):
                     app.toggle_limit()
                 elif event.key == pg.K_s:
                     app.open_settings()
+                elif event.key == pg.K_n:
+                    app.open_noise()
                 elif event.key == pg.K_t:
                     # Дорого (секунды), поэтому по явной просьбе, а не на
                     # каждом движении слайдера.
@@ -2290,6 +2525,7 @@ def run(app, max_frames=None, screenshot=None):
         draw_robot(app, screen, pg, font)
         draw_plots(app, screen, pg, font)
         draw_settings(app, screen, pg, font)
+        draw_noise_panel(app, screen, pg, font)
         if view.size == (W, H):
             # Масштаб 1 -- кладём как есть: пересемплировать нечего, и текст
             # остаётся ровно тем, что нарисовал шрифт.
@@ -2325,7 +2561,7 @@ def build_parser():
                    help="регулятор сравнения: рисуется полупрозрачным поверх")
     p.add_argument("--estimator", choices=ESTIMATOR_KEYS, default="ideal",
                    help="что видит регулятор: ideal -- истину, остальные -- "
-                        "показания ИДУ через комплементарный фильтр")
+                        "показания ИДУ и энкодера через комплементарный фильтр")
     p.add_argument("--estimator-compare", choices=ESTIMATOR_KEYS, default=None,
                    help="второй оцениватель: считается для выбранной клетки и "
                         "накладывается полупрозрачным")
@@ -2338,7 +2574,7 @@ def build_parser():
     p.add_argument("--tau", type=float, default=0.30,
                    help="постоянная времени комплементарного фильтра, с")
     p.add_argument("--counts", type=int, default=2048,
-                   help="меток на оборот у энкодера (вариант IMU+encoder)")
+                   help="меток на оборот у моторного энкодера (он во всех вариантах, кроме ideal)")
     p.add_argument("--seed", type=int, default=0,
                    help="зерно шума датчика (при --estimator, отличном от ideal)")
     p.add_argument("--eps", type=float, default=0.05,

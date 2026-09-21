@@ -185,23 +185,31 @@ def test_estimator_row_changes_the_map_and_records_the_estimate():
 
 
 @pytest.mark.slow
-def test_estimator_cycles_and_hint_names_the_wheel_problem():
+def test_estimator_cycles_and_every_variant_carries_the_encoder():
+    """Решение 17.09: без энкодера колесо ненаблюдаемо, и такие варианты окно
+    больше не предлагает.  Предупреждения про колесо поэтому нет."""
     os.environ["SDL_VIDEODRIVER"] = "dummy"
-    from wpend.viz.explorer import build_parser, Explorer, ESTIMATOR_KEYS
+    from wpend.estimator import ComplementaryEstimator
+    from wpend.sensor import EncoderSensor, IMUSensor, StackedSensor
+    from wpend.viz.explorer import build_parser, Explorer, ESTIMATOR_KEYS, IMU_D
 
     args = build_parser().parse_args(
         ["--grid", "7", "--horizon", "1.0", "--stride", "20", "--main", "lqr"]
     )
     app = Explorer(args)
     assert app.est_key == "ideal" and app.design_hint == ""
-    app.set_estimator("gyro")
-    assert app.est_key == "gyro"
-    # K полного ЛКР спрашивает колесо, которого ИДУ не видит -- окно обязано
-    # сказать об этом вслух, а не молча покрасить карту
-    assert "wheel" in app.design_hint
     for key in ESTIMATOR_KEYS:
         app.set_estimator(key)
-        assert app.est_key == key
+        assert app.est_key == key and app.design_hint == ""
+        if key == "ideal":
+            assert app._sensor() is None and app._estimator() is None
+            continue
+        sensor, est = app._sensor(), app._estimator()
+        assert isinstance(sensor, StackedSensor)
+        assert [type(s) for s in sensor.sensors] == [IMUSensor, EncoderSensor]
+        assert isinstance(est, ComplementaryEstimator) and est.wheel == "encoder"
+        # вынос у датчика и у компенсации -- одно число, иначе вычитается не то
+        assert sensor.sensors[0].d == est.accel_offset == IMU_D
 
 
 @pytest.mark.slow
@@ -234,23 +242,28 @@ def test_second_estimator_runs_only_for_the_selected_cell():
 
 
 @pytest.mark.slow
-def test_encoder_estimator_is_offered_and_closes_the_wheel_gap():
-    """Вариант IMU+encoder обязан присутствовать и обязан давать ограниченную
-    ошибку колеса там, где счисление пути расходится."""
+def test_full_lqr_with_the_estimator_holds_what_ideal_holds_near_upright():
+    """Регрессия 17.09: ЛКР с comp+enc раскачивался (кажущаяся вертикаль при
+    новых l, r).  Узкая карта у вертикали: удержанное идеальным обязано быть
+    удержано и с оценивателем, а ошибка колеса -- ограничена энкодером."""
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     import numpy as np
 
-    from wpend.viz.explorer import build_parser, Explorer, ESTIMATOR_KEYS
+    from wpend.viz.explorer import build_parser, Explorer
+    from wpend.viz.grid import HELD
 
-    assert "enc" in ESTIMATOR_KEYS
-    args = build_parser().parse_args(
-        ["--grid", "7", "--horizon", "3.0", "--stride", "20", "--main", "lqr",
-         "--estimator", "enc"]
-    )
-    app = Explorer(args)
-    assert app.traj.x_hat is not None
-    err = np.abs(app.traj.x_hat[:, 1] - app.traj.x[:-1, 1])   # phi
-    assert np.max(err[np.isfinite(err)]) < 1.0                # не расходится
+    def app_for(est):
+        return Explorer(build_parser().parse_args(
+            ["--grid", "5", "--horizon", "4.0", "--stride", "20", "--main", "lqr",
+             "--u-max", "10", "--theta-max", "0.15", "--dtheta-max", "0.3",
+             "--estimator", est]))
+
+    ideal, comp = app_for("ideal"), app_for("comp")
+    held_ideal = ideal.outcome == HELD
+    assert held_ideal.sum() > 0
+    assert np.all(comp.outcome[held_ideal] == HELD)
+    err = np.abs(comp.traj.x_hat[:, 1] - comp.traj.x[:-1, 1])   # phi
+    assert np.max(err[np.isfinite(err)]) < 0.1
 
 
 @pytest.mark.slow
@@ -280,8 +293,9 @@ def test_noise_sliders_drive_the_sensor_and_the_analytic_mark():
     assert app.stale is True                       # карта помечена устаревшей
 
     # значение действительно доезжает до датчика
-    assert app._sensor().sigma_w[2] == pytest.approx(app.noise["sigma_g"])
-    assert app._sensor().sigma_w[0] == pytest.approx(8e-3)
+    imu = app._sensor().sensors[0]
+    assert imu.sigma_w[2] == pytest.approx(app.noise["sigma_g"])
+    assert imu.sigma_w[0] == pytest.approx(8e-3)
 
 
 @pytest.mark.slow

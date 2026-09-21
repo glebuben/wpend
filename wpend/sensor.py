@@ -89,6 +89,54 @@ class GaussianNoiseSensor(Sensor):
         return x + self.sigma * self._rng.standard_normal(x.shape)
 
 
+def _correlation_matrix(R, name: str, n: int) -> np.ndarray:
+    """Проверить матрицу корреляции и вернуть её как массив (None -> I).
+
+    Проверки громкие, потому что каждая ошибка здесь иначе молчит: без
+    симметрии Холецкий берёт только нижний треугольник, без единиц на
+    диагонали R меняет величину шума, которую задают sigma.
+    """
+    if R is None:
+        return np.eye(n)
+    R = np.asarray(R, dtype=float)
+    if R.shape != (n, n):
+        raise ValueError(f"{name}: нужна матрица {n}x{n} [a_x, a_z, gyro], получено {R.shape}")
+    if not np.all(np.isfinite(R)):
+        raise ValueError(f"{name}: есть inf или nan")
+    if not np.allclose(R, R.T, rtol=0.0, atol=1e-12):
+        raise ValueError(f"{name}: матрица корреляции должна быть симметричной")
+    if not np.allclose(np.diag(R), 1.0, rtol=0.0, atol=1e-12):
+        raise ValueError(
+            f"{name}: на диагонали должны стоять единицы -- величину шума "
+            "задают sigma, а R только связывает каналы"
+        )
+    return R
+
+
+def _cholesky(M: np.ndarray, name: str) -> np.ndarray:
+    """Нижнетреугольная C, C C^T = M; понятная ошибка вместо LinAlgError."""
+    try:
+        return np.linalg.cholesky(M)
+    except np.linalg.LinAlgError:
+        raise ValueError(
+            f"{name}: матрица не положительно определена -- таких корреляций "
+            "не бывает у реальных величин (для 3x3 нужно "
+            "1 - r12^2 - r13^2 - r23^2 + 2 r12 r13 r23 > 0 и |r| < 1)"
+        ) from None
+
+
+def _drift_gram(rate: np.ndarray, dt: float) -> np.ndarray:
+    """G_ij = int_0^dt exp(-(l_i + l_j) s) ds, l = 1/tau.
+
+    Множитель при sigma_i sigma_j rho_ij в ковариации приращения ухода за шаг
+    (вывод -- докстринг IMUSensor).  При l_i + l_j = 0 (оба блуждания) -- dt.
+    expm1 нужен, потому что при tau >> dt 1 - exp(-x) теряет знаки.
+    """
+    s = rate[:, None] + rate[None, :]
+    s_safe = np.where(s == 0.0, 1.0, s)
+    return np.where(s == 0.0, dt, -np.expm1(-s_safe * dt) / s_safe)
+
+
 class IMUSensor(Sensor):
     """Инерциальный датчик: белый шум + смещение нуля + его уход.
 
@@ -132,6 +180,52 @@ class IMUSensor(Sensor):
     на кривой Аллана; на горизонте 5-20 с при tau ~ 100 с разницы нет.
     Подробности и ссылки -- docs/imu_noise.md.
 
+    Корреляция между каналами.  Каналы [a_x, a_z, gyro] сидят на одном
+    кристалле: общий АЦП и питание, перекрёстная чувствительность осей,
+    а у ухода -- общая температура.  Поэтому у каждой из трёх компонент своя
+    матрица корреляции R (3x3, безразмерная, единицы на диагонали):
+    corr_w -- белый шум, corr_b -- уход, corr_b0 -- смещение включения.
+    Величина шума по-прежнему задаётся sigma, связь каналов -- только R:
+
+        Sigma = D R D,   D = diag(sigma)
+
+    Отсчёт берётся как e = D C z, где C C^T = R (Холецкий), z ~ N(0, I):
+    тогда Cov(e) = D C C^T D = Sigma.  Раскладывается именно R, а не Sigma:
+    при нулевом sigma у какого-то канала Sigma вырождена и Холецкого не
+    имеет, а R положительно определена всегда, когда вообще допустима
+    (Glasserman, Monte Carlo Methods in Financial Engineering, §2.3.3).
+    При R = I матрица C единичная, и отсчёты те же, что без корреляции.
+
+    Уход с корреляцией.  R_b -- корреляция НЕПРЕРЫВНОГО шума w(t), а не
+    дискретных приращений:
+
+        db = -Lambda b dt + D_b dW,   E[dW dW^T] = R_b dt,   Lambda = diag(1/tau)
+
+    Точная дискретизация (Farrell, Aided Navigation, гл. 4, дискретный
+    эквивалент Q_d; Maybeck, Stochastic Models, т. 1, §4.9):
+
+        b_k = Phi b_{k-1} + q_k,   Phi = diag(exp(-dt/tau)),   q_k ~ N(0, Q)
+        Q_ij = sigma_i sigma_j rho_ij G_ij,
+        G_ij = int_0^dt exp(-(l_i + l_j) s) ds = (1 - exp(-(l_i+l_j) dt)) / (l_i+l_j),
+        l_i = 1/tau_i   (при tau = inf l = 0 и G = dt -- блуждание).
+
+    На диагонали это прежняя формула tau/2 (1 - exp(-2dt/tau)).  Брать
+    Q_ij = rho_ij sqrt(Q_ii Q_jj) неверно при разных tau: ошибка порядка
+    dt/tau, незаметная при dt << tau и заметная, когда шаг сравним с tau.
+    Q = D (R_b o G) D положительно определена: G -- матрица Грама функций
+    exp(-l_i s), а произведение Адамара положительно определённой R_b и
+    неотрицательной G с положительной диагональю положительно определено
+    (теорема Шура; Horn & Johnson, Matrix Analysis, §7.5).
+
+    Что именно задаёт R_b.  У блуждания Cov b(t) = D_b R_b D_b t, и
+    корреляция самих смещений равна R_b.  У марковского процесса в
+    стационаре Cov b_ij = sigma_i sigma_j rho_ij / (l_i + l_j), то есть
+    corr(b_i, b_j) = rho_ij * 2 sqrt(tau_i tau_j) / (tau_i + tau_j) <= rho_ij.
+
+    В mode="state" на контур попадают только a_x и gyro, и со сменой
+    знака: ошибка theta = -e_ax/g, поэтому corr(ошибка theta, ошибка dtheta)
+    = -rho(a_x, gyro).
+
     Два режима.
       * mode="state" (по умолчанию) -- y имеет форму состояния: шум и смещение
         кладутся на theta и dtheta, колесо (phi, dphi) проходит без ошибки,
@@ -166,6 +260,12 @@ class IMUSensor(Sensor):
     d : float
         Вынос датчика от оси колеса вдоль корпуса [м].  Нужен только в режиме
         "imu".
+    corr_w, corr_b, corr_b0 : массив 3x3 | None
+        Матрицы корреляции белого шума, ухода и смещения включения в порядке
+        каналов [a_x, a_z, gyro].  None -- единичная (каналы независимы).
+        Требования: симметрична, единицы на диагонали, положительно
+        определена.  |rho| = 1 ровно запрещено: R вырождена, и такой канал --
+        не отдельный датчик, а копия другого.
     seed : int | None
         Зерно.  reset() возвращает генератор в начало, поэтому два прогона с
         одним seed дают одинаковое смещение включения и одинаковый шум.
@@ -188,6 +288,9 @@ class IMUSensor(Sensor):
         tau_g: float = np.inf,
         tau_a: float = np.inf,
         d: float = 0.20,
+        corr_w=None,
+        corr_b=None,
+        corr_b0=None,
         seed: int | None = None,
     ):
         if mode not in ("state", "imu"):
@@ -208,6 +311,22 @@ class IMUSensor(Sensor):
         self.sigma_b = np.array([sigma_ba, sigma_ba, sigma_bg], dtype=float)
         self.b0 = np.array([b0_a, b0_a, b0_g], dtype=float)
         self.tau = np.array([tau_a, tau_a, tau_g], dtype=float)
+
+        self.corr_w = _correlation_matrix(corr_w, "corr_w", self._N_BIAS)
+        self.corr_b = _correlation_matrix(corr_b, "corr_b", self._N_BIAS)
+        self.corr_b0 = _correlation_matrix(corr_b0, "corr_b0", self._N_BIAS)
+
+        # Все множители отсчётов считаются здесь один раз: dt у датчика
+        # фиксирован (measure падает при расхождении), значит и Phi, и Q от
+        # шага не зависят.  Строка i матрицы L -- как канал i собирается из
+        # независимых z: e = z @ L.T.
+        self._L_w = (self.sigma_w / np.sqrt(self.dt))[:, None] * _cholesky(self.corr_w, "corr_w")
+        self._L_b0 = self.b0[:, None] * _cholesky(self.corr_b0, "corr_b0")
+        rate = 1.0 / self.tau                            # при tau = inf ровно 0.0
+        self._phi = np.exp(-self.dt * rate)
+        self._L_b = self.sigma_b[:, None] * _cholesky(
+            self.corr_b * _drift_gram(rate, self.dt), "corr_b (вместе с tau)"
+        )
 
         names = tuple(system.state_names)
         if "theta" not in names or "dtheta" not in names:
@@ -247,7 +366,7 @@ class IMUSensor(Sensor):
         """
         shape = prefix + (self._N_BIAS,)
         if self._b is None or self._b.shape != shape:
-            self._b = self.b0 * self._rng.standard_normal(shape)
+            self._b = self._rng.standard_normal(shape) @ self._L_b0.T
             self._t_prev = t
             return self._b
 
@@ -260,22 +379,16 @@ class IMUSensor(Sensor):
                 "заданным датчику.  И шум (1/sqrt(dt)), и уход (sqrt(dt)) зависят "
                 "от шага -- расхождение молча испортило бы обе модели."
             )
-        tau_safe = np.where(np.isinf(self.tau), 1.0, self.tau)
-        phi = np.exp(-dt / self.tau)                     # при tau=inf ровно 1.0
-        var = np.where(
-            np.isinf(self.tau),
-            dt,                                          # предел блуждания
-            -tau_safe * np.expm1(-2.0 * dt / tau_safe) / 2.0,   # expm1: без потери точности при tau >> dt
-        )
-        self._b = phi * self._b + self.sigma_b * np.sqrt(var) * self._rng.standard_normal(shape)
+        # Phi и L_b посчитаны в __init__ по self.dt, а не по dt = t - t_prev:
+        # разность времён несёт ошибку округления, а шаг датчика -- ровно
+        # self.dt (сверено выше).
+        self._b = self._phi * self._b + self._rng.standard_normal(shape) @ self._L_b.T
         self._t_prev = t
         return self._b
 
     def _white(self, prefix: tuple[int, ...]) -> np.ndarray:
-        """Белый шум одного отсчёта: плотность / sqrt(dt)."""
-        return (self.sigma_w / np.sqrt(self.dt)) * self._rng.standard_normal(
-            prefix + (self._N_BIAS,)
-        )
+        """Белый шум одного отсчёта: плотность / sqrt(dt), с корреляцией corr_w."""
+        return self._rng.standard_normal(prefix + (self._N_BIAS,)) @ self._L_w.T
 
     # --- измерение --------------------------------------------------------
 
