@@ -12,7 +12,7 @@
     это «лучшее из возможного».
 
 Настройки те же, что в окне: Q = diag(100, 1, 10, 1), R = 1, горизонт 5 с,
-dt = 1 мс, упал = |theta| >= 1.3, карта в 1.3 раза шире множества. MPC:
+dt = 1 мс, упал = |psi| >= 1.3, карта в 1.3 раза шире множества. MPC:
 такт 20 мс, горизонт 1 с, Q_f = P.
 
 Карта печатается символами (matplotlib в dev не утверждён, §B11):
@@ -20,7 +20,7 @@ dt = 1 мс, упал = |theta| >= 1.3, карта в 1.3 раза шире мн
     L -- держит только ЛКР           . -- не держит никто, но восстановимо
     пробел -- невосстановимо и никто не держит
     ! -- невосстановимо, но кто-то «держит» (быть не должно: проверка)
-Строки -- dtheta0 сверху вниз по убыванию, столбцы -- theta0 слева направо.
+Строки -- dpsi0 сверху вниз по убыванию, столбцы -- psi0 слева направо.
 
 Запуск:  uv run python examples/mpc_clip_map.py --u-max 3 --grid 11
 (MPC -- отдельный прогон на клетку, ~8 с; 121 клетка на 2 ядрах ~8 мин)
@@ -49,7 +49,7 @@ from wpend.models import WheeledPendulum
 
 Q = np.diag([100.0, 1.0, 10.0, 1.0])
 R = np.array([[1.0]])
-DT, HORIZON_S, THETA_FALL, MAP_FIT = 1e-3, 5.0, 1.3, 1.3
+DT, HORIZON_S, PSI_FALL, MAP_FIT = 1e-3, 5.0, 1.3, 1.3
 N_SIM = int(round(HORIZON_S / DT))
 DT_PLAN, PLAN_STEPS = 0.02, 50
 
@@ -58,9 +58,9 @@ def _never(x):
     return np.zeros(np.shape(x)[:-1], dtype=bool)
 
 
-def fell_mask(x_theta):
-    """(M, T) -> (M,): первое пересечение |theta| = theta_fall после старта."""
-    return (np.abs(x_theta[:, 1:]) >= THETA_FALL).any(axis=1)
+def fell_mask(x_psi):
+    """(M, T) -> (M,): первое пересечение |psi| = psi_fall после старта."""
+    return (np.abs(x_psi[:, 1:]) >= PSI_FALL).any(axis=1)
 
 
 def run_mpc_cell(args):
@@ -72,9 +72,9 @@ def run_mpc_cell(args):
     K, P = lqr(A, B, Q, R)
     ctrl = MPCController(model, RK4Integrator(), DT_PLAN, PLAN_STEPS, Q, R, P, K_init=K)
     traj = rollout(world, ctrl, RK4Integrator(), x0, DT, N_SIM)
-    theta = traj.x[:, 0]
+    psi = traj.x[:, 0]
     saturated = float(np.mean(np.abs(traj.u[:, 0]) >= u_max - 1e-9))
-    return bool(fell_mask(theta[None])[0]), abs(theta[-1]), saturated
+    return bool(fell_mask(psi[None])[0]), abs(psi[-1]), saturated
 
 
 def main():
@@ -91,12 +91,12 @@ def main():
     A, B = model.linearize_upright()
     K, P = lqr(A, B, Q, R)
 
-    theta_max = min(MAP_FIT * world.saddle_angle(u_max), 0.98 * THETA_FALL)
+    psi_max = min(MAP_FIT * world.saddle_angle(u_max), 0.98 * PSI_FALL)
     _, ceiling = world.recoverable_bounds(u_max, np.zeros(1))
-    dtheta_max = MAP_FIT * float(ceiling[0])
-    thetas = np.linspace(-theta_max, theta_max, n)
-    dthetas = np.linspace(-dtheta_max, dtheta_max, n)
-    TH, DTH = np.meshgrid(thetas, dthetas, indexing="xy")
+    dpsi_max = MAP_FIT * float(ceiling[0])
+    psis = np.linspace(-psi_max, psi_max, n)
+    dpsis = np.linspace(-dpsi_max, dpsi_max, n)
+    TH, DTH = np.meshgrid(psis, dpsis, indexing="xy")
     X0 = np.zeros((n * n, 4))
     X0[:, 0], X0[:, 2] = TH.ravel(), DTH.ravel()
     recoverable = world.is_recoverable(u_max, X0[:, 0], X0[:, 2])
@@ -112,12 +112,12 @@ def main():
     with ProcessPoolExecutor(args.workers) as pool:
         out = list(pool.map(run_mpc_cell, [(u_max, x) for x in X0]))
     held_mpc = ~np.array([o[0] for o in out])
-    theta_end = np.array([o[1] for o in out])
+    psi_end = np.array([o[1] for o in out])
     sat = np.array([o[2] for o in out])
     elapsed = time.perf_counter() - t0
 
-    print(f"u_max = {u_max} Н·м, сетка {n}x{n}, theta0 до ±{theta_max:.3f}, "
-          f"dtheta0 до ±{dtheta_max:.2f}; MPC считался {elapsed / 60:.1f} мин")
+    print(f"u_max = {u_max} Н·м, сетка {n}x{n}, psi0 до ±{psi_max:.3f}, "
+          f"dpsi0 до ±{dpsi_max:.2f}; MPC считался {elapsed / 60:.1f} мин")
     print(f"  восстановимо: {recoverable.sum():4d}")
     print(f"  реле:         {held_bang.sum():4d}   (совпадает с множеством в "
           f"{(held_bang == recoverable).sum()} клетках из {n * n})")
@@ -126,10 +126,10 @@ def main():
           f"{(held_mpc & ~held_lqr).sum()}, только ЛКР: {(held_lqr & ~held_mpc).sum()})")
     kept = held_mpc
     if kept.any():
-        print(f"  MPC, удержанные: max |theta(5 с)| = {theta_end[kept].max():.2e}, "
+        print(f"  MPC, удержанные: max |psi(5 с)| = {psi_end[kept].max():.2e}, "
               f"доля шагов в насыщении до {sat[kept].max():.2f}")
 
-    print("\n  dtheta0 \\ theta0 ->")
+    print("\n  dpsi0 \\ psi0 ->")
     for iy in range(n - 1, -1, -1):
         line = []
         for ix in range(n):
@@ -145,12 +145,12 @@ def main():
                 line.append("L")
             else:
                 line.append(".")
-        print(f"  {dthetas[iy]:+6.2f} |" + " ".join(line) + "|")
+        print(f"  {dpsis[iy]:+6.2f} |" + " ".join(line) + "|")
 
     if args.save:
-        np.savez(args.save, thetas=thetas, dthetas=dthetas, recoverable=recoverable,
+        np.savez(args.save, psis=psis, dpsis=dpsis, recoverable=recoverable,
                  held_lqr=held_lqr, held_bang=held_bang, held_mpc=held_mpc,
-                 theta_end=theta_end, sat=sat)
+                 psi_end=psi_end, sat=sat)
 
 
 if __name__ == "__main__":

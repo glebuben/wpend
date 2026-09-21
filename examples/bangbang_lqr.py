@@ -12,9 +12,9 @@
      с передачей управления по каждому из двух регионов.
 
 Считаем два разных «получилось»:
-  * УДЕРЖАЛ  -- корпус не упал (критерий карты, |theta| < pi/2);
-  * НАКЛОН   -- корпус пришёл в вертикаль и не качается (|theta|, |dtheta| ~ 0);
-  * +КОЛЕСО  -- вдобавок остановлено колесо (|dphi| ~ 0).
+  * УДЕРЖАЛ  -- корпус не упал (критерий карты, |psi| < pi/2);
+  * НАКЛОН   -- корпус пришёл в вертикаль и не качается (|psi|, |dpsi| ~ 0);
+  * +КОЛЕСО  -- вдобавок остановлено колесо (|dtheta| ~ 0).
 
 Горизонт выбран с запасом (20 с). Колонка +КОЛЕСО очень чувствительна к нему:
 колесо успокаивается заметно позже наклона, и на коротком прогоне регулятор
@@ -63,7 +63,7 @@ def never(x):
 def score(system, controller, X0):
     batch = rollout_many(system, controller, RK4Integrator(), X0,
                          dt=DT, n_steps=N_STEPS, stride=50)
-    outcome, _ = classify(batch, i_theta=0, theta_fall=np.pi / 2)
+    outcome, _ = classify(batch, i_psi=0, psi_fall=np.pi / 2)
     held = outcome == HELD
     x_end = batch.x[:, -1, :]
     tilt_home = held & (np.abs(x_end[:, 0]) < 1e-3) & (np.abs(x_end[:, 2]) < 1e-3)
@@ -81,14 +81,14 @@ def main():
     print(f"K = {np.array2string(K[0], precision=6)}   (Q = diag{np.diag(Q)}, R = 1)")
 
     c_free, _ = certified_level(wp, K, P, u_max=None, n_dirs=4000, ds=2e-3,
-                                s_max=8.0, theta_max=np.pi / 2)
+                                s_max=8.0, psi_max=np.pi / 2)
     c_sat, _ = certified_level(wp, K, P, u_max=U_MAX, n_dirs=4000, ds=2e-3,
-                               s_max=8.0, theta_max=np.pi / 2)
+                               s_max=8.0, psi_max=np.pi / 2)
     print(f"сертифицированный уровень c*: {c_free:.4g} без насыщения, "
           f"{c_sat:.4g} с ним -- в {c_free / c_sat:.0f} раз меньше")
-    print(f"  досягаемость эллипсоида: |theta| <= {np.sqrt(c_sat / P[0, 0]):.4f}, "
-          f"|dtheta| <= {np.sqrt(c_sat / P[2, 2]):.4f}, "
-          f"|dphi| <= {np.sqrt(c_sat / P[3, 3]):.3f}")
+    print(f"  досягаемость эллипсоида: |psi| <= {np.sqrt(c_sat / P[0, 0]):.4f}, "
+          f"|dpsi| <= {np.sqrt(c_sat / P[2, 2]):.4f}, "
+          f"|dtheta| <= {np.sqrt(c_sat / P[3, 3]):.3f}")
 
     # Проект по ОДНОЙ подсистеме наклона: она замкнута сама на себя (§1.4),
     # поэтому её можно стабилизировать отдельно -- и регион получается на
@@ -96,11 +96,11 @@ def main():
     K_t, P_t = lqr_tilt(wp, np.diag([100.0, 10.0]), np.array([[1.0]]))
     c_t, _ = certified_level(wp, K_t, P_t, u_max=U_MAX, coords=(0, 2),
                              n_dirs=4000, ds=2e-3, s_max=8.0,
-                             theta_max=np.pi / 2)
+                             psi_max=np.pi / 2)
     print(f"\nЛКР только по наклону: K = {np.array2string(K_t[0], precision=4)}, "
           f"c*_t = {c_t:.4g}")
-    print(f"  досягаемость: |theta| <= {np.sqrt(c_t / P_t[0, 0]):.4f}, "
-          f"|dtheta| <= {np.sqrt(c_t / P_t[2, 2]):.4f}")
+    print(f"  досягаемость: |psi| <= {np.sqrt(c_t / P_t[0, 0]):.4f}, "
+          f"|dpsi| <= {np.sqrt(c_t / P_t[2, 2]):.4f}")
 
     # Срез 4-мерного эллипсоида по плоскости наклона: обнуляем строки и
     # столбцы колеса. Тогда x^T P_slice x -- та же форма, посчитанная от
@@ -108,8 +108,8 @@ def main():
     P_slice = np.zeros_like(P)
     P_slice[np.ix_([0, 2], [0, 2])] = P[np.ix_([0, 2], [0, 2])]
 
-    spec = GridSpec(n=41, theta_max=0.6, dtheta_max=3.0)
-    X0 = spec.initial_states(wp.n_state, i_theta=0, i_dtheta=2)
+    spec = GridSpec(n=41, psi_max=0.6, dpsi_max=3.0)
+    X0 = spec.initial_states(wp.n_state, i_psi=0, i_dpsi=2)
     total = X0.shape[0]
 
     held_lqr, _, home_lqr, _ = score(wp, LinearFeedbackController(K), X0)
@@ -126,13 +126,13 @@ def main():
         ("реле -> ЛКР наклона (цилиндр)",
          BangBangLQRController(K_t, U_MAX, ellipsoid_region(P_t, c_t), wp)),
         # Проверка идеи «пусть реле доведёт наклон, а дальше полный ЛКР сам
-        # вернёт колесо»: зона -- срез 4-мерного эллипсоида по (theta, dtheta),
+        # вернёт колесо»: зона -- срез 4-мерного эллипсоида по (psi, dpsi),
         # то есть колесо в проверке не участвует. Ответ отрицательный, см. §B8.
         ("реле -> ЛКР 4D по срезу наклона",
          BangBangLQRController(K, U_MAX, ellipsoid_region(P_slice, c_sat), wp)),
         ("реле -> ЛКР по карте",
-         BangBangLQRController(K, U_MAX, grid_region(mask, spec.thetas,
-                                                     spec.dthetas), wp)),
+         BangBangLQRController(K, U_MAX, grid_region(mask, spec.psis,
+                                                     spec.dpsis), wp)),
     ]
 
     print(f"\nсетка {spec.n}x{spec.n} = {total} НУ, горизонт "

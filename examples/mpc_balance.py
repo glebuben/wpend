@@ -65,7 +65,7 @@ def run(world, controller, x0, sensor=None):
 def row(name, traj, J, extra=""):
     held = np.all(np.abs(traj.x[:, 0]) < np.pi / 2)
     print(f"  {name:<22} J = {J:9.2f}   max|u| = {np.abs(traj.u).max():6.2f}   "
-          f"|theta(T)| = {abs(traj.x[-1, 0]):8.2e}   "
+          f"|psi(T)| = {abs(traj.x[-1, 0]):8.2e}   "
           f"{'удержан' if held else 'УПАЛ'}  {extra}")
 
 
@@ -84,9 +84,9 @@ def main():
           f"{HORIZON} шагов = {HORIZON * DT_PLAN:g} с\n")
 
     print("1. Номинал: модель = мир")
-    for theta0 in (0.3, 0.9):
-        x0 = [theta0, 0.0, 0.0, 0.0]
-        print(f" theta0 = {theta0}")
+    for psi0 in (0.3, 0.9):
+        x0 = [psi0, 0.0, 0.0, 0.0]
+        print(f" psi0 = {psi0}")
         row("ЛКР", *run(model, LinearFeedbackController(K), x0)[:2])
         row("план iLQR + слежение", *run(model, planned_tracking(model, K, P, x0), x0)[:2])
         ctrl = mpc()
@@ -96,14 +96,14 @@ def main():
 
     print("\n2. Неточная модель: мир mb = 12 кг, регуляторы думают 10 кг")
     world = WheeledPendulum(mb=12.0)
-    for theta0 in (0.3, 0.9):
-        x0 = [theta0, 0.0, 0.0, 0.0]
-        print(f" theta0 = {theta0}")
+    for psi0 in (0.3, 0.9):
+        x0 = [psi0, 0.0, 0.0, 0.0]
+        print(f" psi0 = {psi0}")
         row("ЛКР", *run(world, LinearFeedbackController(K), x0)[:2])
         row("план iLQR + слежение", *run(world, planned_tracking(model, K, P, x0), x0)[:2])
         row("MPC", *run(world, mpc(), x0)[:2])
 
-    print("\n3. Шум датчика: sigma(theta) = 0.01 рад, sigma(dtheta) = 0.05 рад/с")
+    print("\n3. Шум датчика: sigma(psi) = 0.01 рад, sigma(dpsi) = 0.05 рад/с")
     x0 = [0.3, 0.0, 0.0, 0.0]
 
     def noise():
@@ -119,7 +119,7 @@ def main():
     # горизонт MPC (1 с) начинает с куска той же траектории, но перепланирует
     # раньше, чем корпус успевает уйти далеко. Гипотеза, а не доказательство:
     # см. PROPOSALS.md A23.
-    print("\n4. Большой наклон: theta0 = 1.3 рад, модель = мир")
+    print("\n4. Большой наклон: psi0 = 1.3 рад, модель = мир")
     x0 = [1.3, 0.0, 0.0, 0.0]
     row("ЛКР", *run(model, LinearFeedbackController(K), x0)[:2])
     row("план iLQR + слежение", *run(model, planned_tracking(model, K, P, x0), x0)[:2])

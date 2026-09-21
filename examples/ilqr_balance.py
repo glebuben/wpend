@@ -42,11 +42,11 @@ def main():
     N = int(round(T / dt))
 
     print(f"dt = {dt}, горизонт {T} с ({N} шагов), Q_f = P")
-    print(f"{'theta0':>7} | {'J ЛКР':>9} {'J iLQR':>9} {'выигрыш':>8} | "
+    print(f"{'psi0':>7} | {'J ЛКР':>9} {'J iLQR':>9} {'выигрыш':>8} | "
           f"{'max|u| ЛКР':>10} {'max|u| iLQR':>11} | {'итер.':>5} {'время, с':>8} | "
-          f"{'|theta(T)|':>10}")
-    for theta0 in (0.1, 0.3, 0.6, 0.9):
-        x0 = np.array([theta0, 0.0, 0.0, 0.0])
+          f"{'|psi(T)|':>10}")
+    for psi0 in (0.1, 0.3, 0.6, 0.9):
+        x0 = np.array([psi0, 0.0, 0.0, 0.0])
         base = rollout(wp, LinearFeedbackController(K), rk4, x0, dt, N)
         J_lqr = trajectory_cost(base.x, base.u, Q, R, P, dt)
 
@@ -59,7 +59,7 @@ def main():
                           rk4, x0, dt, N)
         J_ilqr = trajectory_cost(tracked.x, tracked.u, Q, R, P, dt)
         gain = 100.0 * (J_lqr - J_ilqr) / J_lqr
-        print(f"{theta0:7.2f} | {J_lqr:9.2f} {J_ilqr:9.2f} {gain:7.2f}% | "
+        print(f"{psi0:7.2f} | {J_lqr:9.2f} {J_ilqr:9.2f} {gain:7.2f}% | "
               f"{np.abs(base.u).max():10.2f} {np.abs(tracked.u).max():11.2f} | "
               f"{len(costs) - 1:5d} {elapsed:8.2f} | {abs(tracked.x[-1, 0]):10.2e}")
 

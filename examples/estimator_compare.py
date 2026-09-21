@@ -45,7 +45,7 @@ from wpend import (
 )
 from wpend.models import WheeledPendulum
 
-# ЛКР ТОЛЬКО ПО НАКЛОНУ (A17): нули в столбцах phi и dphi -- ровно там, где
+# ЛКР ТОЛЬКО ПО НАКЛОНУ (A17): нули в столбцах theta и dtheta -- ровно там, где
 # состояние ненаблюдаемо при одном ИДУ.  Значит выдуманная оценка колеса
 # физически не может попасть в управление, и это доказуемо.
 K_TILT = np.array([[15.8887, 0.0, 3.4977, 0.0]])
@@ -104,34 +104,34 @@ def run_one(system, make_sensor, make_est, x0, n_steps):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=float, default=5.0)
-    ap.add_argument("--theta0", type=float, default=0.05)
+    ap.add_argument("--psi0", type=float, default=0.05)
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
     system = WheeledPendulum(u_max=1.5)
     n = int(round(args.seconds / DT))
-    x0 = [args.theta0, 0.0, 0.0, 0.0]
+    x0 = [args.psi0, 0.0, 0.0, 0.0]
     sl = slice(0, n, args.stride)
 
-    print(f"один регулятор (ЛКР наклона), одно НУ ({args.theta0}, 0, 0, 0), "
+    print(f"один регулятор (ЛКР наклона), одно НУ ({args.psi0}, 0, 0, 0), "
           f"{args.seconds} с, dt = {DT}, seed = {SEED}.  Меняется ТОЛЬКО оцениватель.\n")
     print(f"{'оцениватель':<32}{'вес a':>9}{'RMSE оценки':>13}"
-          f"{'откл. от идеала':>17}{'max|theta|':>12}  исход")
+          f"{'откл. от идеала':>17}{'max|psi|':>12}  исход")
 
     out = {"t": None, "order": [k for k, *_ in CONFIGS], "runs": {}}
-    ref_theta = None
+    ref_psi = None
 
     for key, label, mk_sensor, mk_est, tau in CONFIGS:
         traj, x_hat = run_one(system, mk_sensor, mk_est, x0, n)
-        theta_true = traj.x[:n, 0]
-        if ref_theta is None:
-            ref_theta = theta_true.copy()
+        psi_true = traj.x[:n, 0]
+        if ref_psi is None:
+            ref_psi = psi_true.copy()
 
-        err = x_hat[:, 0] - theta_true
+        err = x_hat[:, 0] - psi_true
         rmse = float(np.sqrt(np.mean(err ** 2)))
-        dev = float(np.max(np.abs(theta_true - ref_theta)))
-        mx = float(np.max(np.abs(theta_true)))
+        dev = float(np.max(np.abs(psi_true - ref_psi)))
+        mx = float(np.max(np.abs(psi_true)))
         a = 1.0 if tau is None or np.isinf(tau) else tau / (tau + DT)
 
         print(f"{label:<32}{a:>9.4f}{rmse:>13.5f}{dev:>17.5f}{mx:>12.3f}"
@@ -143,12 +143,12 @@ def main() -> None:
             "label": label,
             "tau": None if tau is None else ("inf" if np.isinf(tau) else tau),
             "a": None if tau is None else round(a, 6),
-            "true_theta": np.round(theta_true[sl], 6).tolist(),
-            "hat_theta": np.round(x_hat[sl, 0], 6).tolist(),
+            "true_psi": np.round(psi_true[sl], 6).tolist(),
+            "hat_psi": np.round(x_hat[sl, 0], 6).tolist(),
             "u": np.round(traj.u[sl, 0], 5).tolist(),
             "rmse": round(rmse, 6),
             "dev": round(dev, 6),
-            "max_theta": round(mx, 4),
+            "max_psi": round(mx, 4),
             "fell": bool(mx > 0.6),
         }
 

@@ -161,8 +161,8 @@ class IMUSensor(Sensor):
     Модель ухода -- марковский процесс первого порядка
 
         db/dt = -b/tau + sigma_b * w(t),
-        b_k   = phi*b_{k-1} + sigma_b*sqrt(tau(1-phi^2)/2) * w_k,
-        phi   = exp(-dt/tau),
+        b_k   = theta*b_{k-1} + sigma_b*sqrt(tau(1-theta^2)/2) * w_k,
+        theta   = exp(-dt/tau),
 
     при tau = inf (по умолчанию) вырождающийся ТОЧНО в случайное блуждание
     b_k = b_{k-1} + sigma_b*sqrt(dt)*w_k -- ту самую модель, которую пишут
@@ -223,26 +223,26 @@ class IMUSensor(Sensor):
     corr(b_i, b_j) = rho_ij * 2 sqrt(tau_i tau_j) / (tau_i + tau_j) <= rho_ij.
 
     В mode="state" на контур попадают только a_x и gyro, и со сменой
-    знака: ошибка theta = -e_ax/g, поэтому corr(ошибка theta, ошибка dtheta)
+    знака: ошибка psi = -e_ax/g, поэтому corr(ошибка psi, ошибка dpsi)
     = -rho(a_x, gyro).
 
     Два режима.
       * mode="state" (по умолчанию) -- y имеет форму состояния: шум и смещение
-        кладутся на theta и dtheta, колесо (phi, dphi) проходит без ошибки,
+        кладутся на psi и dpsi, колесо (theta, dtheta) проходит без ошибки,
         как от идеального энкодера.  Контур замыкается через
         PassthroughEstimator, и пороги срыва меряются уже сейчас.
         Ошибка угла получается из ошибки акселерометра статической
-        линеаризацией theta_acc = atan2(-f_x, f_z): d(theta) = -d(f_x)/g.
+        линеаризацией psi_acc = atan2(-f_x, f_z): d(psi) = -d(f_x)/g.
       * mode="imu" -- y = (a_x, a_z, omega), настоящие показания в м/с^2 и
         рад/с.  Это НЕ состояние: PassthroughEstimator на нём бессмыслен,
-        достать theta из показаний -- работа оценивателя (ER-008).  Удельную
+        достать psi из показаний -- работа оценивателя (ER-008).  Удельную
         силу считает модель (System.specific_force), а не датчик: это физика.
 
     Параметры (значения по умолчанию -- круглые порядки величин для дешёвого
     MEMS, не паспорт конкретной микросхемы; см. таблицу в docs/imu_noise.md)
     ---------
     system : System
-        Нужна для g, для индексов theta/dtheta в векторе состояния и -- в
+        Нужна для g, для индексов psi/dpsi в векторе состояния и -- в
         режиме "imu" -- для удельной силы.
     dt : float
         Шаг дискретизации датчика [с].  ЯВНЫЙ параметр, а не выведенный из t:
@@ -323,24 +323,24 @@ class IMUSensor(Sensor):
         self._L_w = (self.sigma_w / np.sqrt(self.dt))[:, None] * _cholesky(self.corr_w, "corr_w")
         self._L_b0 = self.b0[:, None] * _cholesky(self.corr_b0, "corr_b0")
         rate = 1.0 / self.tau                            # при tau = inf ровно 0.0
-        self._phi = np.exp(-self.dt * rate)
+        self._theta = np.exp(-self.dt * rate)
         self._L_b = self.sigma_b[:, None] * _cholesky(
             self.corr_b * _drift_gram(rate, self.dt), "corr_b (вместе с tau)"
         )
 
         names = tuple(system.state_names)
-        if "theta" not in names or "dtheta" not in names:
+        if "psi" not in names or "dpsi" not in names:
             raise ValueError(
                 f"IMUSensor не понимает состояние {names}: нужны компоненты "
-                "'theta' и 'dtheta' (гироскоп меряет dtheta, акселерометр -- наклон)"
+                "'psi' и 'dpsi' (гироскоп меряет dpsi, акселерометр -- наклон)"
             )
         if mode == "imu" and not hasattr(system, "specific_force"):
             raise ValueError(
                 f"{type(system).__name__} не умеет specific_force: режим 'imu' "
                 "требует модели, знающей, где стоит датчик и что он чувствует"
             )
-        self.i_theta = names.index("theta")
-        self.i_dtheta = names.index("dtheta")
+        self.i_psi = names.index("psi")
+        self.i_dpsi = names.index("dpsi")
         self.g = float(getattr(system.p, "g", 9.8))
 
         self._rng = np.random.default_rng(seed)
@@ -382,7 +382,7 @@ class IMUSensor(Sensor):
         # Phi и L_b посчитаны в __init__ по self.dt, а не по dt = t - t_prev:
         # разность времён несёт ошибку округления, а шаг датчика -- ровно
         # self.dt (сверено выше).
-        self._b = self._phi * self._b + self._rng.standard_normal(shape) @ self._L_b.T
+        self._b = self._theta * self._b + self._rng.standard_normal(shape) @ self._L_b.T
         self._t_prev = t
         return self._b
 
@@ -399,16 +399,16 @@ class IMUSensor(Sensor):
 
         if self.mode == "state":
             y = x.copy()
-            # гироскоп меряет dtheta напрямую
-            y[..., self.i_dtheta] = x[..., self.i_dtheta] + e[..., 2]
-            # акселерометр даёт наклон: theta_acc = atan2(-f_x, f_z),
-            # в окрестности покоя d(theta) = -d(f_x)/g
-            y[..., self.i_theta] = x[..., self.i_theta] - e[..., 0] / self.g
+            # гироскоп меряет dpsi напрямую
+            y[..., self.i_dpsi] = x[..., self.i_dpsi] + e[..., 2]
+            # акселерометр даёт наклон: psi_acc = atan2(-f_x, f_z),
+            # в окрестности покоя d(psi) = -d(f_x)/g
+            y[..., self.i_psi] = x[..., self.i_psi] - e[..., 0] / self.g
             return y
 
         f_x, f_z = self.system.specific_force(t, x, u_prev, d=self.d)
         return np.stack(
-            [f_x + e[..., 0], f_z + e[..., 1], x[..., self.i_dtheta] + e[..., 2]],
+            [f_x + e[..., 0], f_z + e[..., 1], x[..., self.i_dpsi] + e[..., 2]],
             axis=-1,
         )
 
@@ -419,25 +419,25 @@ class EncoderSensor(Sensor):
     ЧТО ОН МЕРЯЕТ И ПОЧЕМУ ИМЕННО ЭТО.  Датчик стоит на валу мотора, между
     корпусом и колесом, и видит их ВЗАИМНОЕ вращение:
 
-        y = ( phi - theta,  dphi - dtheta )
+        y = ( theta - psi,  dtheta - dpsi )
 
-    а вовсе не phi.  Абсолютного поворота колеса относительно земли на валу
-    не видно ниоткуда: чтобы получить phi, нужно прибавить наклон, а наклон
+    а вовсе не theta.  Абсолютного поворота колеса относительно земли на валу
+    не видно ниоткуда: чтобы получить theta, нужно прибавить наклон, а наклон
     даёт ИДУ.  Путать эти две величины -- обычная и дорогая ошибка: модель с
-    «энкодером, меряющим phi» выглядит правдоподобно и завышает то, что
+    «энкодером, меряющим theta» выглядит правдоподобно и завышает то, что
     измерение даёт на самом деле.
 
     ЧТО ЭТО ДАЁТ.  При одном ИДУ колесо ненаблюдаемо (rank 2 из 4).  Замер
     матрицы наблюдаемости в вертикали:
 
-        только ИДУ                       rank 2   (ядро: phi, dphi)
-        + тахометр колеса (dphi)         rank 3   (ядро: phi)
+        только ИДУ                       rank 2   (ядро: theta, dtheta)
+        + тахометр колеса (dtheta)         rank 3   (ядро: theta)
         ИДУ + этот энкодер               rank 4
         ТОЛЬКО этот энкодер, без ИДУ     rank 4
 
     Последняя строка не опечатка: относительное ускорение выдаёт наклон,
-    потому что и ddtheta, и ddphi зависят от theta, поэтому за два
-    дифференцирования восстанавливаются и theta, и dtheta.  Формально --
+    потому что и ddpsi, и ddtheta зависят от psi, поэтому за два
+    дифференцирования восстанавливаются и psi, и dpsi.  Формально --
     да; практически такая оценка держится целиком на точности модели.
 
     МОДЕЛЬ ОШИБКИ -- КВАНТОВАНИЕ, А НЕ ШУМ.  У энкодера N меток на оборот, и
@@ -466,7 +466,7 @@ class EncoderSensor(Sensor):
     Параметры
     ---------
     system : System
-        Нужна для индексов theta, phi, dtheta, dphi в векторе состояния.
+        Нужна для индексов psi, theta, dpsi, dtheta в векторе состояния.
     dt : float
         Шаг опроса [с].  ЯВНЫЙ: скорость считается разностью, делённой на
         него.  measure сверяет его с реальной разностью времён.
@@ -482,16 +482,16 @@ class EncoderSensor(Sensor):
         if counts_per_rev is not None and counts_per_rev < 0:
             raise ValueError("counts_per_rev не может быть отрицательным")
         names = tuple(system.state_names)
-        for need in ("theta", "phi", "dtheta", "dphi"):
+        for need in ("psi", "theta", "dpsi", "dtheta"):
             if need not in names:
                 raise ValueError(
                     f"EncoderSensor не понимает состояние {names}: нужны "
-                    "theta, phi, dtheta, dphi"
+                    "psi, theta, dpsi, dtheta"
                 )
+        self.i_psi = names.index("psi")
         self.i_theta = names.index("theta")
-        self.i_phi = names.index("phi")
+        self.i_dpsi = names.index("dpsi")
         self.i_dtheta = names.index("dtheta")
-        self.i_dphi = names.index("dphi")
         self.dt = float(dt)
         self.counts_per_rev = counts_per_rev
         self.q = (0.0 if not counts_per_rev
@@ -512,7 +512,7 @@ class EncoderSensor(Sensor):
 
     def measure(self, t: float, x: np.ndarray, u_prev: np.ndarray | None = None):
         x = np.asarray(x, dtype=float)
-        angle = self._quantize(x[..., self.i_phi] - x[..., self.i_theta])
+        angle = self._quantize(x[..., self.i_theta] - x[..., self.i_psi])
 
         first = (self._prev_angle is None
                  or self._t_prev is None
@@ -546,7 +546,7 @@ class StackedSensor(Sensor):
     интерфейса: ни нового слоя, ни нового понятия.
 
     Порядок датчиков -- часть контракта: оцениватель разбирает y по позициям.
-    StackedSensor(imu, encoder) даёт (a_x, a_z, omega, phi-theta, dphi-dtheta).
+    StackedSensor(imu, encoder) даёт (a_x, a_z, omega, theta-psi, dtheta-dpsi).
 
     reset() пробрасывается всем, поэтому воспроизводимость по seed сохраняется.
     """

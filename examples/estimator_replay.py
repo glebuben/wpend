@@ -41,7 +41,7 @@ from wpend import (
 )
 from wpend.models import WheeledPendulum
 
-# ЛКР ТОЛЬКО ПО НАКЛОНУ (A17): нули стоят в столбцах phi и dphi -- ровно в тех,
+# ЛКР ТОЛЬКО ПО НАКЛОНУ (A17): нули стоят в столбцах theta и dtheta -- ровно в тех,
 # что ненаблюдаемы при одном ИДУ.  Значит выдуманная оценка колеса физически не
 # может попасть в управление, и это доказуемо, а не "надеемся".
 K_TILT = np.array([[15.8887, 0.0, 3.4977, 0.0]])
@@ -90,7 +90,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--dt", type=float, default=1e-3)
-    ap.add_argument("--theta0", type=float, default=0.05)
+    ap.add_argument("--psi0", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stride", type=int, default=10, help="прореживание для вывода")
     ap.add_argument("--json", default=None, help="куда сложить ряды для графиков")
@@ -100,21 +100,21 @@ def main() -> None:
     n = int(round(args.seconds / args.dt))
     ctrl = LinearFeedbackController(K_TILT)
 
-    print(f"ЛКР наклона, x0 = ({args.theta0}, 0, 0, 0), {args.seconds} с, "
+    print(f"ЛКР наклона, x0 = ({args.psi0}, 0, 0, 0), {args.seconds} с, "
           f"dt = {args.dt}, seed = {args.seed}\n")
-    print(f"{'tau, с':>7} {'RMSE theta':>12} {'смещение в хвосте':>18} "
-          f"{'|ошибка dphi|':>14} {'max|theta|':>11}  исход")
+    print(f"{'tau, с':>7} {'RMSE psi':>12} {'смещение в хвосте':>18} "
+          f"{'|ошибка dtheta|':>14} {'max|psi|':>11}  исход")
 
     out = {"t": None, "runs": {}}
     for tau in TAUS:
-        traj, x_hat = replay(system, ctrl, tau, x0=[args.theta0, 0, 0, 0],
+        traj, x_hat = replay(system, ctrl, tau, x0=[args.psi0, 0, 0, 0],
                              dt=args.dt, n_steps=n, seed=args.seed)
         err = x_hat[:, 0] - traj.x[:n, 0]
         rmse = float(np.sqrt(np.mean(err ** 2)))
         tail = float(np.mean(err[n // 2:]))
-        dphi_err = float(x_hat[-1, 3] - traj.x[n - 1, 3])
+        dtheta_err = float(x_hat[-1, 3] - traj.x[n - 1, 3])
         mx = float(np.max(np.abs(traj.x[:n, 0])))
-        print(f"{tau:>7.2f} {rmse:>12.5f} {tail:>+18.5f} {abs(dphi_err):>14.3f} "
+        print(f"{tau:>7.2f} {rmse:>12.5f} {tail:>+18.5f} {abs(dtheta_err):>14.3f} "
               f"{mx:>11.3f}  {'УПАЛ' if mx > 0.6 else 'удержан'}")
 
         sl = slice(0, n, args.stride)
@@ -125,15 +125,15 @@ def main() -> None:
         # (правило 4 ARCHITECTURE.md).  Сохранить истину один раз и сравнивать
         # с ней все прогоны -- тихая ошибка: числа выглядят правдоподобно.
         out["runs"][f"{tau}"] = {
-            "theta": np.round(x_hat[sl, 0], 6).tolist(),
-            "dphi": np.round(x_hat[sl, 3], 4).tolist(),
-            "true_theta": np.round(traj.x[sl, 0], 6).tolist(),
-            "true_dphi": np.round(traj.x[sl, 3], 4).tolist(),
+            "psi": np.round(x_hat[sl, 0], 6).tolist(),
+            "dtheta": np.round(x_hat[sl, 3], 4).tolist(),
+            "true_psi": np.round(traj.x[sl, 0], 6).tolist(),
+            "true_dtheta": np.round(traj.x[sl, 3], 4).tolist(),
             "rmse": round(rmse, 6),
             "tail": round(tail, 6),
-            "dphi_err": round(dphi_err, 4),
+            "dtheta_err": round(dtheta_err, 4),
             "fell": bool(np.max(np.abs(traj.x[:n, 0])) > 0.6),
-            "max_theta": round(float(np.max(np.abs(traj.x[:n, 0]))), 4),
+            "max_psi": round(float(np.max(np.abs(traj.x[:n, 0]))), 4),
         }
 
     if args.json:

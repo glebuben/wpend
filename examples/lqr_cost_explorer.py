@@ -1,15 +1,15 @@
 """Окно для подбора цены ЛКР: две цены A и B рядом, их разница и предел момента.
 
     uv run python examples/lqr_cost_explorer.py
-    uv run python examples/lqr_cost_explorer.py --dtheta-max 10 --grid 81   # карта по theta: от -pi/2 до pi/2
-    uv run python examples/lqr_cost_explorer.py --theta-fall 1.571     # «упал» = лёг на землю
+    uv run python examples/lqr_cost_explorer.py --dpsi-max 10 --grid 81   # карта по psi: от -pi/2 до pi/2
+    uv run python examples/lqr_cost_explorer.py --psi-fall 1.571     # «упал» = лёг на землю
 
 Что на экране
 -------------
 * Сверху слайдер u_max, как в окне исследователя: 0.25…10 Н·м шагом 0.25,
   клавиши [ и ], кнопка `no limit` (клавиша L). Карты пересчитываются на
   отпускании.
-* Цена -- пять чисел: веса Q = diag(q_theta, q_phi, q_dtheta, q_dphi) и R,
+* Цена -- пять чисел: веса Q = diag(q_psi, q_theta, q_dpsi, q_dtheta) и R,
   вводятся с клавиатуры. Клик по полю (или Tab, когда ничего не редактируется,
   переключает A / B) -- поле открыто на ввод, набранное заменяет старое число.
   Принимаются 100, 0.01, 1e-3. Enter -- применить и пересчитать карту,
@@ -17,30 +17,30 @@
   клик мимо поля -- применить. Кнопки A / B выбирают, какую цену правят поля;
   кнопки пресетов ставят в неё найденные ранее наборы (`examples/cost_sweep.py`).
 * Три карты: цена A, цена B, разница. Клик по клетке -- траектории обеих цен
-  на картах и графики theta(t), u(t), phi(t) снизу.
+  на картах и графики psi(t), u(t), theta(t) снизу.
 
 Нулевые веса колеса
 -------------------
-В полях q_phi и q_dphi разрешён 0 (в остальных -- только > 0). Уравнение Риккати с
-нулевым весом phi не решается: phi -- чистый интегратор, которого цена не
-видит, и стабилизирующего решения нет. Но phi не входит в правую часть вовсе
-(Key_Formulas §1.4), поэтому подсистема без phi замкнута сама на себя, и ЛКР
+В полях q_theta и q_dtheta разрешён 0 (в остальных -- только > 0). Уравнение Риккати с
+нулевым весом theta не решается: theta -- чистый интегратор, которого цена не
+видит, и стабилизирующего решения нет. Но theta не входит в правую часть вовсе
+(Key_Formulas §1.4), поэтому подсистема без theta замкнута сама на себя, и ЛКР
 для неё законен -- это обобщение `lqr_tilt` (A17):
-    q_phi = 0              -> ЛКР по (theta, dtheta, dphi), K_phi = 0;
-    q_phi = 0 и q_dphi = 0 -> ЛКР по (theta, dtheta), колесо не видим (= tilt).
-Вес q_dphi = 0 при q_phi > 0 законен и так: phi наблюдаема через свой вес.
+    q_theta = 0              -> ЛКР по (psi, dpsi, dtheta), K_theta = 0;
+    q_theta = 0 и q_dtheta = 0 -> ЛКР по (psi, dpsi), колесо не видим (= tilt).
+Вес q_dtheta = 0 при q_theta > 0 законен и так: theta наблюдаема через свой вес.
 
 Исходы клетки
 -------------
-* упал вперёд / назад -- |theta| пересёк --theta-fall (по умолчанию pi, то есть
+* упал вперёд / назад -- |psi| пересёк --psi-fall (по умолчанию pi, то есть
   корпус провернулся через низ). Земли в модели нет: корпус, лёгший за pi/2,
-  может вернуться. Чтобы считать упавшим любое касание земли, --theta-fall 1.571.
-* удержан -- не пересёк и к концу горизонта |theta| < 0.1;
+  может вернуться. Чтобы считать упавшим любое касание земли, --psi-fall 1.571.
+* удержан -- не пересёк и к концу горизонта |psi| < 0.1;
 * не успокоился (серый) -- не пересёк, но и не вернулся за горизонт.
 
 Зелёная линия -- граница восстановимости `recoverable_bounds` при текущем
 u_max (свойство системы и мотора, не регулятора). Проверена против реле на
-карте до |theta| <= 0.5; на широкой карте это формула модели, а не замер.
+карте до |psi| <= 0.5; на широкой карте это формула модели, а не замер.
 """
 
 import argparse
@@ -77,10 +77,10 @@ PLOTS = [(56, 676, 380, 220), (472, 676, 380, 220), (888, 676, 360, 220)]
 
 #: Пять весов: ключ, подпись, можно ли ноль.
 WEIGHTS = [
-    ("q_theta", "q_theta", False),
-    ("q_phi", "q_phi", True),
-    ("q_dtheta", "q_dtheta", False),
-    ("q_dphi", "q_dphi", True),
+    ("q_psi", "q_psi", False),
+    ("q_theta", "q_theta", True),
+    ("q_dpsi", "q_dpsi", False),
+    ("q_dtheta", "q_dtheta", True),
     ("R", "R", False),
 ]
 W_X0, W_Y, W_GAP, W_LABEL, W_BOX = 24, 88, 200, 74, 104
@@ -88,15 +88,15 @@ FIELD_CHARS = set("0123456789.eE+-")
 
 #: Пресеты -- наборы из `examples/cost_sweep.py` (16.09).
 PRESETS = {
-    "base":      dict(q_theta=100, q_phi=1, q_dtheta=10, q_dphi=1, R=1),
-    "phi=1e-2":  dict(q_theta=100, q_phi=1e-2, q_dtheta=10, q_dphi=1, R=1),
-    "phi=1e-3":  dict(q_theta=100, q_phi=1e-3, q_dtheta=10, q_dphi=1, R=1),
-    "dphi=1e-2": dict(q_theta=100, q_phi=1, q_dtheta=10, q_dphi=1e-2, R=1),
-    "R=0.1":     dict(q_theta=100, q_phi=1, q_dtheta=10, q_dphi=1, R=0.1),
-    "R=10":      dict(q_theta=100, q_phi=1, q_dtheta=10, q_dphi=1, R=10),
-    "R=100":     dict(q_theta=100, q_phi=1, q_dtheta=10, q_dphi=1, R=100),
-    "theta x10": dict(q_theta=1000, q_phi=1, q_dtheta=100, q_dphi=1, R=1),
-    "tilt":      dict(q_theta=100, q_phi=0, q_dtheta=10, q_dphi=0, R=1),
+    "base":      dict(q_psi=100, q_theta=1, q_dpsi=10, q_dtheta=1, R=1),
+    "theta=1e-2":  dict(q_psi=100, q_theta=1e-2, q_dpsi=10, q_dtheta=1, R=1),
+    "theta=1e-3":  dict(q_psi=100, q_theta=1e-3, q_dpsi=10, q_dtheta=1, R=1),
+    "dtheta=1e-2": dict(q_psi=100, q_theta=1, q_dpsi=10, q_dtheta=1e-2, R=1),
+    "R=0.1":     dict(q_psi=100, q_theta=1, q_dpsi=10, q_dtheta=1, R=0.1),
+    "R=10":      dict(q_psi=100, q_theta=1, q_dpsi=10, q_dtheta=1, R=10),
+    "R=100":     dict(q_psi=100, q_theta=1, q_dpsi=10, q_dtheta=1, R=100),
+    "psi x10": dict(q_psi=1000, q_theta=1, q_dpsi=100, q_dtheta=1, R=1),
+    "tilt":      dict(q_psi=100, q_theta=0, q_dpsi=10, q_dtheta=0, R=1),
 }
 
 
@@ -115,12 +115,12 @@ def design(model, cost):
     из задачи (см. докстринг модуля), и K получает в их столбцах нули.
     """
     A, B = model.linearize_upright()
-    keep = [0, 2]                                   # theta, dtheta -- всегда
-    if cost["q_phi"] > 0:
+    keep = [0, 2]                                   # psi, dpsi -- всегда
+    if cost["q_theta"] > 0:
         keep = [0, 1, 2, 3]
-    elif cost["q_dphi"] > 0:
+    elif cost["q_dtheta"] > 0:
         keep = [0, 2, 3]
-    q = np.array([cost["q_theta"], cost["q_phi"], cost["q_dtheta"], cost["q_dphi"]])
+    q = np.array([cost["q_psi"], cost["q_theta"], cost["q_dpsi"], cost["q_dtheta"]])
     idx = np.ix_(keep, keep)
     K_sub, _ = lqr(A[idx], B[keep, :], np.diag(q[keep]), np.array([[cost["R"]]]))
     K = np.zeros((1, 4))
@@ -129,12 +129,12 @@ def design(model, cost):
     return K, poles
 
 
-def compute_map(model, K, u_max, X0, horizon, theta_fall):
+def compute_map(model, K, u_max, X0, horizon, psi_fall):
     """Исход каждой клетки: classify (как окно) + проверка «успокоился»."""
     world = WheeledPendulum(u_max=u_max)
     batch = rollout_many(world, LinearFeedbackController(K), RK4Integrator(), X0, DT,
                          int(round(horizon / DT)), STRIDE)
-    outcome, t_fall = classify(batch, 0, theta_fall)
+    outcome, t_fall = classify(batch, 0, psi_fall)
     settled = np.abs(batch.x[:, -1, 0]) < SETTLE
     outcome = np.where((outcome == HELD) & ~settled, NOT_SETTLED, outcome)
     return outcome, t_fall
@@ -149,9 +149,9 @@ class App:
         self.args = args
         self.model = WheeledPendulum()
         n = args.grid
-        self.thetas = np.linspace(-args.theta_max, args.theta_max, n)
-        self.dthetas = np.linspace(-args.dtheta_max, args.dtheta_max, n)
-        TH, DTH = np.meshgrid(self.thetas, self.dthetas, indexing="xy")
+        self.psis = np.linspace(-args.psi_max, args.psi_max, n)
+        self.dpsis = np.linspace(-args.dpsi_max, args.dpsi_max, n)
+        TH, DTH = np.meshgrid(self.psis, self.dpsis, indexing="xy")
         self.X0 = np.zeros((n * n, 4))
         self.X0[:, 0], self.X0[:, 2] = TH.ravel(), DTH.ravel()
         self.n = n
@@ -194,7 +194,7 @@ class App:
         key = (self.u_max, tuple(sorted(self.cost[slot].items())))
         if key not in self.cache:
             self.cache[key] = compute_map(self.model, self.K[slot], self.u_max, self.X0,
-                                          self.args.horizon, self.args.theta_fall)
+                                          self.args.horizon, self.args.psi_fall)
         self.result[slot] = self.cache[key]
         self.stale[slot] = False
         if self.selected is not None:
@@ -205,7 +205,7 @@ class App:
 
     def select(self, ix, iy):
         self.selected = (ix, iy)
-        x0 = np.array([self.thetas[ix], 0.0, self.dthetas[iy], 0.0])
+        x0 = np.array([self.psis[ix], 0.0, self.dpsis[iy], 0.0])
         for slot in "AB":
             if self.error[slot] is None:
                 tr = rollout(self.world(), LinearFeedbackController(self.K[slot]),
@@ -265,12 +265,12 @@ class App:
 
     # --- геометрия -------------------------------------------------------------
 
-    def to_px(self, rect, theta, dtheta):
+    def to_px(self, rect, psi, dpsi):
         """Как `_to_map_px` окна: узел -- центр клетки."""
         x, y, w, h = rect
         edge = self.n / max(self.n - 1, 1)
-        ht, hd = self.thetas[-1] * edge, self.dthetas[-1] * edge
-        return x + (theta + ht) / (2 * ht) * w, y + (1 - (dtheta + hd) / (2 * hd)) * h
+        ht, hd = self.psis[-1] * edge, self.dpsis[-1] * edge
+        return x + (psi + ht) / (2 * ht) * w, y + (1 - (dpsi + hd) / (2 * hd)) * h
 
     def cell_at(self, pos):
         for rect in MAPS.values():
@@ -373,7 +373,7 @@ def draw_limits(screen, pg, app, rect):
     if app.u_max is None:
         return
     world = app.world()
-    th = np.linspace(-app.args.theta_max * 1.05, app.args.theta_max * 1.05, 1601)
+    th = np.linspace(-app.args.psi_max * 1.05, app.args.psi_max * 1.05, 1601)
     floor, ceiling = world.recoverable_bounds(app.u_max, th)
     clip = screen.get_clip()
     screen.set_clip(rect)
@@ -432,11 +432,11 @@ def draw_map(screen, pg, font, app, key, title, surf, curves):
         cw, ch = w / app.n, h / app.n
         pg.draw.rect(screen, ACCENT, (x + ix * cw, y + (app.n - 1 - iy) * ch,
                                       max(cw, 3), max(ch, 3)), 2)
-    labels = [(f"{app.thetas[0]:+.2f}", x, y + h + 6),
-              (f"{app.thetas[-1]:+.2f}", x + w - 40, y + h + 6)]
+    labels = [(f"{app.psis[0]:+.2f}", x, y + h + 6),
+              (f"{app.psis[-1]:+.2f}", x + w - 40, y + h + 6)]
     if key == "A":
-        labels += [(f"{app.dthetas[-1]:+.1f}", x - 48, y),
-                   (f"{app.dthetas[0]:+.1f}", x - 48, y + h - 14)]
+        labels += [(f"{app.dpsis[-1]:+.1f}", x - 48, y),
+                   (f"{app.dpsis[0]:+.1f}", x - 48, y + h - 14)]
     for text, tx, ty in labels:
         screen.blit(font.render(text, True, DIM), (tx, ty))
 
@@ -512,7 +512,7 @@ def draw(screen, pg, font, app, buttons):
                 app.u_max is None, lambda: toggle_limit(app))
     note = ("release to recompute" if app.u_preview is not None else
             app.busy or f"grid {app.n}x{app.n}, horizon {app.args.horizon:g} s, "
-                        f"fall at |theta| >= {app.args.theta_fall:.3g}")
+                        f"fall at |psi| >= {app.args.psi_fall:.3g}")
     screen.blit(font.render(note, True, ACCENT if app.busy or app.u_preview else DIM),
                 (x + w + 210, y - 1))
 
@@ -590,7 +590,7 @@ def draw(screen, pg, font, app, buttons):
     if app.selected is not None:
         ix, iy = app.selected
         m = iy * app.n + ix
-        parts = [f"theta0 = {app.thetas[ix]:+.3f}, dtheta0 = {app.dthetas[iy]:+.2f}"]
+        parts = [f"psi0 = {app.psis[ix]:+.3f}, dpsi0 = {app.dpsis[iy]:+.2f}"]
         for slot in "AB":
             if slot in app.traj and slot in app.result:
                 code = int(app.result[slot][0][m])
@@ -599,13 +599,13 @@ def draw(screen, pg, font, app, buttons):
                 _, X, U = app.traj[slot]
                 if app.u_max is not None:
                     word += f", sat {np.mean(np.abs(U) >= app.u_max - 1e-6):.0%}"
-                word += f", phi(T) {X[-1, 1]:+.1f}"
+                word += f", theta(T) {X[-1, 1]:+.1f}"
                 parts.append(f"{slot}: {word}")
         screen.blit(font.render("   ".join(parts), True, TEXT), (56, 624))
 
-    draw_plot(screen, pg, font, app, PLOTS[0], "theta(t), rad   A white, B teal", 0)
+    draw_plot(screen, pg, font, app, PLOTS[0], "psi(t), rad   A white, B teal", 0)
     draw_plot(screen, pg, font, app, PLOTS[1], "u(t), N*m   dashed: +-u_max", None, app.u_max)
-    draw_plot(screen, pg, font, app, PLOTS[2], "phi(t), rad   wheel", 1)
+    draw_plot(screen, pg, font, app, PLOTS[2], "theta(t), rad   wheel", 1)
 
 
 def toggle_limit(app):
@@ -633,16 +633,16 @@ def refresh(app, screen, pg, font, buttons):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--theta-max", type=float, default=float(np.pi / 2),
-                    help="край карты по theta; по умолчанию pi/2 -- соглашение для визуализаций")
-    ap.add_argument("--dtheta-max", type=float, default=8.0)
+    ap.add_argument("--psi-max", type=float, default=float(np.pi / 2),
+                    help="край карты по psi; по умолчанию pi/2 -- соглашение для визуализаций")
+    ap.add_argument("--dpsi-max", type=float, default=8.0)
     ap.add_argument("--grid", type=int, default=61)
     ap.add_argument("--horizon", type=float, default=5.0)
-    ap.add_argument("--theta-fall", type=float, default=float(np.pi))
+    ap.add_argument("--psi-fall", type=float, default=float(np.pi))
     ap.add_argument("--u-max", type=float, default=10.0, help="inf -- без предела")
     ap.add_argument("--a", default="base", choices=list(PRESETS))
     ap.add_argument("--b", default="R=100", choices=list(PRESETS))
-    ap.add_argument("--select", type=float, nargs=2, default=None, metavar=("THETA0", "DTHETA0"))
+    ap.add_argument("--select", type=float, nargs=2, default=None, metavar=("PSI0", "DPSI0"))
     ap.add_argument("--screenshot", default=None, help="снять кадр и выйти")
     args = ap.parse_args()
 
@@ -658,8 +658,8 @@ def main():
     buttons = Buttons()
     refresh(app, screen, pg, font, buttons)
     if args.select is not None:
-        ix = int(np.argmin(np.abs(app.thetas - args.select[0])))
-        iy = int(np.argmin(np.abs(app.dthetas - args.select[1])))
+        ix = int(np.argmin(np.abs(app.psis - args.select[0])))
+        iy = int(np.argmin(np.abs(app.dpsis - args.select[1])))
         app.select(ix, iy)
 
     if args.screenshot:

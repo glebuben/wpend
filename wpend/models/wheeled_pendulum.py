@@ -1,8 +1,8 @@
 """Колёсный маятник (segway): корпус на одном колесе, привод -- момент мотора.
 
-Состояние x = (theta, phi, dtheta, dphi):
-    theta -- наклон корпуса от вертикали (0 -- стойка вверх),
-    phi   -- угол поворота колеса в мировой системе (качение без проскальзывания).
+Состояние x = (psi, theta, dpsi, dtheta):
+    psi -- наклон корпуса от вертикали (0 -- стойка вверх),
+    theta   -- угол поворота колеса в мировой системе (качение без проскальзывания).
 Управление u -- момент мотора между корпусом и колесом; на корпус действует
 +u, на колесо -u (третий закон Ньютона).
 
@@ -11,21 +11,21 @@
 
     alpha = I_b + m_b l^2,   beta = m_b r l,
     gamma = I_w + (m_w + m_b) r^2,   D = m_b g l,
-    b(theta)     = gamma + beta cos(theta),
-    Delta(theta) = alpha gamma - beta^2 cos^2(theta) > 0.
+    b(psi)     = gamma + beta cos(psi),
+    Delta(psi) = alpha gamma - beta^2 cos^2(psi) > 0.
 
 Уравнения Эйлера--Лагранжа (§1.1):
-    alpha ddtheta + beta cos(theta) ddphi - D sin(theta) =  u
-    beta cos(theta) ddtheta + gamma ddphi - beta sin(theta) dtheta^2 = -u
+    alpha ddpsi + beta cos(psi) ddtheta - D sin(psi) =  u
+    beta cos(psi) ddpsi + gamma ddtheta - beta sin(psi) dpsi^2 = -u
 
 Разрешая относительно ускорений (определитель = Delta), получаем §1.3:
 
-    ddtheta = [ b(theta) u + gamma D sin(theta)
-                - beta^2 sin(theta) cos(theta) dtheta^2 ] / Delta
-    ddphi   = [ alpha beta sin(theta) dtheta^2 - beta D sin(theta) cos(theta)
-                - (alpha + beta cos(theta)) u ] / Delta
+    ddpsi = [ b(psi) u + gamma D sin(psi)
+                - beta^2 sin(psi) cos(psi) dpsi^2 ] / Delta
+    ddtheta   = [ alpha beta sin(psi) dpsi^2 - beta D sin(psi) cos(psi)
+                - (alpha + beta cos(psi)) u ] / Delta
 
-Ни phi, ни dphi в правую часть не входят: phi -- циклическая координата
+Ни theta, ни dtheta в правую часть не входят: theta -- циклическая координата
 (§1.4, галилеева инвариантность идеального качения).  Это встроенный тест
 корректности модели -- см. tests/test_wheeled_pendulum.py.
 """
@@ -79,7 +79,7 @@ class WheeledPendulumParams:
 
 
 class WheeledPendulum(System):
-    """dx/dt = f(t, x, u), x = (theta, phi, dtheta, dphi), u = (torque,)."""
+    """dx/dt = f(t, x, u), x = (psi, theta, dpsi, dtheta), u = (torque,)."""
 
     def __init__(self, params: WheeledPendulumParams | None = None, **kwargs):
         self.p = params if params is not None else WheeledPendulumParams(**kwargs)
@@ -94,7 +94,7 @@ class WheeledPendulum(System):
 
     @property
     def state_names(self) -> tuple[str, ...]:
-        return ("theta", "phi", "dtheta", "dphi")
+        return ("psi", "theta", "dpsi", "dtheta")
 
     @property
     def action_names(self) -> tuple[str, ...]:
@@ -108,42 +108,42 @@ class WheeledPendulum(System):
 
     # --- вспомогательные скаляры ------------------------------------------
 
-    def b(self, theta) -> float:
-        """b(theta) = gamma + beta cos(theta) -- множитель при u в ddtheta."""
-        return self.p.gamma + self.p.beta * np.cos(theta)
+    def b(self, psi) -> float:
+        """b(psi) = gamma + beta cos(psi) -- множитель при u в ddpsi."""
+        return self.p.gamma + self.p.beta * np.cos(psi)
 
-    def Delta(self, theta) -> float:
-        """Delta(theta) = det M = alpha gamma - beta^2 cos^2(theta).
+    def Delta(self, psi) -> float:
+        """Delta(psi) = det M = alpha gamma - beta^2 cos^2(psi).
 
         Строго положителен для физичных параметров (неравенство Коши--Буняковского
         для матрицы масс), поэтому уравнения всегда разрешимы относительно
         ускорений.
         """
         p = self.p
-        return p.alpha * p.gamma - p.beta ** 2 * np.cos(theta) ** 2
+        return p.alpha * p.gamma - p.beta ** 2 * np.cos(psi) ** 2
 
     # --- динамика ----------------------------------------------------------
 
     def f(self, t, x, u):
         # Индексы x[..., i], а не распаковка: так одна и та же формула считает
         # и одно состояние (4,), и пачку (M, 4) -- см. System.f.
-        theta = x[..., 0]
-        dtheta = x[..., 2]
-        dphi = x[..., 3]
+        psi = x[..., 0]
+        dpsi = x[..., 2]
+        dtheta = x[..., 3]
         p = self.p
-        s, c = np.sin(theta), np.cos(theta)
+        s, c = np.sin(psi), np.cos(psi)
         Delta = p.alpha * p.gamma - p.beta ** 2 * c ** 2
         torque = u[..., 0]
 
-        ddtheta = ((p.gamma + p.beta * c) * torque
+        ddpsi = ((p.gamma + p.beta * c) * torque
                    + p.gamma * p.D * s
-                   - p.beta ** 2 * s * c * dtheta ** 2) / Delta
+                   - p.beta ** 2 * s * c * dpsi ** 2) / Delta
 
-        ddphi = (p.alpha * p.beta * s * dtheta ** 2
+        ddtheta = (p.alpha * p.beta * s * dpsi ** 2
                  - p.beta * p.D * s * c
                  - (p.alpha + p.beta * c) * torque) / Delta
 
-        return np.stack([dtheta, dphi, ddtheta, ddphi], axis=-1)
+        return np.stack([dpsi, dtheta, ddpsi, ddtheta], axis=-1)
 
     # --- что видит акселерометр (физика датчика, а не датчик) ---------------
 
@@ -155,17 +155,17 @@ class WheeledPendulum(System):
         направленный вверх.  Именно поэтому по нему вообще можно судить о
         наклоне, и именно поэтому при разгоне он врёт.
 
-        Датчик стоит в точке p_s = (r*phi + d*sin(theta), r + d*cos(theta)).
-        Оси корпуса: e_z = (sin theta, cos theta) -- вдоль корпуса вверх,
-        e_x = (cos theta, -sin theta) -- вперёд.  Дважды дифференцируя p_s,
+        Датчик стоит в точке p_s = (r*theta + d*sin(psi), r + d*cos(psi)).
+        Оси корпуса: e_z = (sin psi, cos psi) -- вдоль корпуса вверх,
+        e_x = (cos psi, -sin psi) -- вперёд.  Дважды дифференцируя p_s,
         проецируя (d2p_s/dt2 - g_world) на эти оси и сокращая, получаем
 
-            f_x = -g sin(theta) + d*ddtheta + r cos(theta)*ddphi
-            f_z =  g cos(theta) - d*dtheta^2 + r sin(theta)*ddphi
+            f_x = -g sin(psi) + d*ddpsi + r cos(psi)*ddtheta
+            f_z =  g cos(psi) - d*dpsi^2 + r sin(psi)*ddtheta
 
-        В покое f = (-g sin theta, g cos theta): модуль ровно g, и
-        atan2(-f_x, f_z) = theta.  Отсюда "кажущаяся вертикаль": как только
-        корпус разгоняется, члены с ddphi и ddtheta сдвигают этот угол, и
+        В покое f = (-g sin psi, g cos psi): модуль ровно g, и
+        atan2(-f_x, f_z) = psi.  Отсюда "кажущаяся вертикаль": как только
+        корпус разгоняется, члены с ddtheta и ddpsi сдвигают этот угол, и
         ошибка наклона коррелирует с моментом.  Это не шум датчика, а его
         физика -- усреднением она не убирается, нужен гироскоп (ER-008).
 
@@ -179,7 +179,7 @@ class WheeledPendulum(System):
 
         Источники: Groves, "Principles of GNSS, Inertial, and Multisensor
         Integrated Navigation Systems", 2-е изд., гл. 2.4 (удельная сила) и
-        гл. 4.1; docs/Key_Formulas.md §1.3 (откуда ddtheta и ddphi).
+        гл. 4.1; docs/Key_Formulas.md §1.3 (откуда ddpsi и ddtheta).
         """
         if u is None:
             raise ValueError(
@@ -189,21 +189,21 @@ class WheeledPendulum(System):
         x = np.asarray(x, dtype=float)
         u = np.atleast_1d(np.asarray(u, dtype=float))
         dx = self.f(t, x, u)
-        theta = x[..., 0]
-        dtheta = x[..., 2]
-        ddtheta = dx[..., 2]
-        ddphi = dx[..., 3]
-        s, c = np.sin(theta), np.cos(theta)
+        psi = x[..., 0]
+        dpsi = x[..., 2]
+        ddpsi = dx[..., 2]
+        ddtheta = dx[..., 3]
+        s, c = np.sin(psi), np.cos(psi)
         g, r = self.p.g, self.p.r
-        f_x = -g * s + d * ddtheta + r * c * ddphi
-        f_z = g * c - d * dtheta ** 2 + r * s * ddphi
+        f_x = -g * s + d * ddpsi + r * c * ddtheta
+        f_z = g * c - d * dpsi ** 2 + r * s * ddtheta
         return f_x, f_z
 
     # --- оракулы для тестов и анализа --------------------------------------
 
     def first_integral(self, x, u_const) -> float:
-        """H(theta, dtheta; u) = 1/2 Delta dtheta^2 - u (gamma theta + beta sin theta)
-        + gamma D cos(theta).
+        """H(psi, dpsi; u) = 1/2 Delta dpsi^2 - u (gamma psi + beta sin psi)
+        + gamma D cos(psi).
 
         При ПОСТОЯННОМ u выполняется dH/dt = 0 (Key_Formulas §3, вывод в
         приложении B): приведённая динамика наклона одномерна и потому
@@ -218,28 +218,28 @@ class WheeledPendulum(System):
         tests/test_wheeled_pendulum.py::test_first_integral_broadcasts_u.
         """
         x = np.asarray(x, dtype=float)
-        theta, dtheta = x[..., 0], x[..., 2]
+        psi, dpsi = x[..., 0], x[..., 2]
         p = self.p
-        return (0.5 * self.Delta(theta) * dtheta ** 2
-                - u_const * (p.gamma * theta + p.beta * np.sin(theta))
-                + p.gamma * p.D * np.cos(theta))
+        return (0.5 * self.Delta(psi) * dpsi ** 2
+                - u_const * (p.gamma * psi + p.beta * np.sin(psi))
+                + p.gamma * p.D * np.cos(psi))
 
     # --- множество восстановимости (Key_Formulas §3.2) ----------------------
     #
     # Всё, что ниже, НЕ зависит от регулятора. Это ответ на вопрос «может ли
     # хоть какое-нибудь управление |u| <= u_max вернуть корпус в вертикаль»,
     # и он существует в замкнутом виде ровно потому, что приведённая динамика
-    # наклона одномерна (phi циклична, §1.4) и при постоянном u интегрируема.
+    # наклона одномерна (theta циклична, §1.4) и при постоянном u интегрируема.
 
     def saddle_angle(self, u_max: float) -> float:
-        """Угол theta_eq > 0, при котором предельный момент u = -u_max ровно
+        """Угол psi_eq > 0, при котором предельный момент u = -u_max ровно
         уравновешивает силу тяжести:
 
-            gamma D sin(theta_eq) = u_max (gamma + beta cos(theta_eq)).      (*)
+            gamma D sin(psi_eq) = u_max (gamma + beta cos(psi_eq)).      (*)
 
         Это положение равновесия приведённой динамики, и оно СЕДЛОВОЕ: при
-        theta < theta_eq момент пересиливает тяжесть и возвращает корпус, при
-        theta > theta_eq тяжесть пересиливает и корпус уходит. Дальше этого
+        psi < psi_eq момент пересиливает тяжесть и возвращает корпус, при
+        psi > psi_eq тяжесть пересиливает и корпус уходит. Дальше этого
         угла из состояния покоя не спастись никаким управлением.
 
         Корень ищется делением пополам: (*) монотонна на (0, pi/2), а тащить
@@ -265,44 +265,44 @@ class WheeledPendulum(System):
         return 0.5 * (lo + hi)
 
     def separatrix_level(self, u_max: float) -> float:
-        """K(u_max) = H(theta_eq, 0; -u_max) -- уровень первого интеграла,
+        """K(u_max) = H(psi_eq, 0; -u_max) -- уровень первого интеграла,
         проходящий через седло. Граница восстановимости лежит на нём."""
         p = self.p
         th = self.saddle_angle(u_max)
         return (u_max * (p.gamma * th + p.beta * np.sin(th))
                 + p.gamma * p.D * np.cos(th))
 
-    def recoverable_bounds(self, u_max: float, theta):
-        """(floor, ceiling) -- границы по dtheta множества восстановимости.
+    def recoverable_bounds(self, u_max: float, psi):
+        """(floor, ceiling) -- границы по dpsi множества восстановимости.
 
-        Состояние (theta, dtheta) восстановимо тогда и только тогда, когда
-        floor(theta) < dtheta < ceiling(theta). Снаружи не помогает НИКАКОЙ
+        Состояние (psi, dpsi) восстановимо тогда и только тогда, когда
+        floor(psi) < dpsi < ceiling(psi). Снаружи не помогает НИКАКОЙ
         регулятор: это свойство системы и предела мотора, а не закона
         управления.
 
-        Из H(theta, dtheta; -+u_max) = K(u_max) получается
+        Из H(psi, dpsi; -+u_max) = K(u_max) получается
 
-            dtheta^2 = 2 [ K - gamma D cos(theta) -+ u_max (gamma theta
-                           + beta sin(theta)) ] / Delta(theta).
+            dpsi^2 = 2 [ K - gamma D cos(psi) -+ u_max (gamma psi
+                           + beta sin(psi)) ] / Delta(psi).
 
         ЛОВУШКА, ради которой это написано отдельным методом. Граница -- не
         линия уровня H = K, а УСТОЙЧИВОЕ МНОГООБРАЗИЕ седла, и оно составляет
         лишь часть этой линии. У седла устойчивый собственный вектор имеет
-        отрицательный наклон, поэтому нужная ветвь меняет знак dtheta при
-        переходе через theta_eq:
+        отрицательный наклон, поэтому нужная ветвь меняет знак dpsi при
+        переходе через psi_eq:
 
-            ceiling(theta) = +sqrt(sq_minus)  при theta <  theta_eq,
-                             -sqrt(sq_minus)  при theta >  theta_eq;
-            floor(theta)   = -sqrt(sq_plus)   при theta > -theta_eq,
-                             +sqrt(sq_plus)   при theta < -theta_eq.
+            ceiling(psi) = +sqrt(sq_minus)  при psi <  psi_eq,
+                             -sqrt(sq_minus)  при psi >  psi_eq;
+            floor(psi)   = -sqrt(sq_plus)   при psi > -psi_eq,
+                             +sqrt(sq_plus)   при psi < -psi_eq.
 
-        Смена знака -- это не косметика: она добавляет «языки» за +-theta_eq.
+        Смена знака -- это не косметика: она добавляет «языки» за +-psi_eq.
         Корпус, наклонённый почти горизонтально, ВСЁ ЕЩЁ восстановим, если
         качается назад достаточно быстро -- но не слишком быстро, иначе
         перелетит в другую сторону. Взять просто линию уровня значит потерять
         эти области и объявить невосстановимым то, что восстановимо.
 
-        Работает и со скаляром, и с массивом theta -- соглашение A8.
+        Работает и со скаляром, и с массивом psi -- соглашение A8.
 
         Источник: `docs/Key_Formulas.md` §3.2 и приложение C (ветка master);
         Khalil, *Nonlinear Systems*, 3-е изд., гл. 4 (области притяжения) и
@@ -311,38 +311,38 @@ class WheeledPendulum(System):
         тестом.
         """
         p = self.p
-        theta = np.asarray(theta, dtype=float)
+        psi = np.asarray(psi, dtype=float)
         K = self.separatrix_level(u_max)
         th_eq = self.saddle_angle(u_max)
 
-        work = u_max * (p.gamma * theta + p.beta * np.sin(theta))
-        gap = K - p.gamma * p.D * np.cos(theta)
-        Delta = self.Delta(theta)
+        work = u_max * (p.gamma * psi + p.beta * np.sin(psi))
+        gap = K - p.gamma * p.D * np.cos(psi)
+        Delta = self.Delta(psi)
         sq_minus = 2.0 * (gap - work) / Delta      # H(-u_max) = K
         sq_plus = 2.0 * (gap + work) / Delta       # H(+u_max) = K
 
         sm = np.sqrt(np.clip(sq_minus, 0.0, None))
         sp = np.sqrt(np.clip(sq_plus, 0.0, None))
-        ceiling = np.where(theta < th_eq, sm, -sm)
-        floor = np.where(theta > -th_eq, -sp, sp)
+        ceiling = np.where(psi < th_eq, sm, -sm)
+        floor = np.where(psi > -th_eq, -sp, sp)
         return floor, ceiling
 
-    def is_recoverable(self, u_max: float, theta, dtheta):
+    def is_recoverable(self, u_max: float, psi, dpsi):
         """Булев ответ «отсюда можно вернуться при |u| <= u_max»."""
-        floor, ceiling = self.recoverable_bounds(u_max, theta)
-        return (np.asarray(dtheta) > floor) & (np.asarray(dtheta) < ceiling)
+        floor, ceiling = self.recoverable_bounds(u_max, psi)
+        return (np.asarray(dpsi) > floor) & (np.asarray(dpsi) < ceiling)
 
     def linearize_tilt(self):
-        """(A_t, B_t) приведённой подсистемы наклона z = (theta, dtheta).
+        """(A_t, B_t) приведённой подсистемы наклона z = (psi, dpsi).
 
             A_t = [[0, 1], [gamma D / Delta_0, 0]],   B_t = [0, (gamma+beta)/Delta_0]^T
 
         Почему такая подсистема вообще существует. В правые части НЕ входят ни
-        phi, ни dphi (§1.4): наклон живёт своей жизнью, а колесо -- это цепочка
+        theta, ни dtheta (§1.4): наклон живёт своей жизнью, а колесо -- это цепочка
         интеграторов, ведомая наклоном и моментом. Система треугольная, и
         верхнее звено этой цепочки замкнуто само на себя.
 
-        Это ровно строки и столбцы (theta, dtheta) из `linearize_upright` --
+        Это ровно строки и столбцы (psi, dpsi) из `linearize_upright` --
         тест сверяет их поэлементно. Отдельный метод нужен потому, что синтез
         ЛКР по этой паре даёт СУЩЕСТВЕННО другой регулятор: четырёхмерная
         задача обязана возвращать колесо, а единственный рычаг для этого --

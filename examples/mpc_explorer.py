@@ -2,8 +2,8 @@
 
     uv run python examples/mpc_explorer.py
     uv run python examples/mpc_explorer.py --u-max 10 --select -0.495 0.46
-    uv run python examples/mpc_explorer.py --dtheta-max 8        # своя граница по скорости
-    uv run python examples/mpc_explorer.py --theta-fall 1.571    # «упал» = лёг на землю
+    uv run python examples/mpc_explorer.py --dpsi-max 8        # своя граница по скорости
+    uv run python examples/mpc_explorer.py --psi-fall 1.571    # «упал» = лёг на землю
 
 Устроено как окно исследователя, но с поправкой на цену расчёта: карту MPC
 целиком не посчитать (8–15 с на клетку), поэтому
@@ -14,7 +14,7 @@
   итерации iLQR; уже посчитанные старты остаются на карте кружками цвета
   исхода MPC (для текущих параметров);
 * после расчёта траектория проигрывается: робот MPC и полупрозрачный
-  робот-ЛКР, фазовые кривые, графики theta(t), u(t), phi(t);
+  робот-ЛКР, фазовые кривые, графики psi(t), u(t), theta(t);
 * главное -- ПЛАН. На каждом кадре поверх карты и графиков пунктиром рисуется
   то, что MPC предсказывал на последнем такте: куда собирался привести
   корпус и каким моментом. Расхождение плана с тем, что случилось, --
@@ -50,12 +50,12 @@
 
 Карта и исходы (соглашение для визуализаций, Глеб 16.09)
 -------------------------------------------------------
-* По theta карта всегда от -pi/2 до pi/2 (пунктир на краях -- горизонт корпуса).
-  По dtheta -- в 1.3 раза шире множества восстановимости на этом отрезке
+* По psi карта всегда от -pi/2 до pi/2 (пунктир на краях -- горизонт корпуса).
+  По dpsi -- в 1.3 раза шире множества восстановимости на этом отрезке
   (зелёная линия), чтобы полоса целиком помещалась при любом u_max.
-* Упал -- |theta| пересёк --theta-fall (по умолчанию pi: провернулся через
+* Упал -- |psi| пересёк --psi-fall (по умолчанию pi: провернулся через
   низ; земли в модели нет). Не успокоился (серый) -- не пересёк, но к концу
-  прогона |theta| >= 0.1. Иначе удержан.
+  прогона |psi| >= 0.1. Иначе удержан.
 """
 
 import argparse
@@ -84,7 +84,7 @@ import lqr_cost_explorer as lce  # noqa: E402  -- цена, пресеты, по
 
 DT = 1e-3
 MAP_FIT = 1.3
-THETA_MAP = np.pi / 2          # край карты по theta: соглашение для визуализаций (Глеб 16.09)
+PSI_MAP = np.pi / 2          # край карты по psi: соглашение для визуализаций (Глеб 16.09)
 W, H = 1280, 940
 U_SLIDER = (100, 14, 300, 14)
 MAP = (56, 206, 500, 500)
@@ -139,7 +139,7 @@ def build_mpc(cost, u_max, mpc_params, box, record_plans=False):
     from wpend.lqr import lqr
     K, _ = lce.design(WheeledPendulum(), cost)
     A, B = WheeledPendulum().linearize_upright()
-    q = np.array([cost["q_theta"], cost["q_phi"], cost["q_dtheta"], cost["q_dphi"]])
+    q = np.array([cost["q_psi"], cost["q_theta"], cost["q_dpsi"], cost["q_dtheta"]])
     Q, R = np.diag(q), np.array([[cost["R"]]])
     try:
         _, P = lqr(A, B, Q, R)
@@ -158,9 +158,9 @@ def build_mpc(cost, u_max, mpc_params, box, record_plans=False):
     return ctrl, K
 
 
-def outcome_of(x, theta_fall):
+def outcome_of(x, psi_fall):
     """Исход прогона -- те же правила, что у фоновой карты (lce.compute_map)."""
-    fell = np.flatnonzero(np.abs(x[1:, 0]) >= theta_fall)
+    fell = np.flatnonzero(np.abs(x[1:, 0]) >= psi_fall)
     if fell.size:
         return 1 if x[fell[0] + 1, 0] > 0 else 2
     return HELD if abs(x[-1, 0]) < lce.SETTLE else lce.NOT_SETTLED
@@ -169,13 +169,13 @@ def outcome_of(x, theta_fall):
 STORE_STRIDE = 10      # траектория в кэше -- каждый 10-й шаг (10 мс): 121 старт ~ 30 МБ
 
 
-def pack_run(tr, plans, theta_fall, wall):
+def pack_run(tr, plans, psi_fall, wall):
     """Всё, что окну нужно, чтобы показать старт без пересчёта: исход,
     прореженная траектория, планы тактов (float32) и сводка по скорости."""
     walls = [p["wall"] for p in plans]
     iters = [p["iters"] for p in plans]
     return dict(
-        outcome=outcome_of(tr.x, theta_fall),
+        outcome=outcome_of(tr.x, psi_fall),
         t=tr.t[::STORE_STRIDE],
         x=tr.x[::STORE_STRIDE].astype(np.float32),
         u=tr.u[::STORE_STRIDE, 0].astype(np.float32),
@@ -190,12 +190,12 @@ def pack_run(tr, plans, theta_fall, wall):
 def mpc_cell(job):
     """Один старт для пула. Возвращает то же, что считает клик по клетке, --
     чтобы клик по уже залитой клетке показывал траекторию сразу."""
-    x0, cost, u_max, mpc_params, box, horizon, theta_fall = job
+    x0, cost, u_max, mpc_params, box, horizon, psi_fall = job
     ctrl, _ = build_mpc(cost, u_max, mpc_params, box, record_plans=True)
     t0 = time.perf_counter()
     tr = rollout(WheeledPendulum(u_max=u_max), ctrl, RK4Integrator(), x0, DT,
                  int(round(horizon / DT)))
-    return pack_run(tr, ctrl.plans, theta_fall, time.perf_counter() - t0)
+    return pack_run(tr, ctrl.plans, psi_fall, time.perf_counter() - t0)
 
 
 # ---------------------------------------------------------------------------
@@ -244,18 +244,18 @@ class App:
             self.stop_fill()
         u = self.u_max if self.u_max is not None else self.u_finite
         world = WheeledPendulum(u_max=u)
-        th = THETA_MAP
+        th = PSI_MAP
         # Полоса восстановимости наклонена: у края карты она уходит к большим
-        # |dtheta|. Граница по скорости берётся по всему отрезку theta, иначе
+        # |dpsi|. Граница по скорости берётся по всему отрезку psi, иначе
         # полоса вылезала бы за верх и низ карты.
         grid_th = np.linspace(-th, th, 401)
         floor, ceil = world.recoverable_bounds(u, grid_th)
         reach = np.abs(np.concatenate([floor, ceil]))
-        dth = self.args.dtheta_max or MAP_FIT * float(reach[np.isfinite(reach)].max())
+        dth = self.args.dpsi_max or MAP_FIT * float(reach[np.isfinite(reach)].max())
         n = self.args.grid
-        self.thetas = np.linspace(-th, th, n)
-        self.dthetas = np.linspace(-dth, dth, n)
-        TH, DTH = np.meshgrid(self.thetas, self.dthetas, indexing="xy")
+        self.psis = np.linspace(-th, th, n)
+        self.dpsis = np.linspace(-dth, dth, n)
+        TH, DTH = np.meshgrid(self.psis, self.dpsis, indexing="xy")
         self.X0 = np.zeros((n * n, 4))
         self.X0[:, 0], self.X0[:, 2] = TH.ravel(), DTH.ravel()
         self.n = n
@@ -274,7 +274,7 @@ class App:
 
     def compute_background(self):
         self.bg = lce.compute_map(WheeledPendulum(), self.K, self.u_max, self.X0,
-                                  self.args.horizon, self.args.theta_fall)
+                                  self.args.horizon, self.args.psi_fall)
 
     # --- расчёт выбранного старта ---------------------------------------------------
 
@@ -297,7 +297,7 @@ class App:
     def start(self, ix, iy):
         self.cancel_worker()
         self.selected = (ix, iy)
-        x0 = np.array([self.thetas[ix], 0.0, self.dthetas[iy], 0.0])
+        x0 = np.array([self.psis[ix], 0.0, self.dpsis[iy], 0.0])
         world = WheeledPendulum(u_max=self.u_max)
         n_steps = int(round(self.args.horizon / DT))
         lq = rollout(world, LinearFeedbackController(self.K), RK4Integrator(), x0, DT, n_steps)
@@ -325,7 +325,7 @@ class App:
             except Exception as exc:        # показать, а не уронить окно
                 self.status = f"MPC failed: {str(exc)[:80]}"
                 return
-            run = pack_run(tr, mpc.plans, self.args.theta_fall, time.perf_counter() - t0)
+            run = pack_run(tr, mpc.plans, self.args.psi_fall, time.perf_counter() - t0)
             self.runs.setdefault(key, {})[cell] = run
             self.marks.setdefault(key, {})[cell] = run["outcome"]
             if self.selected == cell and self.params_key() == key:
@@ -352,9 +352,9 @@ class App:
         done = self.runs.get(key, {})
         todo = [c for c in self.fill_cells() if c not in done]
         for ix, iy in todo:
-            x0 = np.array([self.thetas[ix], 0.0, self.dthetas[iy], 0.0])
+            x0 = np.array([self.psis[ix], 0.0, self.dpsis[iy], 0.0])
             job = (x0, dict(self.cost), self.u_max, dict(self.mpc), self.box,
-                   self.args.horizon, self.args.theta_fall)
+                   self.args.horizon, self.args.psi_fall)
             self.fill_futures[self.pool.submit(mpc_cell, job)] = (key, (ix, iy))
         self.fill_total = len(self.fill_cells())
 
@@ -414,11 +414,11 @@ class App:
 
     # --- геометрия -----------------------------------------------------------------
 
-    def to_px(self, theta, dtheta):
+    def to_px(self, psi, dpsi):
         x, y, w, h = MAP
         edge = self.n / max(self.n - 1, 1)
-        ht, hd = self.thetas[-1] * edge, self.dthetas[-1] * edge
-        return x + (theta + ht) / (2 * ht) * w, y + (1 - (dtheta + hd) / (2 * hd)) * h
+        ht, hd = self.psis[-1] * edge, self.dpsis[-1] * edge
+        return x + (psi + ht) / (2 * ht) * w, y + (1 - (dpsi + hd) / (2 * hd)) * h
 
     def cell_at(self, pos):
         """Клетка под курсором. В режиме сравнения -- ближайшая клетка заливки:
@@ -540,7 +540,7 @@ def draw_map(screen, pg, font, app):
 
     if app.u_max is not None:
         world = WheeledPendulum(u_max=app.u_max)
-        th = np.linspace(app.thetas[0] * 1.05, app.thetas[-1] * 1.05, 800)
+        th = np.linspace(app.psis[0] * 1.05, app.psis[-1] * 1.05, 800)
         floor, ceil = world.recoverable_bounds(app.u_max, th)
         for vals in (ceil, floor):
             pts = [app.to_px(a, b) for a, b in zip(th, vals) if abs(b) > 1e-12]
@@ -574,10 +574,10 @@ def draw_map(screen, pg, font, app):
         pg.draw.rect(screen, ACCENT, (x + (ix + 0.5 - span / 2) * cw,
                                       y + (app.n - 1 - iy + 0.5 - span / 2) * ch,
                                       max(span * cw, 3), max(span * ch, 3)), 2)
-    for text, tx, ty in ((f"{app.thetas[0]:+.2f}", x, y + h + 6),
-                         (f"{app.thetas[-1]:+.2f}", x + w - 40, y + h + 6),
-                         (f"{app.dthetas[-1]:+.1f}", x - 48, y),
-                         (f"{app.dthetas[0]:+.1f}", x - 48, y + h - 14)):
+    for text, tx, ty in ((f"{app.psis[0]:+.2f}", x, y + h + 6),
+                         (f"{app.psis[-1]:+.2f}", x + w - 40, y + h + 6),
+                         (f"{app.dpsis[-1]:+.1f}", x - 48, y),
+                         (f"{app.dpsis[0]:+.1f}", x - 48, y + h - 14)):
         screen.blit(font.render(text, True, DIM), (tx, ty))
 
 
@@ -663,7 +663,7 @@ def draw_plot(screen, pg, font, app, rect, title, index, limit=None):
     if limit is not None:
         lo, hi = min(lo, -limit), max(hi, limit)
     if index == 0:
-        lo, hi = max(lo, -1.1 * app.args.theta_fall), min(hi, 1.1 * app.args.theta_fall)
+        lo, hi = max(lo, -1.1 * app.args.psi_fall), min(hi, 1.1 * app.args.psi_fall)
     pad = 0.08 * max(hi - lo, 1e-6)
     lo, hi = lo - pad, hi + pad
 
@@ -763,7 +763,7 @@ def draw(screen, pg, font, app, buttons):
     line = app.status
     if app.selected is not None:
         ix, iy = app.selected
-        line = f"theta0 = {app.thetas[ix]:+.3f}, dtheta0 = {app.dthetas[iy]:+.2f}   {line}"
+        line = f"psi0 = {app.psis[ix]:+.3f}, dpsi0 = {app.dpsis[iy]:+.2f}   {line}"
     screen.blit(font.render(line, True, TEXT), (24, 138))
     legend = "dashed orange: MPC plan made at the last tact (where it expected to go)"
     screen.blit(font.render(legend, True, PLAN), (24, 158))
@@ -777,9 +777,9 @@ def draw(screen, pg, font, app, buttons):
 
     draw_map(screen, pg, font, app)
     draw_robot(screen, pg, font, app)
-    draw_plot(screen, pg, font, app, PLOTS[0], "theta(t), rad", 0)
+    draw_plot(screen, pg, font, app, PLOTS[0], "psi(t), rad", 0)
     draw_plot(screen, pg, font, app, PLOTS[1], "u(t), N*m  dashed green: +-u_max", None, app.u_max)
-    draw_plot(screen, pg, font, app, PLOTS[2], "phi(t), rad  (wheel)", 1)
+    draw_plot(screen, pg, font, app, PLOTS[2], "theta(t), rad  (wheel)", 1)
     if app.bg is None:
         screen.blit(font.render("computing LQR background...", True, ACCENT), (MAP[0] + 10, MAP[1] + 10))
 
@@ -808,13 +808,13 @@ def main():
     ap.add_argument("--preset", default="base", choices=list(lce.PRESETS))
     ap.add_argument("--grid", type=int, default=41)
     ap.add_argument("--horizon", type=float, default=5.0, help="длина прогона, с")
-    ap.add_argument("--dtheta-max", type=float, default=None,
-                    help="граница по dtheta; по умолчанию -- по множеству восстановимости")
-    ap.add_argument("--theta-fall", type=float, default=float(np.pi))
+    ap.add_argument("--dpsi-max", type=float, default=None,
+                    help="граница по dpsi; по умолчанию -- по множеству восстановимости")
+    ap.add_argument("--psi-fall", type=float, default=float(np.pi))
     ap.add_argument("--fill-step", type=int, default=4,
                     help="заливка MPC: каждая k-я клетка сетки (41 и 4 -> 11x11 = 121 старт)")
     ap.add_argument("--fill", action="store_true", help="сразу начать заливку MPC")
-    ap.add_argument("--select", type=float, nargs=2, default=None, metavar=("THETA0", "DTHETA0"))
+    ap.add_argument("--select", type=float, nargs=2, default=None, metavar=("PSI0", "DPSI0"))
     ap.add_argument("--screenshot", default=None, help="дождаться MPC, снять кадр на --shot-t и выйти")
     ap.add_argument("--shot-t", type=float, default=1.0)
     args = ap.parse_args()
@@ -838,8 +838,8 @@ def main():
 
     ensure_background()
     if args.select is not None:
-        app.start(int(np.argmin(np.abs(app.thetas - args.select[0]))),
-                  int(np.argmin(np.abs(app.dthetas - args.select[1]))))
+        app.start(int(np.argmin(np.abs(app.psis - args.select[0]))),
+                  int(np.argmin(np.abs(app.dpsis - args.select[1]))))
 
     if args.fill:
         app.start_fill()

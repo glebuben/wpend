@@ -31,7 +31,7 @@
 форма) и сертифицированный уровень c* (свойство проекта, считается численно).
 Поэтому слайдер во время перетаскивания двигает только первое -- это даром, --
 а второе и сетку пересчитывает на отпускании. Границы карты -- по стандарту
-проекта: theta до ±1.3·pi/2, dtheta -- 1.3 от восстановимого множества на
+проекта: psi до ±1.3·pi/2, dpsi -- 1.3 от восстановимого множества на
 [-pi/2, pi/2], см. Explorer._map_bounds.
 
 Модуль читает только Trajectory / TrajectoryBatch: ни одной формулы динамики
@@ -52,7 +52,7 @@ from ..controller import (
     LinearFeedbackController,
     ellipsoid_region,
     grid_region,
-    theta_band_region,
+    psi_band_region,
 )
 from ..estimator import ComplementaryEstimator, optimal_tau
 from ..integrator import RK4Integrator
@@ -67,7 +67,7 @@ from .grid import FELL_BACKWARD, FELL_FORWARD, HELD, GridSpec, classify
 # уехали: если синтез даст другое K, окно скажет об этом вслух.
 K_LQR = np.array([[95.122221, 1.0, 19.807871, 1.449624]])
 
-I_THETA, I_PHI, I_DTHETA, I_DPHI = 0, 1, 2, 3
+I_PSI, I_THETA, I_DPSI, I_DTHETA = 0, 1, 2, 3
 
 W, H = 1280, 940
 PICK = (24, 44)                     # x, y первой строки кнопок
@@ -91,7 +91,7 @@ NOISE_SPECS = [
 NOISE_TRACK = 104                   # длина дорожки одного слайдера
 NOISE_STEP = 96                     # x-шаг между блоками сверх дорожки
 
-# Диапазон слайдера. Сверху 10 Н*м: там седло уже за theta_fall, и карта
+# Диапазон слайдера. Сверху 10 Н*м: там седло уже за psi_fall, и карта
 # перестаёт следовать за восстановимым множеством -- окно говорит об этом
 # вслух. Снизу 0.25 -- режим, где восстановимо почти ничто. Шаг общий для мыши
 # и клавиатуры, иначе один и тот же замер не повторить.
@@ -101,16 +101,16 @@ U_MIN, U_MAX, U_STEP = 0.25, 10.0, 0.25
 #: переключается по сепаратрисе при том же пределе. Без предела не определено
 #: ни то, ни другое, поэтому окно их отключает -- как отключает эллипсоид без
 #: scipy: кнопка перечёркнута, и рядом написано, чего не хватает.
-RELAY_KEYS = ("bang", "bang-ell", "bang-ell-phi", "bang-tilt", "bang-map",
+RELAY_KEYS = ("bang", "bang-ell", "bang-ell-theta", "bang-tilt", "bang-map",
               "bang-eps", "bang-eps-ell")
 
 #: Цена ЛКР второй фазы у `bang-eps`: веса колеса в сто раз меньше базовых.
-#: Замер (PROPOSALS.md A26, карта 31x31, theta +-pi/2): с этой ценой и ЛКР, и
-#: реле -> |theta| < eps -> ЛКР удерживают всё восстановимое при u_max = 1.5, 3, 10;
+#: Замер (PROPOSALS.md A26, карта 31x31, psi +-pi/2): с этой ценой и ЛКР, и
+#: реле -> |psi| < eps -> ЛКР удерживают всё восстановимое при u_max = 1.5, 3, 10;
 #: с базовой ценой реле -> eps теряет 4 и 10 клеток при 3 и 10 Н*м.
 Q_SOFT_WHEEL = np.diag([100.0, 1e-2, 10.0, 1e-2])
 
-#: Цены ЛКР, с которыми окно стартует: (q_theta, q_phi, q_dtheta, q_dphi, R).
+#: Цены ЛКР, с которыми окно стартует: (q_psi, q_theta, q_dpsi, q_dtheta, R).
 #: Панель настроек (кнопка `settings`, клавиша S) меняет КОПИЮ -- app.cost, --
 #: а эти числа остаются опорой: кнопка `defaults` возвращает ровно их.
 #: base -- K для `lqr`, `bang-ell*`, `bang-map` и третьей фазы `bang-eps-ell`;
@@ -119,7 +119,7 @@ DEFAULT_COST = {
     "base": (100.0, 1.0, 10.0, 1.0, 1.0),
     "soft": (100.0, 1e-2, 10.0, 1e-2, 1.0),
 }
-COST_LABELS = ("q_theta", "q_phi", "q_dtheta", "q_dphi", "R")
+COST_LABELS = ("q_psi", "q_theta", "q_dpsi", "q_dtheta", "R")
 
 #: Во сколько раз карта шире восстановимого множества. 1.0 -- граница ровно по
 #: краю, и не видно, что снаружи неё карта обязана быть красной у любого
@@ -127,9 +127,9 @@ COST_LABELS = ("q_theta", "q_phi", "q_dtheta", "q_dphi", "R")
 MAP_FIT = 1.3
 #: Горизонт корпуса. Отмечается на карте пунктиром, когда попадает в границы.
 HORIZON_ANGLE = float(np.pi / 2)
-#: Стандарт карт (CLAUDE.md, Глеб 16.09 и 17.09): интересен theta в
+#: Стандарт карт (CLAUDE.md, Глеб 16.09 и 17.09): интересен psi в
 #: [-pi/2, pi/2], сетка берётся с запасом MAP_FIT по обеим осям.
-THETA_MAP = HORIZON_ANGLE
+PSI_MAP = HORIZON_ANGLE
 
 BG = (22, 24, 28)
 PANEL = (33, 36, 42)
@@ -171,10 +171,10 @@ UNKNOWN = (58, 62, 70)
 
 
 def _cost_matrices(cost):
-    """(q_theta, q_phi, q_dtheta, q_dphi, R) -> (Q, R) для `wpend.lqr.lqr`.
-    Порядок весов -- порядок состояния (I_THETA, I_PHI, I_DTHETA, I_DPHI)."""
+    """(q_psi, q_theta, q_dpsi, q_dtheta, R) -> (Q, R) для `wpend.lqr.lqr`.
+    Порядок весов -- порядок состояния (I_PSI, I_THETA, I_DPSI, I_DTHETA)."""
     q = np.zeros(4)
-    q[[I_THETA, I_PHI, I_DTHETA, I_DPHI]] = cost[:4]
+    q[[I_PSI, I_THETA, I_DPSI, I_DTHETA]] = cost[:4]
     return np.diag(q), np.array([[float(cost[4])]])
 
 
@@ -229,7 +229,7 @@ def _finite(ts, ys):
     перевалившись за горизонт, корпус получает момент, который его же и
     раскручивает, и угловые клетки карты уходят в переполнение за секунды
     (замер: |u| до 2e6 против 175 в остальных). Классификация это ловит --
-    theta пересекает theta_fall задолго до inf, и клетка честно красится
+    psi пересекает psi_fall задолго до inf, и клетка честно красится
     «упал», -- но рисовать по inf нельзя: масштаб оси станет nan, а int(nan)
     в pygame -- исключение. Поэтому кривые строятся по конечным точкам, а сам
     факт расхождения окно пишет словами.
@@ -286,7 +286,7 @@ CONTROLLERS = [
      lambda app: BangBangLQRController(app.K, app.u_max,
                                        ellipsoid_region(app.P, app.c_star),
                                        app.system)),
-    ("bang-ell-phi", "bang -> ell+phi",
+    ("bang-ell-theta", "bang -> ell+theta",
      lambda app: BangBangLQRController(app.K, app.u_max,
                                        ellipsoid_region(app.P, app.c_star),
                                        app.system, wheel_ref=True)),
@@ -296,15 +296,15 @@ CONTROLLERS = [
                                        app.system)),
     ("bang-map", "bang -> map",
      lambda app: BangBangLQRController(app.K, app.u_max,
-                                       grid_region(app.lqr_mask(), app.spec.thetas,
-                                                   app.spec.dthetas),
+                                       grid_region(app.lqr_mask(), app.spec.psis,
+                                                   app.spec.dpsis),
                                        app.system)),
-    # Реле сразу, передача по |theta| < eps (eps -- --eps), дальше ЛКР с
-    # пониженными гейнами по phi, dphi. Критерий без сертификата, поэтому
+    # Реле сразу, передача по |psi| < eps (eps -- --eps), дальше ЛКР с
+    # пониженными гейнами по theta, dtheta. Критерий без сертификата, поэтому
     # K_soft, а не K: базовый ЛКР после такой передачи роняет корпус чаще.
     ("bang-eps", "bang -> eps",
      lambda app: BangBangLQRController(app.K_soft, app.u_max,
-                                       theta_band_region(app.args.eps),
+                                       psi_band_region(app.args.eps),
                                        app.system)),
     # То же, плюс третья фаза (A27): мягкий ЛКР отдаёт управление базовому K,
     # когда состояние входит в ЕГО сертифицированный эллипсоид x^T P x <= c*.
@@ -312,7 +312,7 @@ CONTROLLERS = [
     # «критерий + регулятор» здесь честная.
     ("bang-eps-ell", "bang -> eps -> ell",
      lambda app: BangBangLQRController(app.K_soft, app.u_max,
-                                       theta_band_region(app.args.eps),
+                                       psi_band_region(app.args.eps),
                                        app.system, K_final=app.K,
                                        final_region=ellipsoid_region(app.P, app.c_star))),
 ]
@@ -331,7 +331,7 @@ CONTROLLER_BUILD = {key: build for key, _, build in CONTROLLERS}
 #
 #  Все неидеальные варианты -- ИДУ ПЛЮС МОТОРНЫЙ ЭНКОДЕР (решение Глеба и
 #  куратора 17.09): при одном ИДУ колесо ненаблюдаемо (rank 2 из 4), и любой
-#  регулятор с K[phi], K[dphi] != 0 получал выдуманное колесо -- смотреть на
+#  регулятор с K[theta], K[dtheta] != 0 получал выдуманное колесо -- смотреть на
 #  такую карту нет смысла.  С энкодером rank 4, ошибка колеса ограничена.
 #
 #  Все с компенсацией кажущейся вертикали (accel_offset = IMU_D, PROPOSALS.md
@@ -397,7 +397,7 @@ class Explorer:
             self.u_max = self.u_finite
         self.system = WheeledPendulum(u_max=self.u_max)
         self.integrator = RK4Integrator()
-        self.pinned = args.theta_max is not None or args.dtheta_max is not None
+        self.pinned = args.psi_max is not None or args.dpsi_max is not None
         self.spec = GridSpec(args.grid, *self._map_bounds())
         self.u_clip = self._clip_u_max()
 
@@ -531,7 +531,7 @@ class Explorer:
     def _synthesize_soft(self):
         """ЛКР второй фазы `bang-eps`: та же задача, что в _synthesize, но с
         ценой self.cost["soft"]. По умолчанию это Q_SOFT_WHEEL, R = 1 -- гейны
-        по phi и dphi ниже базовых в 10 и 4.4 раза.
+        по theta и dtheta ниже базовых в 10 и 4.4 раза.
 
         Без scipy -- None, и `bang-eps` окно отключает, как эллипсоид.
         """
@@ -544,16 +544,16 @@ class Explorer:
         return K_soft
 
     def _start_state(self):
-        """(theta, dtheta) стартовой клетки: узел сетки с |theta| <= pi/2 внутри
+        """(psi, dpsi) стартовой клетки: узел сетки с |psi| <= pi/2 внутри
         множества восстановимости и, если сетка уже посчитана, удержанный
-        основным регулятором; из таких -- с наибольшим |theta| (при равенстве
+        основным регулятором; из таких -- с наибольшим |psi| (при равенстве
         ближе к середине отрезка скоростей). На широкой карте наугад
         выбранная клетка почти всегда -- лёгший корпус, а центр -- неподвижный
         робот; ни то, ни другое не показывает, что делает регулятор."""
         u = self.u_finite if self.u_max is None else self.u_max
-        X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)
-        th, dth = X0[:, I_THETA], X0[:, I_DTHETA]
-        ok = self.system.is_recoverable(u, th, dth) & (np.abs(th) <= THETA_MAP)
+        X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)
+        th, dth = X0[:, I_PSI], X0[:, I_DPSI]
+        ok = self.system.is_recoverable(u, th, dth) & (np.abs(th) <= PSI_MAP)
         if (self.outcome >= 0).all() and (ok & (self.outcome == HELD)).any():
             ok &= self.outcome == HELD
         if not ok.any():
@@ -735,11 +735,11 @@ class Explorer:
 
         c_star, _ = certified_level(self.system, self.K, self.P, u_max=self.u_max,
                                     n_dirs=1500, ds=4e-3, s_max=8.0,
-                                    theta_max=self.args.theta_fall)
+                                    psi_max=self.args.psi_fall)
         c_tilt, _ = certified_level(self.system, self.K_tilt, self.P_tilt,
-                                    u_max=self.u_max, coords=(I_THETA, I_DTHETA),
+                                    u_max=self.u_max, coords=(I_PSI, I_DPSI),
                                     n_dirs=4000, ds=2e-3, s_max=8.0,
-                                    theta_max=self.args.theta_fall)
+                                    psi_max=self.args.psi_fall)
         self.design_note = (f"c*={c_star:.3g}"
                             + ("" if self.u_max is not None else " unclipped")
                             + self._drift)
@@ -748,21 +748,21 @@ class Explorer:
     # --- карта под предел момента ------------------------------------------
 
     def _map_bounds(self):
-        """Границы карты (theta_max, dtheta_max) по стандарту проекта.
+        """Границы карты (psi_max, dpsi_max) по стандарту проекта.
 
         Стандарт (CLAUDE.md, решения Глеба 16.09 и 17.09): интересен наклон
-        theta в [-pi/2, pi/2], а сетка берётся с запасом MAP_FIT по обеим осям.
-        По theta граница поэтому постоянная, MAP_FIT * pi/2 ≈ 2.04 рад: карта
+        psi в [-pi/2, pi/2], а сетка берётся с запасом MAP_FIT по обеим осям.
+        По psi граница поэтому постоянная, MAP_FIT * pi/2 ≈ 2.04 рад: карта
         одна и та же при любом моторе, и пунктир pi/2 на ней виден всегда.
 
-        По dtheta граница по-прежнему идёт за мотором: восстановимое множество
+        По dpsi граница по-прежнему идёт за мотором: восстановимое множество
         растёт с u_max почти линейно, и одни и те же границы годятся ровно для
-        одного мотора. Берётся MAP_FIT от наибольшего |dtheta| на границе
-        восстановимости при theta в [-pi/2, pi/2] -- не «горло» при theta = 0:
+        одного мотора. Берётся MAP_FIT от наибольшего |dpsi| на границе
+        восстановимости при psi в [-pi/2, pi/2] -- не «горло» при psi = 0:
         множество наклонное, и у края отрезка оно шире, чем в центре.
 
-        theta_fall по умолчанию -- pi («упал», земли в модели нет), так что
-        карта до него не доходит. Явные --theta-max / --dtheta-max
+        psi_fall по умолчанию -- pi («упал», земли в модели нет), так что
+        карта до него не доходит. Явные --psi-max / --dpsi-max
         замораживают границы: тогда карты при разных u_max сравнимы по
         пикселям, а не только по подписям.
         """
@@ -771,23 +771,23 @@ class Explorer:
         # смысл опыта -- те же клетки, другой мотор: видно, какие поменяли
         # цвет, а не как поехали оси.
         u = self.u_finite if self.u_max is None else self.u_max
-        theta_max = min(MAP_FIT * THETA_MAP, 0.98 * self.args.theta_fall)
-        th = np.linspace(-THETA_MAP, THETA_MAP, 401)
+        psi_max = min(MAP_FIT * PSI_MAP, 0.98 * self.args.psi_fall)
+        th = np.linspace(-PSI_MAP, PSI_MAP, 401)
         floor, ceiling = self.system.recoverable_bounds(u, th)
         reach = np.abs(np.concatenate([floor, ceiling]))
-        dtheta_max = MAP_FIT * float(reach[np.isfinite(reach)].max())
-        if self.args.theta_max is not None:
-            theta_max = self.args.theta_max
-        if self.args.dtheta_max is not None:
-            dtheta_max = self.args.dtheta_max
-        return theta_max, dtheta_max
+        dpsi_max = MAP_FIT * float(reach[np.isfinite(reach)].max())
+        if self.args.psi_max is not None:
+            psi_max = self.args.psi_max
+        if self.args.dpsi_max is not None:
+            dpsi_max = self.args.dpsi_max
+        return psi_max, dpsi_max
 
     def _clip_u_max(self):
         """Предел момента, с которого карта перестаёт содержать множество
-        восстановимости по theta. При стандартной карте (±1.3·pi/2 до
-        theta_fall = pi) такого нет -- None. Остаётся для --theta-fall меньше
+        восстановимости по psi. При стандартной карте (±1.3·pi/2 до
+        psi_fall = pi) такого нет -- None. Остаётся для --psi-fall меньше
         MAP_FIT·pi/2, где карта обрезается и окно обязано сказать об этом."""
-        if MAP_FIT * THETA_MAP <= 0.98 * self.args.theta_fall:
+        if MAP_FIT * PSI_MAP <= 0.98 * self.args.psi_fall:
             return None
         return U_MIN
 
@@ -799,14 +799,14 @@ class Explorer:
             # Без предела восстановимо любое состояние. Нарисовать здесь линию
             # значило бы дорисовать границу, которой нет, поэтому границы
             # просто нет -- и легенда говорит об этом словами.
-            self.limit_theta = self.limit_floor = self.limit_ceiling = None
-            self.theta_eq = None
+            self.limit_psi = self.limit_floor = self.limit_ceiling = None
+            self.psi_eq = None
             return
-        self.limit_theta = np.linspace(-self.spec.theta_max * 1.05,
-                                       self.spec.theta_max * 1.05, 601)
+        self.limit_psi = np.linspace(-self.spec.psi_max * 1.05,
+                                       self.spec.psi_max * 1.05, 601)
         self.limit_floor, self.limit_ceiling = self.system.recoverable_bounds(
-            self.u_max, self.limit_theta)
-        self.theta_eq = self.system.saddle_angle(self.u_max)
+            self.u_max, self.limit_psi)
+        self.psi_eq = self.system.saddle_angle(self.u_max)
 
     def toggle_limit(self):
         """Выключить предел или вернуть последнее конечное значение.
@@ -930,7 +930,7 @@ class Explorer:
         lo, hi = NOISE_SPECS[3][2], NOISE_SPECS[3][3]
         taus = np.exp(np.linspace(np.log(lo), np.log(hi), n_points))
         m = self.spec.index(*self.selected)
-        x0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)[m]
+        x0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m]
         X0 = np.tile(x0, (n_points * n_reps, 1))
 
         keep = self.noise["tau"]
@@ -948,7 +948,7 @@ class Explorer:
             self.tau_star_measured = None
             return
 
-        err = batch.x_hat[:, :, I_THETA] - batch.x[:, :-1, I_THETA]
+        err = batch.x_hat[:, :, I_PSI] - batch.x[:, :-1, I_PSI]
         err = np.where(np.isfinite(err), err, np.inf)
         rmse = np.sqrt(np.mean(err ** 2, axis=1)).reshape(n_points, n_reps)
         score = np.mean(rmse, axis=1)
@@ -1006,7 +1006,7 @@ class Explorer:
             self.traj_est_cmp = None
             return
         m = self.spec.index(*self.selected)
-        X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)[m:m + 1]
+        X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m:m + 1]
         with self._errstate():
             batch = rollout_many(self.system, self.controller, self.integrator,
                                  X0, self.args.dt, self.n_steps, self.args.stride,
@@ -1037,7 +1037,7 @@ class Explorer:
         конечного предела момента."""
         if key in RELAY_KEYS and self.u_max is None:
             return False
-        if key in ("bang-ell", "bang-ell-phi"):
+        if key in ("bang-ell", "bang-ell-theta"):
             return self.P is not None
         if key == "bang-tilt":
             return self.P_tilt is not None
@@ -1066,14 +1066,14 @@ class Explorer:
             if self.main_key == "lqr" and self.batch is not None:
                 outcome = self.outcome
             else:
-                X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)
+                X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)
                 with self._errstate():
                     batch = rollout_many(self.system, LinearFeedbackController(self.K),
                                          self.integrator, X0, self.args.dt,
                                          self.n_steps, self.args.stride,
                                          sensor=self._sensor(),
                                          estimator=self._estimator())
-                outcome, _ = classify(batch, I_THETA, self.args.theta_fall)
+                outcome, _ = classify(batch, I_PSI, self.args.psi_fall)
             self._lqr_mask_cache = (outcome == HELD).reshape(self.spec.n, self.spec.n)
         return self._lqr_mask_cache
 
@@ -1121,7 +1121,7 @@ class Explorer:
 
     def _precompute(self):
         """Один векторный прогон всей сетки: M начальных условий одновременно."""
-        X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)
+        X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)
         t0 = time.perf_counter()
         with self._errstate():
             self.batch = rollout_many(self.system, self.controller, self.integrator,
@@ -1130,12 +1130,12 @@ class Explorer:
                                       sensor=self._sensor(),
                                       estimator=self._estimator(),
                                       record_estimate=self.records_estimate)
-        self.outcome, self.t_fall = classify(self.batch, I_THETA, self.args.theta_fall)
+        self.outcome, self.t_fall = classify(self.batch, I_PSI, self.args.psi_fall)
         self.compute_seconds = time.perf_counter() - t0
         # Без предела ЛКР -- линейный закон, продолженный на все углы: за
         # горизонтом он раскручивает корпус вместо того, чтобы ловить, и
         # угловые клетки уходят в переполнение. Классификация их всё равно
-        # ловит (theta пересекает theta_fall задолго до inf), но молчать об
+        # ловит (psi пересекает psi_fall задолго до inf), но молчать об
         # этом нельзя -- иначе выглядит как «numpy что-то ругался».
         gone = int((~np.isfinite(self.batch.x).all(axis=(1, 2))).sum())
         print(f"[{CONTROLLER_LABEL[self.main_key]} / {ESTIMATOR_LABEL[self.est_key]}] "
@@ -1151,7 +1151,7 @@ class Explorer:
             return self.batch[m]
         if m in self.cache:
             return self.cache[m]
-        X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)[m:m + 1]
+        X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m:m + 1]
         t0 = time.perf_counter()
         with self._errstate():
             batch = rollout_many(self.system, self.controller, self.integrator,
@@ -1159,7 +1159,7 @@ class Explorer:
                                  sensor=self._sensor(), estimator=self._estimator(),
                                  record_estimate=self.records_estimate)
         self.compute_seconds = time.perf_counter() - t0
-        outcome, t_fall = classify(batch, I_THETA, self.args.theta_fall)
+        outcome, t_fall = classify(batch, I_PSI, self.args.psi_fall)
         self.outcome[m] = outcome[0]
         self.t_fall[m] = t_fall[0]
         self.cache[m] = batch[0]
@@ -1177,7 +1177,7 @@ class Explorer:
 
     def _run_one(self, controller, m: int):
         """Один прогон одной клетки выбранным регулятором."""
-        X0 = self.spec.initial_states(self.system.n_state, I_THETA, I_DTHETA)[m:m + 1]
+        X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m:m + 1]
         with self._errstate():
             batch = rollout_many(self.system, controller, self.integrator,
                                  X0, self.args.dt, self.n_steps, self.args.stride,
@@ -1198,17 +1198,17 @@ class Explorer:
         # Запоминаем не номер клетки, а её СОСТОЯНИЕ: при смене предела сетка
         # перестраивается, и вопрос «что этот же старт делает при другом
         # моторе» требует именно состояния.
-        self.selected_state = (float(self.spec.thetas[ix]),
-                               float(self.spec.dthetas[iy]))
+        self.selected_state = (float(self.spec.psis[ix]),
+                               float(self.spec.dpsis[iy]))
         self.traj = self._trajectory(self.spec.index(ix, iy))
         self._update_compare()
         self._update_estimator_compare()
         self.play_time = 0.0
         self.playing = True
 
-    def _select_nearest(self, theta, dtheta):
-        ix = int(np.argmin(np.abs(self.spec.thetas - theta)))
-        iy = int(np.argmin(np.abs(self.spec.dthetas - dtheta)))
+    def _select_nearest(self, psi, dpsi):
+        ix = int(np.argmin(np.abs(self.spec.psis - psi)))
+        iy = int(np.argmin(np.abs(self.spec.dpsis - dpsi)))
         self.select(ix, iy)
 
     # --- воспроизведение ---------------------------------------------------
@@ -1255,35 +1255,35 @@ def _map_surface(app, pg):
     return surf
 
 
-def _to_map_px(app, theta, dtheta):
-    """Точка (theta, dtheta) -> пиксель карты.
+def _to_map_px(app, psi, dpsi):
+    """Точка (psi, dpsi) -> пиксель карты.
 
     Карта рисуется как n x n клеток: узел сетки ix -- это не точка, а целый
     пиксель surface, растянутый в клетку [ix, ix+1).  Поэтому узел ix лежит в
     (ix + 0.5) / n ширины, а не в ix / (n - 1), и пересчёт ведётся по границам
     картинки, отступающим от крайних узлов на полклетки.  Наивная нормировка на
-    theta_max совпадает с подсветкой клетки только в центре карты, а к краям
+    psi_max совпадает с подсветкой клетки только в центре карты, а к краям
     расходится линейно, до полклетки в углах.
     """
     x, y, w, h = MAP
     n = app.spec.n
-    edge = n / max(n - 1, 1)          # (полширины картинки) / theta_max
-    half_th = app.spec.theta_max * edge
-    half_dth = app.spec.dtheta_max * edge
-    fx = (theta + half_th) / (2 * half_th)
-    fy = (dtheta + half_dth) / (2 * half_dth)
+    edge = n / max(n - 1, 1)          # (полширины картинки) / psi_max
+    half_th = app.spec.psi_max * edge
+    half_dth = app.spec.dpsi_max * edge
+    fx = (psi + half_th) / (2 * half_th)
+    fy = (dpsi + half_dth) / (2 * half_dth)
     return x + fx * w, y + (1.0 - fy) * h
 
 
 def _draw_phase(target, pg, app, traj, color, head_color, frame, ox, oy, width=2):
-    """Фазовая кривая (theta, dtheta) в координатах target со сдвигом (ox, oy).
+    """Фазовая кривая (psi, dpsi) в координатах target со сдвигом (ox, oy).
 
     Сдвиг нужен, чтобы одна и та же функция рисовала и прямо на экране, и на
     полупрозрачной подложке, у которой своё начало координат.
     """
     x, y, w, h = MAP
     pts = [_to_map_px(app, th, dth)
-           for th, dth in zip(traj.x[:, I_THETA], traj.x[:, I_DTHETA])]
+           for th, dth in zip(traj.x[:, I_PSI], traj.x[:, I_DPSI])]
     # Сравнение отсеивает и nan: любое сравнение с nan ложно, поэтому
     # разошедшийся хвост просто не попадает в список точек.
     pts = [(px + ox, py + oy) for px, py in pts
@@ -1314,7 +1314,7 @@ def _draw_limits(app, screen, pg):
     screen.set_clip((x, y, w, h))
     for values in (app.limit_ceiling, app.limit_floor):
         run = []
-        for th, dth in zip(app.limit_theta, values):
+        for th, dth in zip(app.limit_psi, values):
             if abs(dth) < 1e-12:                  # уровень отсутствует
                 if len(run) > 1:
                     pg.draw.lines(screen, LIMIT, False, run, 2)
@@ -1330,27 +1330,27 @@ def _draw_limits(app, screen, pg):
             pg.draw.lines(screen, LIMIT, False, run, 2)
     # Сёдла: отсюда из состояния покоя уже не вернуться.
     for sign in (+1, -1):
-        px, py = _to_map_px(app, sign * app.theta_eq, 0.0)
+        px, py = _to_map_px(app, sign * app.psi_eq, 0.0)
         if x <= px <= x + w and y <= py <= y + h:
             pg.draw.circle(screen, LIMIT, (int(px), int(py)), 4, 1)
     screen.set_clip(clip)
 
 
 def _draw_horizon(app, screen, pg, font):
-    """Пунктир на theta = +-pi/2: корпус лёг горизонтально.
+    """Пунктир на psi = +-pi/2: корпус лёг горизонтально.
 
-    Отметка не про регулятор, а про задачу. Момент тяжести идёт как D*sin(theta)
+    Отметка не про регулятор, а про задачу. Момент тяжести идёт как D*sin(psi)
     и ровно на pi/2 проходит максимум: правее он снова УБЫВАЕТ, и «дальше --
     всегда тяжелее» перестаёт быть правдой. Без линии на широкой карте это
     место ничем не отмечено, а глаз ищет его первым.
 
     Рисуется только когда pi/2 попал в границы: на приколоченной узкой
-    карте (--theta-max 0.15) линия ушла бы за край, и pygame нарисовал бы её по
+    карте (--psi-max 0.15) линия ушла бы за край, и pygame нарисовал бы её по
     самой кромке панели -- отметка не там, где написано, хуже, чем её
     отсутствие.
     """
     x, y, w, h = MAP
-    if app.spec.theta_max < HORIZON_ANGLE:
+    if app.spec.psi_max < HORIZON_ANGLE:
         return
     for sign in (+1, -1):
         px, _ = _to_map_px(app, sign * HORIZON_ANGLE, 0.0)
@@ -1366,7 +1366,7 @@ def _draw_horizon(app, screen, pg, font):
 
 def draw_map(app, screen, pg, font):
     x, y, w, h = MAP
-    _panel(screen, pg, MAP, "INITIAL CONDITIONS  theta0 (rad) x dtheta0 (rad/s)", font)
+    _panel(screen, pg, MAP, "INITIAL CONDITIONS  psi0 (rad) x dpsi0 (rad/s)", font)
     screen.blit(pg.transform.scale(_map_surface(app, pg), (w, h)), (x, y))
     if app.stale:
         # Карта посчитана при другом пределе момента. Не пометить её -- значит
@@ -1417,10 +1417,10 @@ def draw_map(app, screen, pg, font):
                      (x + ix * cell_w, y + (app.spec.n - 1 - iy) * cell_h,
                       cell_w, cell_h), width)
 
-    labels = [(f"-{app.spec.theta_max:.2f}", x, y + h + 6),
-              (f"+{app.spec.theta_max:.2f}", x + w - 34, y + h + 6),
-              (f"+{app.spec.dtheta_max:.1f}", x - 46, y),
-              (f"-{app.spec.dtheta_max:.1f}", x - 46, y + h - 14)]
+    labels = [(f"-{app.spec.psi_max:.2f}", x, y + h + 6),
+              (f"+{app.spec.psi_max:.2f}", x + w - 34, y + h + 6),
+              (f"+{app.spec.dpsi_max:.1f}", x - 46, y),
+              (f"-{app.spec.dpsi_max:.1f}", x - 46, y + h - 14)]
     for text, tx, ty in labels:
         screen.blit(font.render(text, True, DIM), (tx, ty))
 
@@ -1436,13 +1436,13 @@ def _draw_body(target, pg, app, state, ox, oy, body_color, wheel_color, tip_colo
     wheel_px = 26.0
     m2px = wheel_px / p.r
     cx, cy = ox + w / 2, oy + h * 0.72
-    theta, phi = state[I_THETA], state[I_PHI]
+    psi, theta = state[I_PSI], state[I_THETA]
 
     pg.draw.circle(target, wheel_color, (int(cx), int(cy)), int(wheel_px), 3)
-    spoke = (cx + wheel_px * np.sin(phi), cy - wheel_px * np.cos(phi))
+    spoke = (cx + wheel_px * np.sin(theta), cy - wheel_px * np.cos(theta))
     pg.draw.line(target, wheel_color, (cx, cy), spoke, 2)
 
-    tip = (cx + p.l * m2px * np.sin(theta), cy - p.l * m2px * np.cos(theta))
+    tip = (cx + p.l * m2px * np.sin(psi), cy - p.l * m2px * np.cos(psi))
     pg.draw.line(target, body_color, (cx, cy), tip, 6)
     pg.draw.circle(target, tip_color, (int(tip[0]), int(tip[1])), 9)
 
@@ -1453,7 +1453,7 @@ def draw_robot(app, screen, pg, font):
     if app.traj is None:
         return
     state = app.traj.x[app.frame]
-    phi = state[I_PHI]
+    theta = state[I_THETA]
     # Разошедшаяся траектория: рисовать корпус по inf нельзя (int(nan) --
     # исключение), а сказать об этом надо -- это и есть ответ на вопрос
     # «что будет без предела» для угловых клеток.
@@ -1467,9 +1467,9 @@ def draw_robot(app, screen, pg, font):
     cy = y + h * 0.72
 
     # Дорога и её бегущие метки -- декорация сцены, а не робота: рисуются один
-    # раз и по phi ОСНОВНОГО прогона, иначе два робота ехали бы по двум дорогам.
+    # раз и по theta ОСНОВНОГО прогона, иначе два робота ехали бы по двум дорогам.
     pg.draw.line(screen, GRID_LINE, (x + 8, cy + wheel_px), (x + w - 8, cy + wheel_px), 2)
-    shift = (p.r * phi * m2px) % (0.1 * m2px)
+    shift = (p.r * theta * m2px) % (0.1 * m2px)
     step = 0.1 * m2px
     k = -int(w / (2 * step)) - 1
     while x + w / 2 + k * step - shift < x + w:
@@ -1514,10 +1514,12 @@ def draw_robot(app, screen, pg, font):
         px = bx + bar_w / 2 + np.clip(t2 / limit, -1, 1) * bar_w / 2
         pg.draw.line(screen, GHOST, (px, by - 2), (px, by + 14), 2)
 
+    # Колонка "=" выровнена вручную: имена после смены нотации (ER-022) стали
+    # другой длины, автоподбора тут нет -- шрифт моноширинный.
     info = [f"t     = {app.traj.t[app.frame] - app.traj.t[0]:5.2f} s",
-            f"theta = {state[I_THETA]:+.4f} rad",
-            f"dtheta= {state[I_DTHETA]:+.4f} rad/s",
-            f"phi   = {phi:+.3f} rad"]
+            f"psi   = {state[I_PSI]:+.4f} rad",
+            f"dpsi  = {state[I_DPSI]:+.4f} rad/s",
+            f"theta = {theta:+.3f} rad"]
     for i, line in enumerate(info):
         screen.blit(font.render(line, True, TEXT), (x + 14, y + 14 + 18 * i))
     if diverged:
@@ -1526,7 +1528,7 @@ def draw_robot(app, screen, pg, font):
                     (x + 14, y + 14 + 18 * len(info)))
     if app.traj_cmp is not None:
         s2 = app.traj_cmp.x[app.frame_of(app.traj_cmp)]
-        cmp_info = [f"theta = {s2[I_THETA]:+.4f}", f"phi   = {s2[I_PHI]:+.3f}"]
+        cmp_info = [f"psi   = {s2[I_PSI]:+.4f}", f"theta = {s2[I_THETA]:+.3f}"]
         for i, line in enumerate(cmp_info):
             screen.blit(font.render(line, True, GHOST), (x + 14, y + 92 + 18 * i))
 
@@ -1569,8 +1571,8 @@ def _plot(screen, pg, rect, ts, ys, color, label, font, guides=(), ghosts=(),
             if y <= gy <= y + h:
                 pg.draw.line(screen, (70, 60, 50), (x, gy), (x + w, gy), 1)
     if limit is not None:
-        # ±theta_eq: за этим наклоном из состояния покоя не вернуться никаким
-        # управлением. Не путать с theta_fall -- тот просто «считаем упавшим».
+        # ±psi_eq: за этим наклоном из состояния покоя не вернуться никаким
+        # управлением. Не путать с psi_fall -- тот просто «считаем упавшим».
         for sign in (+1, -1):
             ly = to_px(ts[0], sign * abs(limit))[1]
             if y <= ly <= y + h:
@@ -1607,7 +1609,7 @@ V_LABELS = ("V full", "V wheel-anchored", "V tilt (P_t)")
 
 
 def _lyapunov_curves(app, traj):
-    """(V полное, V с привязкой phi, V только наклон) вдоль траектории.
+    """(V полное, V с привязкой theta, V только наклон) вдоль траектории.
 
     Читается только Trajectory плюс константы проекта P и c*, которые окно и
     так держит, чтобы собрать регулятор. Закон управления здесь не
@@ -1615,7 +1617,7 @@ def _lyapunov_curves(app, traj):
     """
     X = traj.x
     anchored = X.copy()
-    anchored[:, I_PHI] = 0.0                       # колесо объявлено стоящим
+    anchored[:, I_THETA] = 0.0                       # колесо объявлено стоящим
     # Третья кривая считается ДРУГОЙ формой -- P от lqr_tilt, -- и сравнивать
     # её надо с c*_t, а не с c*. Подставлять сюда P от четырёхмерного проекта
     # и класть рядом уровень c* значило бы сравнивать разные квадратичные
@@ -1698,25 +1700,25 @@ def draw_plots(app, screen, pg, font):
         return
     ts = app.traj.t - app.traj.t[0]
     half = (h - 40) / 3
-    g_theta, g_u = [], []
+    g_psi, g_u = [], []
     for traj2, color in ((app.traj_cmp, GHOST), (app.traj_est_cmp, GHOST_EST)):
         if traj2 is None:
             continue
         ts2 = traj2.t - traj2.t[0]
-        g_theta.append((ts2, traj2.x[:, I_THETA], color))
+        g_psi.append((ts2, traj2.x[:, I_PSI], color))
         g_u.append((ts2[:-1], traj2.u[:, 0], color))
     # Оценка приходит из самой Trajectory (правило 6): окно не пересчитывает
     # фильтр и вообще не знает, какой датчик её породил. x_hat выровнена по u,
     # то есть на один кадр короче x -- отсюда ts[:-1].
-    e_theta = None
+    e_psi = None
     if app.traj.x_hat is not None:
-        e_theta = (ts[:-1], app.traj.x_hat[:, I_THETA])
+        e_psi = (ts[:-1], app.traj.x_hat[:, I_PSI])
     to_px1 = _plot(screen, pg, (x + 12, y + 10, w - 24, half),
-                   ts, app.traj.x[:, I_THETA], (120, 180, 240), "theta (rad)", font,
-                   guides=(app.args.theta_fall,), ghosts=g_theta,
-                   limit=app.theta_eq, estimate=e_theta)
-    if e_theta is not None:
-        err = app.traj.x_hat[:, I_THETA] - app.traj.x[:-1, I_THETA]
+                   ts, app.traj.x[:, I_PSI], (120, 180, 240), "psi (rad)", font,
+                   guides=(app.args.psi_fall,), ghosts=g_psi,
+                   limit=app.psi_eq, estimate=e_psi)
+    if e_psi is not None:
+        err = app.traj.x_hat[:, I_PSI] - app.traj.x[:-1, I_PSI]
         finite = err[np.isfinite(err)]
         rmse = float(np.sqrt(np.mean(finite ** 2))) if finite.size else float("nan")
         # Слева под подписью панели: справа стоят числа шкалы, и надпись
@@ -1724,8 +1726,8 @@ def draw_plots(app, screen, pg, font):
         text = f"est RMSE {rmse:.4f}"
         screen.blit(font.render(text, True, ESTIMATE), (x + 18, y + 10 + 22))
         if app.traj_est_cmp is not None and app.traj_est_cmp.x_hat is not None:
-            e2 = (app.traj_est_cmp.x_hat[:, I_THETA]
-                  - app.traj_est_cmp.x[:-1, I_THETA])
+            e2 = (app.traj_est_cmp.x_hat[:, I_PSI]
+                  - app.traj_est_cmp.x[:-1, I_PSI])
             f2 = e2[np.isfinite(e2)]
             r2 = float(np.sqrt(np.mean(f2 ** 2))) if f2.size else float("nan")
             screen.blit(font.render(f"vs {r2:.4f}", True, GHOST_EST),
@@ -1908,7 +1910,7 @@ def draw_slider(app, screen, pg, font):
     pg.draw.rect(screen, tone, (x, y, fill, h), border_radius=4)
     pg.draw.rect(screen, GRID_LINE, (x, y, w, h), 1, border_radius=4)
 
-    # Отметка предела, за которым карта упирается в theta_fall: цвет тот же,
+    # Отметка предела, за которым карта упирается в psi_fall: цвет тот же,
     # что у границы восстановимости, потому что это про неё и есть.
     if app.u_clip is not None:
         cx = u_max_to_px(app.u_clip)
@@ -1932,12 +1934,12 @@ def draw_slider(app, screen, pg, font):
     elif off:
         note, color = "no limit: relay disabled, map frozen", LIMIT
     elif app.pinned:
-        note, color = "map pinned by --theta-max / --dtheta-max", DIM
+        note, color = "map pinned by --psi-max / --dpsi-max", DIM
     elif app.u_clip is not None and app.u_max > app.u_clip:
-        note = f"map clipped by theta_fall = {app.args.theta_fall:g}"
+        note = f"map clipped by psi_fall = {app.args.psi_fall:g}"
         color = LIMIT
     else:
-        note = f"map: theta +-{MAP_FIT:g}*pi/2, dtheta {MAP_FIT:g}x recoverable"
+        note = f"map: psi +-{MAP_FIT:g}*pi/2, dpsi {MAP_FIT:g}x recoverable"
         color = DIM
     screen.blit(font.render(note, True, color), (rect[0] + rect[2] + 16, y - 1))
 
@@ -2001,7 +2003,7 @@ def draw_settings(app, screen, pg, font):
     x, y, w, h = SETTINGS
     pg.draw.rect(screen, PANEL, SETTINGS, border_radius=6)
     pg.draw.rect(screen, GRID_LINE, SETTINGS, 1, border_radius=6)
-    screen.blit(font.render("SETTINGS  --  LQR cost  Q = diag(q_theta, q_phi, q_dtheta, q_dphi)",
+    screen.blit(font.render("SETTINGS  --  LQR cost  Q = diag(q_psi, q_theta, q_dpsi, q_dtheta)",
                             True, TEXT), (x + 24, y + 16))
     screen.blit(font.render("base: lqr, bang-ell*, bang-map, phase 3;  soft: phase 2 of bang-eps*",
                             True, DIM), (x + 24, y + 38))
@@ -2274,14 +2276,14 @@ def draw_header(app, screen, pg, font, big):
         pg.draw.rect(screen, OUTCOME_COLOR[code], (lx, H - 52, 14, 14))
         screen.blit(font.render(text, True, DIM), (lx + 20, H - 52))
         lx += 40 + font.size(text)[0]
-    if app.theta_eq is None:
+    if app.psi_eq is None:
         # Свотча нет сознательно: на карте нет цвета, который он объяснял бы.
         lim_text = "no torque limit -- every state is recoverable"
         screen.blit(font.render(lim_text, True, DIM), (lx, H - 52))
         lx += 20 + font.size(lim_text)[0]
     else:
         pg.draw.rect(screen, LIMIT, (lx, H - 52, 14, 14))
-        lim_text = f"recoverable limit (theta_eq = {app.theta_eq:.3f})"
+        lim_text = f"recoverable limit (psi_eq = {app.psi_eq:.3f})"
         screen.blit(font.render(lim_text, True, LIMIT), (lx + 20, H - 52))
         lx += 40 + font.size(lim_text)[0]
     if app.cmp_key is not None:
@@ -2578,7 +2580,7 @@ def build_parser():
     p.add_argument("--seed", type=int, default=0,
                    help="зерно шума датчика (при --estimator, отличном от ideal)")
     p.add_argument("--eps", type=float, default=0.05,
-                   help="bang-eps: реле отдаёт управление ЛКР, когда |theta| < eps, рад")
+                   help="bang-eps: реле отдаёт управление ЛКР, когда |psi| < eps, рад")
     p.add_argument("--u-max", type=float, default=3.0,
                    help="предел момента, Н*м -- начальное положение слайдера "
                         f"(диапазон {U_MIN:g}..{U_MAX:g}); inf -- запустить "
@@ -2587,13 +2589,13 @@ def build_parser():
     p.add_argument("--dt", type=float, default=1e-3, help="шаг интегрирования, с")
     p.add_argument("--stride", type=int, default=10,
                    help="сохранять каждый stride-й кадр (счёт идёт с шагом dt)")
-    p.add_argument("--theta-max", type=float, default=None,
-                   help="границы карты по theta0; по умолчанию подгоняются под "
+    p.add_argument("--psi-max", type=float, default=None,
+                   help="границы карты по psi0; по умолчанию подгоняются под "
                         "u_max, явное значение их замораживает")
-    p.add_argument("--dtheta-max", type=float, default=None,
-                   help="границы карты по dtheta0; по умолчанию подгоняются под "
+    p.add_argument("--dpsi-max", type=float, default=None,
+                   help="границы карты по dpsi0; по умолчанию подгоняются под "
                         "u_max, явное значение их замораживает")
-    p.add_argument("--theta-fall", type=float, default=float(np.pi),
+    p.add_argument("--psi-fall", type=float, default=float(np.pi),
                    help="угол, начиная с которого считаем, что корпус упал "
                         "(по умолчанию pi: земли в модели нет)")
     p.add_argument("--speed", type=float, default=1.0, help="скорость воспроизведения")

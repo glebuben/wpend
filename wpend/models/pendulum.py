@@ -1,19 +1,19 @@
 """Маятник на оси с моментом мотора -- простейшая модель для обкатки каркаса.
 
-Состояние x = (theta, dtheta), где theta -- отклонение от ВЕРХНЕЙ вертикали
-(theta = 0 -- стойка вверх, как у колёсного маятника; theta = pi -- висит вниз).
+Состояние x = (psi, dpsi), где psi -- отклонение от ВЕРХНЕЙ вертикали
+(psi = 0 -- стойка вверх, как у колёсного маятника; psi = pi -- висит вниз).
 
 Уравнение движения (стержень массы m с центром масс на расстоянии l,
 момент инерции I = m l^2, вязкое трение c, момент мотора u):
 
-    I * ddtheta = m g l sin(theta) - c * dtheta + u
+    I * ddpsi = m g l sin(psi) - c * dpsi + u
 
 Знак "+" перед sin неслучаен: при отсчёте от верхней вертикали гравитация
 УВОДИТ от равновесия, поэтому верхнее положение неустойчиво -- ровно тот
 случай, ради которого существует регулятор.
 
-Полная энергия E = 1/2 I dtheta^2 + m g l cos(theta) удовлетворяет
-    dE/dt = dtheta * u - c * dtheta^2,
+Полная энергия E = 1/2 I dpsi^2 + m g l cos(psi) удовлетворяет
+    dE/dt = dpsi * u - c * dpsi^2,
 то есть при u = 0 и c = 0 сохраняется.  Это даёт бесплатный оракул для тестов:
 любая ошибка в f или в интеграторе немедленно ломает сохранение E.
 """
@@ -42,7 +42,7 @@ class PendulumParams:
 
 
 class Pendulum(System):
-    """dx/dt = f(t, x, u) для маятника, x = (theta, dtheta), u = (torque,)."""
+    """dx/dt = f(t, x, u) для маятника, x = (psi, dpsi), u = (torque,)."""
 
     def __init__(self, params: PendulumParams | None = None, **kwargs):
         self.p = params if params is not None else PendulumParams(**kwargs)
@@ -57,7 +57,7 @@ class Pendulum(System):
 
     @property
     def state_names(self) -> tuple[str, ...]:
-        return ("theta", "dtheta")
+        return ("psi", "dpsi")
 
     @property
     def action_names(self) -> tuple[str, ...]:
@@ -72,20 +72,20 @@ class Pendulum(System):
     def f(self, t, x, u):
         # Индексы x[..., i], а не распаковка: так одна и та же формула считает
         # и одно состояние (2,), и пачку (M, 2) -- см. System.f.
-        theta = x[..., 0]
-        dtheta = x[..., 1]
+        psi = x[..., 0]
+        dpsi = x[..., 1]
         p = self.p
-        ddtheta = (p.m * p.g * p.l * np.sin(theta) - p.c * dtheta + u[..., 0]) / p.I
-        return np.stack([dtheta, ddtheta], axis=-1)
+        ddpsi = (p.m * p.g * p.l * np.sin(psi) - p.c * dpsi + u[..., 0]) / p.I
+        return np.stack([dpsi, ddpsi], axis=-1)
 
     # --- оракулы для тестов и анализа ------------------------------------
 
     def energy(self, x) -> float:
-        """E = 1/2 I dtheta^2 + m g l cos(theta); сохраняется при u = 0, c = 0."""
+        """E = 1/2 I dpsi^2 + m g l cos(psi); сохраняется при u = 0, c = 0."""
         x = np.asarray(x, dtype=float)
-        theta, dtheta = x[..., 0], x[..., 1]
+        psi, dpsi = x[..., 0], x[..., 1]
         p = self.p
-        return 0.5 * p.I * dtheta ** 2 + p.m * p.g * p.l * np.cos(theta)
+        return 0.5 * p.I * dpsi ** 2 + p.m * p.g * p.l * np.cos(psi)
 
     def linearize_upright(self):
         """(A, B) линеаризации в верхнем положении x = 0, u = 0.

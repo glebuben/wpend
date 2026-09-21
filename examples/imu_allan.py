@@ -42,8 +42,8 @@ def allan_deviation(rate, dt: float, n_points: int = 60, min_clusters: int = 20)
     дисперсию -- иначе хвост кривой (большие tau, мало окон) шумит так, что
     наклон по нему не измерить.
 
-        theta(k)      = cumsum(rate) * dt                (проинтегрированный угол)
-        sigma^2(tau)  = sum_k [theta_{k+2m} - 2 theta_{k+m} + theta_k]^2
+        psi(k)      = cumsum(rate) * dt                (проинтегрированный угол)
+        sigma^2(tau)  = sum_k [psi_{k+2m} - 2 psi_{k+m} + psi_k]^2
                         / (2 tau^2 (L - 2m)),            tau = m*dt
 
     Вторая разность здесь не случайна: это в точности разность СРЕДНИХ по двум
@@ -59,8 +59,8 @@ def allan_deviation(rate, dt: float, n_points: int = 60, min_clusters: int = 20)
     логарифмически равномерно.
     """
     rate = np.asarray(rate, dtype=float)
-    theta = np.concatenate(([0.0], np.cumsum(rate) * dt))
-    L = theta.size
+    psi = np.concatenate(([0.0], np.cumsum(rate) * dt))
+    L = psi.size
     m_max = min((L - 1) // 2, L // max(min_clusters, 2))
     if m_max < 1:
         raise ValueError("сигнал слишком короткий для кривой Аллана")
@@ -70,7 +70,7 @@ def allan_deviation(rate, dt: float, n_points: int = 60, min_clusters: int = 20)
     for m in ms:
         if 2 * m >= L:
             continue
-        diff = theta[2 * m:] - 2.0 * theta[m:-m] + theta[:-2 * m]
+        diff = psi[2 * m:] - 2.0 * psi[m:-m] + psi[:-2 * m]
         tau = m * dt
         var = np.sum(diff ** 2) / (2.0 * tau ** 2 * diff.size)
         taus.append(tau)
@@ -97,7 +97,7 @@ def gyro_signal(n: int, dt: float, seed: int = 0, **kw) -> np.ndarray:
     sensor.reset()
     x = np.zeros(system.n_state)
     u = np.zeros(system.n_action)
-    i = system.state_names.index("dtheta")
+    i = system.state_names.index("dpsi")
     out = np.empty(n, dtype=float)
     for k in range(n):
         out[k] = sensor.measure(k * dt, x, u)[i]

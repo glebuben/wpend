@@ -9,26 +9,26 @@
 
   run   считает и сохраняет результаты в .npz
         uv run python examples/cost_sweep.py run                  # только ЛКР, ~2 мин
-        uv run python examples/cost_sweep.py run --mpc base phi=1e-2 R=10
+        uv run python examples/cost_sweep.py run --mpc base theta=1e-2 R=10
                                                                   # + MPC, ~7 мин на пресет и предел
   show  читает .npz и печатает; ничего не пересчитывает
         uv run python examples/cost_sweep.py show                 # сводная таблица
-        uv run python examples/cost_sweep.py show --map phi=1e-2 --u-max 10
+        uv run python examples/cost_sweep.py show --map theta=1e-2 --u-max 10
         uv run python examples/cost_sweep.py show --map base --u-max 3 --mpc
-        uv run python examples/cost_sweep.py cell --preset base --u-max 10 --theta -0.4 --dtheta 0.5
+        uv run python examples/cost_sweep.py cell --preset base --u-max 10 --psi -0.4 --dpsi 0.5
                                                                   # один прогон ЛКР с подробностями
 
 Что сравнивается с чем
 ----------------------
 * `is_recoverable` -- аналитическое множество: снаружи не держит никто.
   Реле по сепаратрисе совпадает с ним на всей карте (A16), это потолок.
-* «удержан» -- |theta| ни разу после старта не достиг 1.3 за горизонт
+* «удержан» -- |psi| ни разу после старта не достиг 1.3 за горизонт
   (тот же критерий, что `wpend.viz.grid.classify`).
-* «сошёлся» -- удержан и в конце |theta| < 0.05, |dtheta| < 0.1, |dphi| < 0.1.
-* ЦЕНА ЗА УДЕРЖАНИЕ -- колесо. По удержанным клеткам печатается max |phi(T)|
-  (куда уехало колесо, рад; метры = рад · r = рад · 0.3) и max |dphi(T)|.
+* «сошёлся» -- удержан и в конце |psi| < 0.05, |dpsi| < 0.1, |dtheta| < 0.1.
+* ЦЕНА ЗА УДЕРЖАНИЕ -- колесо. По удержанным клеткам печатается max |theta(T)|
+  (куда уехало колесо, рад; метры = рад · r = рад · 0.3) и max |dtheta(T)|.
 
-Карта -- как в окне: в 1.3 раза шире множества, обрезана по theta_fall.
+Карта -- как в окне: в 1.3 раза шире множества, обрезана по psi_fall.
 Все регуляторы видят истинное состояние; мир обрезает момент (`clip_action`).
 MPC: такт 20 мс, горизонт 1 с, Q_f = P своего пресета, предела не знает.
 """
@@ -48,31 +48,31 @@ from wpend.lqr import lqr, lqr_tilt
 from wpend.models import WheeledPendulum
 from wpend.viz.grid import classify
 
-DT, THETA_FALL, MAP_FIT = 1e-3, 1.3, 1.3
+DT, PSI_FALL, MAP_FIT = 1e-3, 1.3, 1.3
 DT_PLAN, PLAN_STEPS = 0.02, 50
 HERE = Path(__file__).resolve().parent
 DEFAULT_LQR = HERE / "results" / "cost_sweep_lqr.npz"
 DEFAULT_MPC = HERE / "results" / "cost_sweep_mpc.npz"
 
 # ---------------------------------------------------------------------------
-#  Пресеты цены. Порядок весов: (theta, phi, dtheta, dphi).
+#  Пресеты цены. Порядок весов: (psi, theta, dpsi, dtheta).
 #  "base" -- цена, с которой работает весь проект (окно, тесты).
-#  phi=... -- меняется ТОЛЬКО вес положения колеса: главный подозреваемый.
+#  theta=... -- меняется ТОЛЬКО вес положения колеса: главный подозреваемый.
 #  "tilt" -- крайний случай: колесо не в цене вовсе (`lqr_tilt`, A17).
 # ---------------------------------------------------------------------------
 PRESETS = {
-    "base":       (np.diag([100.0, 1.0,  10.0, 1.0]),  1.0),
-    "phi=0.3":    (np.diag([100.0, 0.3,  10.0, 1.0]),  1.0),
-    "phi=0.1":    (np.diag([100.0, 0.1,  10.0, 1.0]),  1.0),
-    "phi=3e-2":   (np.diag([100.0, 3e-2, 10.0, 1.0]),  1.0),
-    "phi=1e-2":   (np.diag([100.0, 1e-2, 10.0, 1.0]),  1.0),
-    "phi=1e-3":   (np.diag([100.0, 1e-3, 10.0, 1.0]),  1.0),
-    "dphi=1e-2":  (np.diag([100.0, 1.0,  10.0, 1e-2]), 1.0),
-    "R=0.1":      (np.diag([100.0, 1.0,  10.0, 1.0]),  0.1),
-    "R=10":       (np.diag([100.0, 1.0,  10.0, 1.0]),  10.0),
-    "R=100":      (np.diag([100.0, 1.0,  10.0, 1.0]),  100.0),
-    "theta x10":  (np.diag([1000.0, 1.0, 100.0, 1.0]), 1.0),
-    "tilt":       None,
+    "base":        (np.diag([100.0, 1.0,  10.0, 1.0]),  1.0),
+    "theta=0.3":   (np.diag([100.0, 0.3,  10.0, 1.0]),  1.0),
+    "theta=0.1":   (np.diag([100.0, 0.1,  10.0, 1.0]),  1.0),
+    "theta=3e-2":  (np.diag([100.0, 3e-2, 10.0, 1.0]),  1.0),
+    "theta=1e-2":  (np.diag([100.0, 1e-2, 10.0, 1.0]),  1.0),
+    "theta=1e-3":  (np.diag([100.0, 1e-3, 10.0, 1.0]),  1.0),
+    "dtheta=1e-2": (np.diag([100.0, 1.0,  10.0, 1e-2]), 1.0),
+    "R=0.1":       (np.diag([100.0, 1.0,  10.0, 1.0]),  0.1),
+    "R=10":        (np.diag([100.0, 1.0,  10.0, 1.0]),  10.0),
+    "R=100":       (np.diag([100.0, 1.0,  10.0, 1.0]),  100.0),
+    "psi x10":     (np.diag([1000.0, 1.0, 100.0, 1.0]), 1.0),
+    "tilt":        None,
 }
 
 
@@ -91,32 +91,32 @@ def design(name):
 
 def grid(u_max, n):
     world = WheeledPendulum(u_max=u_max)
-    theta_max = min(MAP_FIT * world.saddle_angle(u_max), 0.98 * THETA_FALL)
+    psi_max = min(MAP_FIT * world.saddle_angle(u_max), 0.98 * PSI_FALL)
     _, ceiling = world.recoverable_bounds(u_max, np.zeros(1))
-    dtheta_max = MAP_FIT * float(ceiling[0])
-    thetas = np.linspace(-theta_max, theta_max, n)
-    dthetas = np.linspace(-dtheta_max, dtheta_max, n)
-    TH, DTH = np.meshgrid(thetas, dthetas, indexing="xy")
+    dpsi_max = MAP_FIT * float(ceiling[0])
+    psis = np.linspace(-psi_max, psi_max, n)
+    dpsis = np.linspace(-dpsi_max, dpsi_max, n)
+    TH, DTH = np.meshgrid(psis, dpsis, indexing="xy")
     X0 = np.zeros((n * n, 4))
     X0[:, 0], X0[:, 2] = TH.ravel(), DTH.ravel()
-    return thetas, dthetas, X0, world.is_recoverable(u_max, X0[:, 0], X0[:, 2])
+    return psis, dpsis, X0, world.is_recoverable(u_max, X0[:, 0], X0[:, 2])
 
 
-def outcome_of(t, x_theta):
+def outcome_of(t, x_psi):
     """Исход и момент падения -- тем же `classify`, что красит карту окна.
 
     classify читает у пачки только .t и .x, поэтому хватает простого
     контейнера: MPC считается поклеточно, и TrajectoryBatch у него нет.
     """
     from types import SimpleNamespace
-    x = np.zeros(x_theta.shape + (1,))
-    x[..., 0] = x_theta
-    return classify(SimpleNamespace(t=t, x=x), 0, THETA_FALL)
+    x = np.zeros(x_psi.shape + (1,))
+    x[..., 0] = x_psi
+    return classify(SimpleNamespace(t=t, x=x), 0, PSI_FALL)
 
 
-def summarize(x_theta, x_end):
+def summarize(x_psi, x_end):
     """Из траекторий наклона (M, T) и конечных состояний (M, 4) -- метрики клеток."""
-    held = ~(np.abs(x_theta[:, 1:]) >= THETA_FALL).any(axis=1)
+    held = ~(np.abs(x_psi[:, 1:]) >= PSI_FALL).any(axis=1)
     conv = (held & (np.abs(x_end[:, 0]) < 0.05) & (np.abs(x_end[:, 2]) < 0.1)
             & (np.abs(x_end[:, 3]) < 0.1))
     return held, conv
@@ -142,8 +142,8 @@ def cmd_run(args):
     out = {"u_maxes": np.array(args.u_max), "presets": np.array(list(PRESETS)),
            "grid": args.grid, "horizon": args.horizon}
     for u_max in args.u_max:
-        thetas, dthetas, X0, rec = grid(u_max, args.grid)
-        out[f"{u_max}__thetas"], out[f"{u_max}__dthetas"], out[f"{u_max}__rec"] = thetas, dthetas, rec
+        psis, dpsis, X0, rec = grid(u_max, args.grid)
+        out[f"{u_max}__psis"], out[f"{u_max}__dpsis"], out[f"{u_max}__rec"] = psis, dpsis, rec
         world = WheeledPendulum(u_max=u_max)
         for name in PRESETS:
             _, _, K, _ = design(name)
@@ -164,8 +164,8 @@ def cmd_run(args):
     mpc = {"u_maxes": np.array(args.u_max), "presets": np.array(args.mpc),
            "grid": args.mpc_grid, "horizon": args.horizon}
     for u_max in args.u_max:
-        thetas, dthetas, X0, rec = grid(u_max, args.mpc_grid)
-        mpc[f"{u_max}__thetas"], mpc[f"{u_max}__dthetas"], mpc[f"{u_max}__rec"] = thetas, dthetas, rec
+        psis, dpsis, X0, rec = grid(u_max, args.mpc_grid)
+        mpc[f"{u_max}__psis"], mpc[f"{u_max}__dpsis"], mpc[f"{u_max}__rec"] = psis, dpsis, rec
         for name in args.mpc:
             t0 = time.perf_counter()
             with ProcessPoolExecutor(args.workers) as pool:
@@ -189,10 +189,33 @@ def cmd_run(args):
 #  show / cell
 # ---------------------------------------------------------------------------
 
-def _load(path):
+def to_new_notation(name: str) -> str:
+    """Имя из старой нотации в новую: наклон `theta` -> `psi`, колесо `phi` -> `theta`.
+
+    Через плейсхолдер, а не двумя заменами подряд: `theta -> psi`, а потом
+    `phi -> theta` схлопнуло бы обе переменные в одну (ER-022).
+    """
+    return name.replace("theta", "\x00").replace("phi", "theta").replace("\x00", "psi")
+
+
+def load_results(path):
+    """Читает .npz перебора цен и приводит имена массивов к новой нотации.
+
+    Файлы в `examples/results/` посчитаны 16.09.2026, до смены нотации
+    21.09.2026 (ER-022): наклон в них назван `theta`, колесо `phi`. Сами файлы
+    не перезаписываем -- переименовываем ключи при чтении. Признак старого
+    файла -- `phi` в именах: в новой нотации такой буквы нет.
+    """
     if not Path(path).exists():
         sys.exit(f"нет файла {path}: сначала `run`")
-    return np.load(path, allow_pickle=False)
+    d = np.load(path, allow_pickle=False)
+    if not any("phi" in k for k in d.files):
+        return d
+    # Старый файл: имена массивов и подписи пресетов переводим целиком. Это
+    # читает весь .npz в память (~40 МБ у прогона MPC) -- разово и на десктопе.
+    out = {to_new_notation(k): d[k] for k in d.files}
+    out["presets"] = np.array([to_new_notation(str(p)) for p in out["presets"]])
+    return out
 
 
 def _row(d, u_max, name):
@@ -201,14 +224,14 @@ def _row(d, u_max, name):
         return None
     held, conv, end = d[key + "__held"], d[key + "__conv"], d[key + "__end"]
     rec = d[f"{u_max}__rec"]
-    phi = np.abs(end[held, 1]).max() if held.any() else np.nan
-    dphi = np.abs(end[held, 3]).max() if held.any() else np.nan
-    return held.sum(), (rec & ~held).sum(), conv.sum(), phi, dphi
+    theta = np.abs(end[held, 1]).max() if held.any() else np.nan
+    dtheta = np.abs(end[held, 3]).max() if held.any() else np.nan
+    return held.sum(), (rec & ~held).sum(), conv.sum(), theta, dtheta
 
 
 def cmd_show(args):
-    d = _load(args.lqr)
-    m = _load(args.mpc_file) if Path(args.mpc_file).exists() else None
+    d = load_results(args.lqr)
+    m = load_results(args.mpc_file) if Path(args.mpc_file).exists() else None
 
     if args.map:
         src = m if args.mpc else d
@@ -221,7 +244,7 @@ def cmd_show(args):
         print(f"\nu_max = {u_max:g} Н·м   ЛКР: сетка {int(d['grid'])}x{int(d['grid'])}, "
               f"горизонт {float(d['horizon']):g} с, восстановимо {rec.sum()}")
         print(f"  {'пресет':<10} {'удержан':>8} {'потерян':>8} {'сошёлся':>8} "
-              f"{'max|phi(T)|':>12} {'max|dphi(T)|':>13}")
+              f"{'max|theta(T)|':>12} {'max|dtheta(T)|':>13}")
         for name in d["presets"]:
             r = _row(d, u_max, name)
             print(f"  {name:<10} {r[0]:8d} {r[1]:8d} {r[2]:8d} {r[3]:12.1f} {r[4]:13.2f}")
@@ -257,8 +280,8 @@ def print_map(src, u_max, name, is_mpc):
     if key + "__held" not in src:
         sys.exit(f"нет результата {key}; есть пресеты: {list(src['presets'])}")
     held, rec = src[key + "__held"], src[f"{u_max}__rec"]
-    thetas, dthetas = src[f"{u_max}__thetas"], src[f"{u_max}__dthetas"]
-    n = thetas.size
+    psis, dpsis = src[f"{u_max}__psis"], src[f"{u_max}__dpsis"]
+    n = psis.size
     if is_mpc:
         held_lqr = lqr_on_grid(u_max, name, n, float(src["horizon"]))
         print(f"MPC против ЛКР, пресет {name}, u_max = {u_max:g}, сетка {n}x{n}: "
@@ -269,7 +292,7 @@ def print_map(src, u_max, name, is_mpc):
         print(f"ЛКР, пресет {name}, u_max = {u_max:g}: удержан {held.sum()}, "
               f"восстановимо {rec.sum()}, потерян {(rec & ~held).sum()}")
         print("  # удержан   . восстановимо, но упал   ! удержан вне множества (быть не должно)")
-    print(f"  theta0: {thetas[0]:+.3f} ... {thetas[-1]:+.3f};  строки -- dtheta0 сверху вниз")
+    print(f"  psi0: {psis[0]:+.3f} ... {psis[-1]:+.3f};  строки -- dpsi0 сверху вниз")
     sep = " " if is_mpc else ""
     for iy in range(n - 1, -1, -1):
         cells = []
@@ -282,25 +305,25 @@ def print_map(src, u_max, name, is_mpc):
             else:
                 c = "#" if held[j] and rec[j] else "!" if held[j] else "." if rec[j] else " "
             cells.append(c)
-        print(f"  {dthetas[iy]:+6.2f} |{sep.join(cells)}|")
+        print(f"  {dpsis[iy]:+6.2f} |{sep.join(cells)}|")
 
 
 def cmd_cell(args):
     """Один прогон ЛКР выбранного пресета: когда упал, сколько в насыщении, где колесо."""
     Q, R, K, P = design(args.preset)
     world = WheeledPendulum(u_max=args.u_max)
-    x0 = np.array([args.theta, 0.0, args.dtheta, 0.0])
+    x0 = np.array([args.psi, 0.0, args.dpsi, 0.0])
     traj = rollout(world, LinearFeedbackController(K), RK4Integrator(), x0, DT,
                    int(round(args.horizon / DT)))
-    theta = traj.x[:, 0]
-    fall = np.flatnonzero(np.abs(theta[1:]) >= THETA_FALL)
+    psi = traj.x[:, 0]
+    fall = np.flatnonzero(np.abs(psi[1:]) >= PSI_FALL)
     sat = np.abs(traj.u[:, 0]) >= args.u_max - 1e-9
     print(f"пресет {args.preset}, K = {np.round(K, 3)}")
     print(f"x0 = {x0}, восстановимо: {bool(world.is_recoverable(args.u_max, x0[0], x0[2]))}")
     print(f"упал: {'нет' if fall.size == 0 else f'в t = {traj.t[fall[0] + 1]:.3f} с'}")
     print(f"в насыщении {sat.mean():.0%} шагов, первое -- "
           f"{'нет' if not sat.any() else f't = {traj.t[np.argmax(sat)]:.3f} с'}")
-    print(f"{'t, с':>6} {'theta':>8} {'phi':>8} {'dtheta':>8} {'dphi':>8} {'u':>8}")
+    print(f"{'t, с':>6} {'psi':>8} {'theta':>8} {'dpsi':>8} {'dtheta':>8} {'u':>8}")
     for t_show in np.linspace(0.0, args.horizon, 11):
         k = min(int(round(t_show / DT)), traj.n_steps - 1)
         x = traj.x[k]
@@ -332,8 +355,8 @@ def main():
     c = sub.add_parser("cell")
     c.add_argument("--preset", default="base", choices=list(PRESETS))
     c.add_argument("--u-max", type=float, default=10.0)
-    c.add_argument("--theta", type=float, required=True)
-    c.add_argument("--dtheta", type=float, required=True)
+    c.add_argument("--psi", type=float, required=True)
+    c.add_argument("--dpsi", type=float, required=True)
     c.add_argument("--horizon", type=float, default=5.0)
 
     args = ap.parse_args()

@@ -53,17 +53,17 @@ class ComplementaryEstimator(Estimator):
 
     Читает показания ИДУ y = (a_x, a_z, omega) -- то, что даёт IMUSensor в
     режиме "imu".  Наклон по акселерометру берётся как направление кажущейся
-    вертикали, theta_acc = atan2(-a_x, a_z), после чего измерение становится
-    ЛИНЕЙНЫМ по состоянию (y = theta + шум), и расширенный фильтр Калмана для
+    вертикали, psi_acc = atan2(-a_x, a_z), после чего измерение становится
+    ЛИНЕЙНЫМ по состоянию (y = psi + шум), и расширенный фильтр Калмана для
     этой задачи не нужен -- достаточно обычного.
 
-        theta_hat_k = a*(theta_hat_{k-1} + omega_k*dt) + (1-a)*theta_acc_k,
+        psi_hat_k = a*(psi_hat_{k-1} + omega_k*dt) + (1-a)*psi_acc_k,
         a = tau/(tau + dt)
 
     ПОЧЕМУ "комплементарный".  В непрерывном времени это
-    theta_hat' = omega + k*(theta_acc - theta_hat), k = 1/tau, откуда
+    psi_hat' = omega + k*(psi_acc - psi_hat), k = 1/tau, откуда
 
-        theta_hat = [ s/(s+k) ]*theta  +  [ k/(s+k) ]*theta_acc
+        psi_hat = [ s/(s+k) ]*psi  +  [ k/(s+k) ]*psi_acc
                       гироскоп             акселерометр
                     ФВЧ                  ФНЧ
 
@@ -84,14 +84,14 @@ class ComplementaryEstimator(Estimator):
     tau* = (C/2b^2)^(1/3).  Убирает остаток только расширенное состояние
     (ER-008.2), где смещение оценивается наравне с углом.
 
-    Скорость наклона фильтр НЕ фильтрует: dtheta_hat = omega, то есть в
+    Скорость наклона фильтр НЕ фильтрует: dpsi_hat = omega, то есть в
     регулятор уходит показание гироскопа вместе с его смещением.  Это тоже
     лечится расширением состояния, а не подбором tau.
 
     КОЛЕСО.  Из ИДУ оно не достаётся никак.  Не "плохо достаётся" -- никак:
-    ddtheta и ddphi зависят только от (theta, dtheta, u) (Key_Formulas §1.4,
-    phi циклична), поэтому и a_x, a_z, omega зависят только от них.  Два
-    состояния, отличающиеся лишь (phi, dphi), дают ПОБИТОВО одинаковые
+    ddpsi и ddtheta зависят только от (psi, dpsi, u) (Key_Formulas §1.4,
+    theta циклична), поэтому и a_x, a_z, omega зависят только от них.  Два
+    состояния, отличающиеся лишь (theta, dtheta), дают ПОБИТОВО одинаковые
     показания -- это проверено тестом, и это сильнее, чем rank(O) = 2 из 4:
     утверждение точное, а не про линеаризацию.  Ненаблюдаемая подсистема при
     этом ещё и недетектируема: A, суженная на ядро, -- нильпотентная жорданова
@@ -100,27 +100,27 @@ class ComplementaryEstimator(Estimator):
 
     Отсюда два режима, и оба честны по-своему:
 
-    * wheel="zero" -- phi_hat = dphi_hat = 0.  Законно ровно в паре с
+    * wheel="zero" -- theta_hat = dtheta_hat = 0.  Законно ровно в паре с
       регулятором, у которого нули в этих столбцах (lqr_tilt, A17): выдуманное
       число тогда физически не может попасть в управление.  Это база отсчёта.
     * wheel="encoder" -- колесо приходит от МОТОРНОГО ЭНКОДЕРА, и тогда
       система наблюдаема (rank 4 против 2 при одном ИДУ).  Датчик даёт
       ОТНОСИТЕЛЬНЫЕ величины, поэтому оценка складывается:
 
-          phi_hat  = (phi - theta)_изм  + theta_hat
-          dphi_hat = (dphi - dtheta)_изм + omega
+          theta_hat  = (theta - psi)_изм  + psi_hat
+          dtheta_hat = (dtheta - dpsi)_изм + omega
 
       Ошибка наклона протекает в колесо целиком -- это не дефект, а плата за
       то, что вал не видит землю.  Зато она ОГРАНИЧЕНА ошибкой наклона, а не
       растёт со временем, как при счислении пути.  Ждёт y из пяти чисел:
       StackedSensor(IMUSensor(mode="imu"), EncoderSensor).
-    * wheel="dead_reckon" (по умолчанию) -- счисление пути: ddphi берётся из
+    * wheel="dead_reckon" (по умолчанию) -- счисление пути: ddtheta берётся из
       ПРАВОЙ ЧАСТИ МОДЕЛИ по текущей оценке наклона и прошлому управлению и
       дважды интегрируется явным Эйлером.  Оценка обязана разойтись, и в этом
       смысл режима: ошибка ускорения колеса равна c*eps, где eps -- ошибка
-      наклона, а c = d(ddphi)/d(theta) = -350 для параметров по умолчанию.
-      Значит постоянный остаток eps_0 = b*tau даёт ошибку dphi = c*eps_0*t
-      (линейно) и phi = c*eps_0*t^2/2 (квадратично), а белый шум -- рост как
+      наклона, а c = d(ddtheta)/d(psi) = -350 для параметров по умолчанию.
+      Значит постоянный остаток eps_0 = b*tau даёт ошибку dtheta = c*eps_0*t
+      (линейно) и theta = c*eps_0*t^2/2 (квадратично), а белый шум -- рост как
       sqrt(t) и t^(3/2).  Замер показывает, что убивает оценку колеса не шум,
       а остаток фильтра, усиленный в 350 раз.
 
@@ -156,34 +156,34 @@ class ComplementaryEstimator(Estimator):
     КОМПЕНСАЦИЯ КАЖУЩЕЙСЯ ВЕРТИКАЛИ.  Акселерометр меряет не наклон, а
     удельную силу (WheeledPendulum.specific_force):
 
-        f_x = -g sin(theta) + d*ddtheta + r cos(theta)*ddphi
-        f_z =  g cos(theta) - d*dtheta^2 + r sin(theta)*ddphi
+        f_x = -g sin(psi) + d*ddpsi + r cos(psi)*ddtheta
+        f_z =  g cos(psi) - d*dpsi^2 + r sin(psi)*ddtheta
 
     Всё, кроме членов с g, -- инерционная часть, и atan2(-f_x, f_z) врёт
     ровно на неё.  Размер вранья задают r и d: при r = 0.3 (параметры модели
-    с 17.09) член r*ddphi вшестеро больше, чем был при r = 0.05, и замер
+    с 17.09) член r*ddtheta вшестеро больше, чем был при r = 0.05, и замер
     показывает, что без компенсации ЛКР с этим фильтром раскачивается при
     любом tau (0.1...3 с), а со старыми l, r держал при tau = 0.3.  Причина --
-    обратная связь: ошибка наклона -> момент -> ddphi -> ошибка наклона.
+    обратная связь: ошибка наклона -> момент -> ddtheta -> ошибка наклона.
 
-    Инерционная часть предсказуема: ddtheta и ddphi -- правая часть модели по
-    (theta, dtheta, u), а u_prev -- ровно тот момент, что действовал на
+    Инерционная часть предсказуема: ddpsi и ddtheta -- правая часть модели по
+    (psi, dpsi, u), а u_prev -- ровно тот момент, что действовал на
     интервале, кончающемся в t (A20).  Поэтому перед atan2 из показаний
     вычитается предсказание
 
-        a_x' = a_x - (f_x(x_hat, u_prev) + g sin(theta_hat)),
-        a_z' = a_z - (f_z(x_hat, u_prev) - g cos(theta_hat)),
+        a_x' = a_x - (f_x(x_hat, u_prev) + g sin(psi_hat)),
+        a_z' = a_z - (f_z(x_hat, u_prev) - g cos(psi_hat)),
 
     где x_hat собирается из ПРОШЛОЙ оценки наклона, текущего omega и колеса.
     Ошибка компенсации -- второго порядка: она пропорциональна ошибке
-    наклона, помноженной на d(ddphi)/d(theta), и сама проходит через ФНЧ
+    наклона, помноженной на d(ddtheta)/d(psi), и сама проходит через ФНЧ
     фильтра.  Это наблюдатель с моделью в смысле A2, как и счисление пути.
 
     На первом вызове прошлой оценки нет, а у покоящейся в наклоне машины
-    ddtheta != 0 уже от силы тяжести.  Поэтому начальный наклон -- корень
-    theta = atan2(-a_x'(theta), a_z'(theta)), найденный методом Ньютона
+    ddpsi != 0 уже от силы тяжести.  Поэтому начальный наклон -- корень
+    psi = atan2(-a_x'(psi), a_z'(psi)), найденный методом Ньютона
     (_initial_tilt).  Простая итерация здесь не годится: замер при
-    theta = 0.05 даёт theta_acc = 0.117, производная отображения по модулю
+    psi = 0.05 даёт psi_acc = 0.117, производная отображения по модулю
     около 1.3 > 1, и итерация расходится.  По той же причине и на каждом
     шаге берётся корень (один шаг Ньютона от прогноза гироскопом), а не
     подстановка прошлой оценки: иначе при tau = 0 фильтр -- это та самая
@@ -211,11 +211,11 @@ class ComplementaryEstimator(Estimator):
                 f"получено {wheel!r}"
             )
         names = tuple(system.state_names)
-        for need in ("theta", "phi", "dtheta", "dphi"):
+        for need in ("psi", "theta", "dpsi", "dtheta"):
             if need not in names:
                 raise ValueError(
                     f"ComplementaryEstimator не понимает состояние {names}: "
-                    "нужны theta, phi, dtheta, dphi"
+                    "нужны psi, theta, dpsi, dtheta"
                 )
         if accel_offset is not None and not hasattr(system, "specific_force"):
             raise ValueError(
@@ -227,7 +227,7 @@ class ComplementaryEstimator(Estimator):
         self.dt = float(dt)
         self.tau = tau if tau.ndim else float(tau)
         self.wheel = wheel
-        self.i = tuple(names.index(n) for n in ("theta", "phi", "dtheta", "dphi"))
+        self.i = tuple(names.index(n) for n in ("psi", "theta", "dpsi", "dtheta"))
         # a = tau/(tau+dt); при tau = inf это ровно 1 (чистый гироскоп), но
         # inf/(inf+dt) в плавающей точке даёт nan -- поэтому предел явно.
         # np.where вместо if: tau может быть массивом, и тогда бесконечность
@@ -237,19 +237,19 @@ class ComplementaryEstimator(Estimator):
         if not tau.ndim:
             self.a = float(self.a)
 
+        self._psi = None
         self._theta = None
-        self._phi = None
-        self._dphi = None
+        self._dtheta = None
         self._t_prev = None
 
     # --- вспомогательное -------------------------------------------------
 
     @staticmethod
     def tilt_from_accelerometer(a_x, a_z):
-        """Кажущаяся вертикаль: theta_acc = atan2(-a_x, a_z).
+        """Кажущаяся вертикаль: psi_acc = atan2(-a_x, a_z).
 
-        В покое f = (-g sin theta, g cos theta), и формула возвращает ровно
-        theta.  При разгоне -- систематически смещённое значение: это не шум,
+        В покое f = (-g sin psi, g cos psi), и формула возвращает ровно
+        psi.  При разгоне -- систематически смещённое значение: это не шум,
         а физика (docs/imu_noise.md §1, WheeledPendulum.specific_force).
         """
         return np.arctan2(-np.asarray(a_x, dtype=float), np.asarray(a_z, dtype=float))
@@ -258,14 +258,14 @@ class ComplementaryEstimator(Estimator):
 
     def reset(self, y0: np.ndarray | None = None) -> None:
         if y0 is None:
-            self._theta = None
-            self._phi = self._dphi = None
+            self._psi = None
+            self._theta = self._dtheta = None
         else:
             y0 = np.asarray(y0, dtype=float)
             u0 = np.zeros(y0.shape[:-1] + (self.system.n_action,))
-            self._theta = self._initial_tilt(0.0, y0, u0)
-            zeros = np.zeros_like(self._theta)
-            self._phi, self._dphi = zeros.copy(), zeros.copy()
+            self._psi = self._initial_tilt(0.0, y0, u0)
+            zeros = np.zeros_like(self._psi)
+            self._theta, self._dtheta = zeros.copy(), zeros.copy()
         self._t_prev = None
 
     # --- оценка ----------------------------------------------------------
@@ -274,7 +274,7 @@ class ComplementaryEstimator(Estimator):
         y = np.asarray(y, dtype=float)
         n_need = 5 if self.wheel == "encoder" else 3
         if y.shape[-1] != n_need:
-            what = ("(a_x, a_z, omega, phi-theta, dphi-dtheta)"
+            what = ("(a_x, a_z, omega, theta-psi, dtheta-dpsi)"
                     if n_need == 5 else "(a_x, a_z, omega)")
             hint = ("Нужен StackedSensor(IMUSensor(mode='imu'), EncoderSensor)."
                     if n_need == 5 else "Датчику нужен mode='imu'.")
@@ -283,36 +283,36 @@ class ComplementaryEstimator(Estimator):
                 f"числа {what}, получено {y.shape}.  {hint}"
             )
         omega = y[..., 2]
-        if self.accel_offset is None or self._theta is None \
-                or np.shape(self._theta) != np.shape(omega):
-            theta_acc = self.tilt_from_accelerometer(y[..., 0], y[..., 1])
+        if self.accel_offset is None or self._psi is None \
+                or np.shape(self._psi) != np.shape(omega):
+            psi_acc = self.tilt_from_accelerometer(y[..., 0], y[..., 1])
         else:
             # Корень, а не одна подстановка прошлой оценки: у отображения
-            # theta -> compensated_tilt(theta) производная около -1.3, и при
+            # psi -> compensated_tilt(psi) производная около -1.3, и при
             # tau = 0 (a = 0) простая подстановка -- расходящаяся итерация.
             # Старт -- прогноз гироскопом, одного шага Ньютона хватает.
-            theta_acc = self._initial_tilt(t, y, u_prev,
-                                           start=self._theta + omega * self.dt, n_iter=1)
-        if np.ndim(self.a) and np.shape(self.a) != np.shape(theta_acc):
+            psi_acc = self._initial_tilt(t, y, u_prev,
+                                           start=self._psi + omega * self.dt, n_iter=1)
+        if np.ndim(self.a) and np.shape(self.a) != np.shape(psi_acc):
             raise ValueError(
                 f"tau задано массивом {np.shape(self.a)}, а пачка измерений "
-                f"имеет форму {np.shape(theta_acc)}: на каждую строку нужно "
+                f"имеет форму {np.shape(psi_acc)}: на каждую строку нужно "
                 "ровно одно tau."
             )
 
-        # Первый вызов: reset мог задать theta по y0, но времени он не знает,
+        # Первый вызов: reset мог задать psi по y0, но времени он не знает,
         # поэтому _t_prev is None -- такой же признак первого шага, как и
         # отсутствие оценки.  Шага фильтра здесь нет, только инициализация.
-        if (self._theta is None or self._t_prev is None
-                or np.shape(self._theta) != np.shape(theta_acc)):
-            if self._theta is None or np.shape(self._theta) != np.shape(theta_acc):
+        if (self._psi is None or self._t_prev is None
+                or np.shape(self._psi) != np.shape(psi_acc)):
+            if self._psi is None or np.shape(self._psi) != np.shape(psi_acc):
                 if self.accel_offset is not None:
-                    theta_acc = self._initial_tilt(t, y, u_prev)
-                self._theta = np.array(theta_acc, dtype=float, copy=True)
-                self._phi = np.zeros_like(self._theta)
-                self._dphi = np.zeros_like(self._theta)
+                    psi_acc = self._initial_tilt(t, y, u_prev)
+                self._psi = np.array(psi_acc, dtype=float, copy=True)
+                self._theta = np.zeros_like(self._psi)
+                self._dtheta = np.zeros_like(self._psi)
             self._t_prev = float(t)
-            return self._assemble(self._theta, omega, y)
+            return self._assemble(self._psi, omega, y)
 
         dt = float(t) - self._t_prev
         if dt > 0:
@@ -322,15 +322,15 @@ class ComplementaryEstimator(Estimator):
                     "От шага зависят и a = tau/(tau+dt), и оба интегрирования."
                 )
             # комплементарный шаг: прогноз гироскопом + подтяжка к акселерометру
-            self._theta = self.a * (self._theta + omega * self.dt) \
-                + (1.0 - self.a) * theta_acc
+            self._psi = self.a * (self._psi + omega * self.dt) \
+                + (1.0 - self.a) * psi_acc
             if self.wheel == "dead_reckon":
                 self._integrate_wheel(t, omega, u_prev)
             self._t_prev = float(t)
 
-        return self._assemble(self._theta, omega, y)
+        return self._assemble(self._psi, omega, y)
 
-    def _compensated_tilt(self, t, y, u_prev, theta_guess):
+    def _compensated_tilt(self, t, y, u_prev, psi_guess):
         """atan2 по показаниям, из которых вычтена предсказанная инерционная
         часть удельной силы (вывод -- докстринг класса)."""
         if u_prev is None:
@@ -338,47 +338,47 @@ class ComplementaryEstimator(Estimator):
                 "accel_offset требует u_prev: инерционная часть удельной силы "
                 "зависит от приложенного момента"
             )
-        theta_guess = np.asarray(theta_guess, dtype=float)
-        x_hat = self._assemble(theta_guess, y[..., 2], y)
+        psi_guess = np.asarray(psi_guess, dtype=float)
+        x_hat = self._assemble(psi_guess, y[..., 2], y)
         u = np.atleast_1d(np.asarray(u_prev, dtype=float))
         f_x, f_z = self.system.specific_force(t, x_hat, u, d=self.accel_offset)
         g = float(self.system.p.g)
-        a_x = y[..., 0] - (f_x + g * np.sin(theta_guess))
-        a_z = y[..., 1] - (f_z - g * np.cos(theta_guess))
+        a_x = y[..., 0] - (f_x + g * np.sin(psi_guess))
+        a_z = y[..., 1] - (f_z - g * np.cos(psi_guess))
         return self.tilt_from_accelerometer(a_x, a_z)
 
     def _initial_tilt(self, t, y, u_prev, start=None, n_iter: int = 8):
         """Наклон по акселерометру.  Без компенсации -- просто atan2.  С
-        компенсацией -- корень h(theta) = compensated_tilt(theta) - theta = 0
+        компенсацией -- корень h(psi) = compensated_tilt(psi) - psi = 0
         методом Ньютона с центральной разностью; старт -- сырой atan2 (первый
         вызов) или прогноз гироскопом (шаг фильтра).  Пачка решается
         построчно-независимо тем же векторным кодом."""
         y = np.asarray(y, dtype=float)
-        theta = self.tilt_from_accelerometer(y[..., 0], y[..., 1])
+        psi = self.tilt_from_accelerometer(y[..., 0], y[..., 1])
         if self.accel_offset is None:
-            return theta
+            return psi
         if start is not None:
-            theta = np.asarray(start, dtype=float)
+            psi = np.asarray(start, dtype=float)
         h = 1e-6
         for _ in range(n_iter):
-            r0 = self._compensated_tilt(t, y, u_prev, theta) - theta
-            rp = self._compensated_tilt(t, y, u_prev, theta + h) - (theta + h)
-            rm = self._compensated_tilt(t, y, u_prev, theta - h) - (theta - h)
+            r0 = self._compensated_tilt(t, y, u_prev, psi) - psi
+            rp = self._compensated_tilt(t, y, u_prev, psi + h) - (psi + h)
+            rm = self._compensated_tilt(t, y, u_prev, psi - h) - (psi - h)
             slope = (rp - rm) / (2.0 * h)
             # Вырожденный наклон (slope ~ 0) -- шаг не делаем: лучше сырой
             # atan2, чем деление на ноль.  Шаг ограничен, чтобы из дальнего
             # старта не перепрыгнуть через pi.
             ok = np.abs(slope) > 1e-9
             step = np.where(ok, -r0 / np.where(ok, slope, 1.0), 0.0)
-            theta = theta + np.clip(step, -0.5, 0.5)
-        return theta
+            psi = psi + np.clip(step, -0.5, 0.5)
+        return psi
 
     def _integrate_wheel(self, t: float, omega, u_prev) -> None:
-        """Счисление пути по колесу: ddphi из правой части модели, явный Эйлер.
+        """Счисление пути по колесу: ddtheta из правой части модели, явный Эйлер.
 
-        ddphi не зависит ни от phi, ни от dphi (§1.4), поэтому подстановка
+        ddtheta не зависит ни от theta, ни от dtheta (§1.4), поэтому подстановка
         собственных -- заведомо неверных -- оценок колеса на результат не
-        влияет: считается функция только от (theta_hat, omega, u_prev).
+        влияет: считается функция только от (psi_hat, omega, u_prev).
         Обратной связи здесь нет вовсе, и ошибка ничем не ограничена.
         """
         if u_prev is None:
@@ -386,31 +386,31 @@ class ComplementaryEstimator(Estimator):
                 "wheel='dead_reckon' требует u_prev: ускорение колеса зависит "
                 "от приложенного момента"
             )
-        x_hat = self._assemble(self._theta, omega, None)
-        ddphi = self.system.f(t, x_hat, np.atleast_1d(np.asarray(u_prev, float)))[..., self.i[3]]
-        self._phi = self._phi + self._dphi * self.dt      # явный Эйлер: phi по СТАРОЙ скорости
-        self._dphi = self._dphi + ddphi * self.dt
+        x_hat = self._assemble(self._psi, omega, None)
+        ddtheta = self.system.f(t, x_hat, np.atleast_1d(np.asarray(u_prev, float)))[..., self.i[3]]
+        self._theta = self._theta + self._dtheta * self.dt      # явный Эйлер: theta по СТАРОЙ скорости
+        self._dtheta = self._dtheta + ddtheta * self.dt
 
-    def _assemble(self, theta, omega, y) -> np.ndarray:
-        """Собрать x_hat = (theta, phi, dtheta, dphi) в порядке state_names.
+    def _assemble(self, psi, omega, y) -> np.ndarray:
+        """Собрать x_hat = (psi, theta, dpsi, dtheta) в порядке state_names.
 
         y нужен только режиму "encoder": колесо там не хранится в состоянии
         фильтра, а каждый раз складывается из показания и наклона.
         """
-        theta = np.asarray(theta, dtype=float)
+        psi = np.asarray(psi, dtype=float)
         omega = np.asarray(omega, dtype=float)
         if self.wheel == "encoder" and y is not None:
             # Энкодер даёт ОТНОСИТЕЛЬНЫЕ величины -- прибавляем наклон.
-            phi = y[..., 3] + theta
-            dphi = y[..., 4] + omega
-        elif self.wheel == "zero" or self._phi is None:
-            phi = np.zeros_like(theta)
-            dphi = np.zeros_like(theta)
+            theta = y[..., 3] + psi
+            dtheta = y[..., 4] + omega
+        elif self.wheel == "zero" or self._theta is None:
+            theta = np.zeros_like(psi)
+            dtheta = np.zeros_like(psi)
         else:
-            phi, dphi = self._phi, self._dphi
+            theta, dtheta = self._theta, self._dtheta
         parts = [None] * 4
-        parts[self.i[0]], parts[self.i[1]] = theta, phi
-        parts[self.i[2]], parts[self.i[3]] = omega, dphi
+        parts[self.i[0]], parts[self.i[1]] = psi, theta
+        parts[self.i[2]], parts[self.i[3]] = omega, dtheta
         return np.stack(parts, axis=-1)
 
 

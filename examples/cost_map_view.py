@@ -2,10 +2,10 @@
 
 Читает то, что посчитал `examples/cost_sweep.py run`, и ничего не пересчитывает
 по сетке. Слева карта цены A, в середине -- цены B, справа -- разница.
-Внизу -- theta(t), u(t) и phi(t) выбранной клетки для обеих цен.
+Внизу -- psi(t), u(t) и theta(t) выбранной клетки для обеих цен.
 
     uv run python examples/cost_map_view.py                       # base против R=100, ЛКР, 10 Н·м
-    uv run python examples/cost_map_view.py --a base --b phi=1e-2 --u-max 3
+    uv run python examples/cost_map_view.py --a base --b theta=1e-2 --u-max 3
     uv run python examples/cost_map_view.py --method mpc          # карты MPC 11x11
 
 Цвета карт -- те же, что в `wpend.viz.explorer`: синий -- удержан, красный --
@@ -61,7 +61,9 @@ class Data:
         self.files = {}
         for method, path in (("lqr", lqr_path), ("mpc", mpc_path)):
             if Path(path).exists():
-                self.files[method] = np.load(path, allow_pickle=False)
+                # load_results, а не np.load: файлы 16.09 записаны в старой
+                # нотации, ключи переводятся при чтении (ER-022).
+                self.files[method] = cs.load_results(path)
         if "lqr" not in self.files:
             sys.exit(f"нет {lqr_path}: сначала `uv run python examples/cost_sweep.py run`")
 
@@ -80,7 +82,7 @@ class Data:
 
     def axes(self, method, u_max):
         d = self.files[method]
-        return d[f"{u_max}__thetas"], d[f"{u_max}__dthetas"], d[f"{u_max}__rec"]
+        return d[f"{u_max}__psis"], d[f"{u_max}__dpsis"], d[f"{u_max}__rec"]
 
 
 class View:
@@ -104,20 +106,20 @@ class View:
             self.a = avail[0]
         if self.b not in avail:
             self.b = avail[min(1, len(avail) - 1)]
-        self.thetas, self.dthetas, self.rec = self.data.axes(self.method, self.u_max)
-        self.n = self.thetas.size
+        self.psis, self.dpsis, self.rec = self.data.axes(self.method, self.u_max)
+        self.n = self.psis.size
         world = WheeledPendulum(u_max=self.u_max)
-        self.limit_theta = np.linspace(-1.5, 1.5, 1201)
+        self.limit_psi = np.linspace(-1.5, 1.5, 1201)
         self.limit_floor, self.limit_ceiling = world.recoverable_bounds(self.u_max,
-                                                                        self.limit_theta)
-        self.theta_eq = world.saddle_angle(self.u_max)
+                                                                        self.limit_psi)
+        self.psi_eq = world.saddle_angle(self.u_max)
         self.selected = None
         self.traj = {}
 
     def select(self, ix, iy):
         self.selected = (ix, iy)
         m = iy * self.n + ix
-        x0 = np.array([self.thetas[ix], 0.0, self.dthetas[iy], 0.0])
+        x0 = np.array([self.psis[ix], 0.0, self.dpsis[iy], 0.0])
         for slot, name in (("A", self.a), ("B", self.b)):
             if self.method == "mpc":
                 X = self.data.get("mpc", self.u_max, name, "x")[m].astype(float)
@@ -133,13 +135,13 @@ class View:
 
     # --- геометрия карты -------------------------------------------------------
 
-    def to_px(self, rect, theta, dtheta):
+    def to_px(self, rect, psi, dpsi):
         """Как `_to_map_px` окна: узел -- центр клетки, края на полклетки дальше."""
         x, y, w, h = rect
         edge = self.n / max(self.n - 1, 1)
-        half_th, half_dth = self.thetas[-1] * edge, self.dthetas[-1] * edge
-        return (x + (theta + half_th) / (2 * half_th) * w,
-                y + (1.0 - (dtheta + half_dth) / (2 * half_dth)) * h)
+        half_th, half_dth = self.psis[-1] * edge, self.dpsis[-1] * edge
+        return (x + (psi + half_th) / (2 * half_th) * w,
+                y + (1.0 - (dpsi + half_dth) / (2 * half_dth)) * h)
 
     def cell_at(self, pos):
         for rect in MAPS.values():
@@ -189,7 +191,7 @@ def draw_limits(screen, pg, view, rect):
     screen.set_clip(rect)
     for values in (view.limit_ceiling, view.limit_floor):
         run = []
-        for th, dth in zip(view.limit_theta, values):
+        for th, dth in zip(view.limit_psi, values):
             if abs(dth) < 1e-12:                       # уровня нет -- линию рвём
                 if len(run) > 1:
                     pg.draw.lines(screen, LIMIT, False, run, 2)
@@ -199,7 +201,7 @@ def draw_limits(screen, pg, view, rect):
         if len(run) > 1:
             pg.draw.lines(screen, LIMIT, False, run, 2)
     for sign in (+1, -1):
-        px, py = view.to_px(rect, sign * view.theta_eq, 0.0)
+        px, py = view.to_px(rect, sign * view.psi_eq, 0.0)
         pg.draw.circle(screen, LIMIT, (int(px), int(py)), 4, 1)
     screen.set_clip(clip)
 
@@ -234,11 +236,11 @@ def draw_map(screen, pg, font, view, key, title, surf, curves):
         ix, iy = view.selected
         cw, ch = w / view.n, h / view.n
         pg.draw.rect(screen, ACCENT, (x + ix * cw, y + (view.n - 1 - iy) * ch, cw, ch), 2)
-    labels = [(f"{view.thetas[0]:+.2f}", x, y + h + 6),
-              (f"{view.thetas[-1]:+.2f}", x + w - 40, y + h + 6)]
+    labels = [(f"{view.psis[0]:+.2f}", x, y + h + 6),
+              (f"{view.psis[-1]:+.2f}", x + w - 40, y + h + 6)]
     if key == "A":       # оси у всех карт общие; слева от B и diff подпись легла бы на соседа
-        labels += [(f"{view.dthetas[-1]:+.1f}", x - 44, y),
-                   (f"{view.dthetas[0]:+.1f}", x - 44, y + h - 14)]
+        labels += [(f"{view.dpsis[-1]:+.1f}", x - 44, y),
+                   (f"{view.dpsis[0]:+.1f}", x - 44, y + h - 14)]
     for text, tx, ty in labels:
         screen.blit(font.render(text, True, DIM), (tx, ty))
 
@@ -400,7 +402,7 @@ def draw(screen, pg, font, view, buttons):
     if view.selected is not None:
         ix, iy = view.selected
         m = iy * view.n + ix
-        parts = [f"theta0 = {view.thetas[ix]:+.3f}, dtheta0 = {view.dthetas[iy]:+.2f}, "
+        parts = [f"psi0 = {view.psis[ix]:+.3f}, dpsi0 = {view.dpsis[iy]:+.2f}, "
                  f"recoverable: {'yes' if view.rec[m] else 'no'}"]
         for slot, name in (("A", view.a), ("B", view.b)):
             code = int(view.data.get(view.method, view.u_max, name, "outcome")[m])
@@ -409,13 +411,13 @@ def draw(screen, pg, font, view, buttons):
             if slot in view.traj:
                 _, X, U = view.traj[slot]
                 sat = np.mean(np.abs(U) >= view.u_max - 1e-6)
-                word += f", saturated {sat:.0%}, phi(T) = {X[-1, 1]:+.1f}"
+                word += f", saturated {sat:.0%}, theta(T) = {X[-1, 1]:+.1f}"
             parts.append(f"{slot}: {word}")
         screen.blit(font.render("   ".join(parts), True, TEXT), (48, 624))
 
-    draw_plot(screen, pg, font, view, PLOTS[0], "theta(t), rad   A white, B teal", 0)
+    draw_plot(screen, pg, font, view, PLOTS[0], "psi(t), rad   A white, B teal", 0)
     draw_plot(screen, pg, font, view, PLOTS[1], "u(t), N*m   dashed: +-u_max", None, view.u_max)
-    draw_plot(screen, pg, font, view, PLOTS[2], "phi(t), rad   wheel", 1)
+    draw_plot(screen, pg, font, view, PLOTS[2], "theta(t), rad   wheel", 1)
 
 
 def main():

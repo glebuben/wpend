@@ -92,7 +92,7 @@ def ellipsoid_region(P, c):
     а не измерена. Цена -- консервативность: настоящий бассейн заметно шире.
 
     Проверка идёт по ПОЛНОМУ состоянию, включая колесо: c* сертифицирован для
-    4-мерного эллипсоида, и выбрасывать из проверки phi/dphi значит потерять
+    4-мерного эллипсоида, и выбрасывать из проверки theta/dtheta значит потерять
     ровно ту гарантию, ради которой этот вариант и берут.
     """
     P = np.asarray(P, dtype=float)
@@ -111,55 +111,55 @@ def _nearest_index(grid, values):
     return np.where(values - grid[j - 1] <= grid[j] - values, j - 1, j)
 
 
-def grid_region(mask, thetas, dthetas, i_theta=0, i_dtheta=2):
-    """Предикат «клетка карты (theta, dtheta) помечена как удержанная».
+def grid_region(mask, psis, dpsis, i_psi=0, i_dpsi=2):
+    """Предикат «клетка карты (psi, dpsi) помечена как удержанная».
 
-    `mask` -- булева матрица формы (len(dthetas), len(thetas)); порядок осей
-    тот же, что у `wpend.viz.grid.GridSpec`: строка -- dtheta, столбец -- theta.
+    `mask` -- булева матрица формы (len(dpsis), len(psis)); порядок осей
+    тот же, что у `wpend.viz.grid.GridSpec`: строка -- dpsi, столбец -- psi.
     Обычно это результат прогона сетки под чистым ЛКР: `classify(...) == HELD`.
 
     Это измеренный бассейн, а не доказанный: клетка означает «за горизонт
     прогона корпус не упал», и между узлами ничего не гарантировано. Зато он
     заметно шире эллипсоида -- в этом и смысл сравнения.
 
-    Читает только (theta, dtheta). Для вопроса «упадёт ли» это не потеря
-    общности: ускорения колёсного маятника не зависят ни от phi, ни от dphi
+    Читает только (psi, dpsi). Для вопроса «упадёт ли» это не потеря
+    общности: ускорения колёсного маятника не зависят ни от theta, ни от dtheta
     (Key_Formulas §1.4), поэтому карта и строится в этой плоскости. Но для
     вопроса «сойдётся ли ЛКР к нулю ПОЛНОСТЬЮ» -- потеря: колесо, укатившееся
     далеко, из проверки выпадает, и регулятор может переключиться раньше, чем
     имеет право. Именно это и надо увидеть в сравнении.
     """
     mask = np.asarray(mask, dtype=bool)
-    thetas = np.asarray(thetas, dtype=float)
-    dthetas = np.asarray(dthetas, dtype=float)
-    if mask.shape != (dthetas.size, thetas.size):
-        raise ValueError(f"mask должна быть формы {(dthetas.size, thetas.size)}, "
+    psis = np.asarray(psis, dtype=float)
+    dpsis = np.asarray(dpsis, dtype=float)
+    if mask.shape != (dpsis.size, psis.size):
+        raise ValueError(f"mask должна быть формы {(dpsis.size, psis.size)}, "
                          f"а не {mask.shape}")
 
     def inside(x):
         x = np.asarray(x, dtype=float)
-        th, dth = x[..., i_theta], x[..., i_dtheta]
-        on_grid = ((th >= thetas[0]) & (th <= thetas[-1])
-                   & (dth >= dthetas[0]) & (dth <= dthetas[-1]))
-        ix = _nearest_index(thetas, np.clip(th, thetas[0], thetas[-1]))
-        iy = _nearest_index(dthetas, np.clip(dth, dthetas[0], dthetas[-1]))
+        th, dth = x[..., i_psi], x[..., i_dpsi]
+        on_grid = ((th >= psis[0]) & (th <= psis[-1])
+                   & (dth >= dpsis[0]) & (dth <= dpsis[-1]))
+        ix = _nearest_index(psis, np.clip(th, psis[0], psis[-1]))
+        iy = _nearest_index(dpsis, np.clip(dth, dpsis[0], dpsis[-1]))
         return mask[iy, ix] & on_grid
 
     return inside
 
 
-def theta_band_region(eps, i_theta=0):
-    """Предикат «корпус в eps-окрестности вертикали»: |theta| < eps.
+def psi_band_region(eps, i_psi=0):
+    """Предикат «корпус в eps-окрестности вертикали»: |psi| < eps.
 
     Самый грубый ответ на вопрос «когда отдавать управление ЛКР» -- и
-    сознательно грубый. Ни dtheta, ни колесо в проверку не входят.
+    сознательно грубый. Ни dpsi, ни колесо в проверку не входят.
 
-    Почему dtheta можно не проверять. Реле едет по сепаратрисе, а на ней
-    при theta -> 0 и dtheta -> 0 (из H(θ, θ̇; ∓u_max) = γD, Key_Formulas §3:
-    θ̇² ~ |θ| вблизи нуля). Значит первый вход в полосу обычно происходит уже с
+    Почему dpsi можно не проверять. Реле едет по сепаратрисе, а на ней
+    при psi -> 0 и dpsi -> 0 (из H(ψ, ψ̇; ∓u_max) = γD, Key_Formulas §3:
+    ψ̇² ~ |ψ| вблизи нуля). Значит первый вход в полосу обычно происходит уже с
     малой скоростью. Обычно, но не всегда: траектория выше сепаратрисы
-    пролетает theta = 0 на скорости, и полоса её пропустит. Замер
-    (PROPOSALS.md A26): при u_max = 10 |dtheta| в момент передачи доходит до 1.8,
+    пролетает psi = 0 на скорости, и полоса её пропустит. Замер
+    (PROPOSALS.md A26): при u_max = 10 |dpsi| в момент передачи доходит до 1.8,
     а ЛКР с мягким колесом ловит и эти состояния.
 
     Сертификата у такой пары НЕТ: полоса не множество уровня V и не
@@ -175,7 +175,7 @@ def theta_band_region(eps, i_theta=0):
 
     def inside(x):
         x = np.asarray(x, dtype=float)
-        return np.abs(x[..., i_theta]) < eps
+        return np.abs(x[..., i_psi]) < eps
 
     return inside
 
@@ -191,34 +191,34 @@ class BangBangLQRController(Controller):
 
     Закон переключения релейной фазы -- ТОЧНАЯ сепаратриса, а не подгонка
     -------------------------------------------------------------------------
-    Наклон колёсного маятника живёт своей жизнью: phi циклична, поэтому
+    Наклон колёсного маятника живёт своей жизнью: theta циклична, поэтому
     (Key_Formulas §1.3-1.4)
 
-        Δ(θ) θ̈ = b(θ) u + γ D sin θ − β² sin θ cos θ θ̇² ,
+        Δ(ψ) ψ̈ = b(ψ) u + γ D sin ψ − β² sin ψ cos ψ ψ̇² ,
 
     и при ПОСТОЯННОМ u сохраняется первый интеграл (§3)
 
-        H(θ, θ̇; u) = ½ Δ(θ) θ̇² − u (γ θ + β sin θ) + γ D cos θ .
+        H(ψ, ψ̇; u) = ½ Δ(ψ) ψ̇² − u (γ ψ + β sin ψ) + γ D cos ψ .
 
     Значит фазовые кривые при u = const -- в точности линии уровня H, и
     траекторию, приходящую в верхнее положение, можно выписать, а не подобрать:
 
-      * при θ̇ > 0 корпус уезжает вперёд, тормозим моментом u = −u_max, и
+      * при ψ̇ > 0 корпус уезжает вперёд, тормозим моментом u = −u_max, и
         нужная кривая -- ветвь уровня H(·; −u_max) = H(0,0) = γ D;
-      * при θ̇ < 0 -- зеркально, u = +u_max на уровне H(·; +u_max) = γ D.
+      * при ψ̇ < 0 -- зеркально, u = +u_max на уровне H(·; +u_max) = γ D.
 
-    Обозначив d = sign θ̇ (а при θ̇ = 0 -- sign θ), обе ветви складываются в одну
+    Обозначив d = sign ψ̇ (а при ψ̇ = 0 -- sign ψ), обе ветви складываются в одну
     переключающую функцию
 
-        σ(θ, θ̇) = d · [ H(θ, θ̇; −u_max·d) − γ D ] ,      u = −u_max · sign σ.
+        σ(ψ, ψ̇) = d · [ H(ψ, ψ̇; −u_max·d) − γ D ] ,      u = −u_max · sign σ.
 
     Читается так: σ > 0 -- «энергии больше, чем на тормозной кривой, ведущей в
     ноль», надо тормозить; σ < 0 -- «меньше», надо разгоняться к нулю.
 
     Проверка знака в пределе двойного интегратора (β = 0, D = 0, то есть
-    θ̈ = u/α): при θ̇ > 0 получается σ = γ(½ α θ̇² + u_max θ) -- это, с точностью
+    ψ̈ = u/α): при ψ̇ > 0 получается σ = γ(½ α ψ̇² + u_max ψ) -- это, с точностью
     до положительного множителя, классическая переключающая функция
-    θ + α θ̇|θ̇| / (2 u_max) с u = −u_max sign(·).
+    ψ + α ψ̇|ψ̇| / (2 u_max) с u = −u_max sign(·).
 
     Чего эта формула НЕ обещает
     ---------------------------
@@ -226,9 +226,9 @@ class BangBangLQRController(Controller):
       восстановимого множества. Дальше, за седлом u = −u_max (уровень K(u_max),
       см. `src/recoverable.py`), спасения нет вообще, и формула вырождается в
       «тормозить изо всех сил» -- лучшее из доступного, но не возврат.
-    * Колесо. Релейная фаза считает только наклон; phi за это время уезжает, и
+    * Колесо. Релейная фаза считает только наклон; theta за это время уезжает, и
       возвращает его уже ЛКР. Если фаза длинная, состояние может не попасть в
-      4-мерный эллипсоид именно из-за phi -- это видно в `examples/bangbang_lqr.py`.
+      4-мерный эллипсоид именно из-за theta -- это видно в `examples/bangbang_lqr.py`.
     * На самой кривой σ = 0 управление дребезжит с частотой шага интегратора.
       Это неустранимое свойство релейного закона и одна из причин передавать
       управление ЛКР, а не досиживать до нуля на реле.
@@ -250,29 +250,29 @@ class BangBangLQRController(Controller):
         Нужен ровно ради `first_integral` и параметров γ, D -- то есть ради
         формулы сепаратрисы. Никакого состояния из системы не читается.
     wheel_ref : bool
-        False (по умолчанию) -- ЛКР гонит колесо в phi = 0, а регион
+        False (по умолчанию) -- ЛКР гонит колесо в theta = 0, а регион
         проверяется по полному состоянию. True -- ПРИВЯЗКА К КОЛЕСУ (§B8):
-        целью становится не phi = 0, а то положение колеса, в котором
+        целью становится не theta = 0, а то положение колеса, в котором
         произошла передача.
 
-        Почему это законно, а не подгонка. Координата phi циклична: правая
+        Почему это законно, а не подгонка. Координата theta циклична: правая
         часть f от неё не зависит вовсе (Key_Formulas §1.4). Значит для
-        e = x - (0, phi_ref, 0, 0) выполняется ė = f(e, u) с той же самой
-        функцией f -- сдвиг вдоль phi не меняет векторное поле. Поэтому
+        e = x - (0, theta_ref, 0, 0) выполняется ė = f(e, u) с той же самой
+        функцией f -- сдвиг вдоль theta не меняет векторное поле. Поэтому
         сертификат «V̇ < 0 внутри x^T P x <= c*» переносится на e ДОСЛОВНО,
         без нового доказательства (Khalil, гл. 8.2 + инвариантность поля).
 
         Что меняется на практике: до передачи регион проверяется по состоянию
-        с обнулённой phi -- то есть задаётся вопрос «поместились бы мы в
+        с обнулённой theta -- то есть задаётся вопрос «поместились бы мы в
         эллипсоид, если объявить колесо стоящим там, где оно есть». В момент
-        передачи phi_ref защёлкивается, и дальше ЛКР работает как u = -K e,
+        передачи theta_ref защёлкивается, и дальше ЛКР работает как u = -K e,
         то есть выпрямляет корпус и останавливает колесо ТАМ, ГДЕ ОНО
         ОКАЗАЛОСЬ. Цель прогона меняется с «приехать в ноль» на
         «остановиться где стоишь» -- это надо признавать вслух.
 
-        Скорость колеса dphi при этом из проверки НЕ уходит: она не циклична,
-        и вклад P[3,3] dphi^2 остаётся. Привязка снимает вклад phi, но не
-        вклад dphi -- см. замер в PROPOSALS.md §B8.
+        Скорость колеса dtheta при этом из проверки НЕ уходит: она не циклична,
+        и вклад P[3,3] dtheta^2 остаётся. Привязка снимает вклад theta, но не
+        вклад dtheta -- см. замер в PROPOSALS.md §B8.
     latch : bool
         True (по умолчанию) -- вошёл в регион и остался в ЛКР до `reset()`.
         Сертифицированный эллипсоид инвариантен (внутри V̇ < 0, значит V
@@ -287,7 +287,7 @@ class BangBangLQRController(Controller):
         u = -K_final x.
 
         Зачем. Вторая фаза отвечает за то, чтобы НЕ УРОНИТЬ: мягкий ЛКР
-        (пониженные гейны по phi, dphi) ловит состояния, которые жёсткий
+        (пониженные гейны по theta, dtheta) ловит состояния, которые жёсткий
         роняет, но возвращает колесо медленно. Третья фаза -- за то, чтобы
         ДОВЕСТИ: когда мягкий уже привёл состояние туда, где жёсткий
         доказуемо работает, отдаём управление жёсткому.
@@ -296,11 +296,11 @@ class BangBangLQRController(Controller):
         `certified_level` для ТОЙ ЖЕ пары (K_final, P_final) и того же u_max:
         внутри него V̇ < 0 при обрезанном управлении, множество инвариантно,
         и сходимость -K_final x доказана (Khalil, гл. 8.2). Поэтому здесь, в
-        отличие от полосы по theta, пара «критерий + регулятор» честная.
+        отличие от полосы по psi, пара «критерий + регулятор» честная.
         Проверка идёт по полному состоянию: колесо в сертификате участвует.
 
         При wheel_ref=True третья фаза видит то же состояние, что вторая,
-        -- x с вычтенным phi_ref: phi циклична, сертификат переносится.
+        -- x с вычтенным theta_ref: theta циклична, сертификат переносится.
 
         Третья фаза следует ТОЛЬКО за второй: попадание в final_region
         во время релейной фазы не считается. Иначе при широком c* реле
@@ -312,16 +312,16 @@ class BangBangLQRController(Controller):
     вызывается `rollout`-ом один раз перед прогоном.
     """
 
-    def __init__(self, K, u_max, region, system, *, i_theta=0, i_phi=1,
-                 i_dtheta=2, latch=True, wheel_ref=False,
+    def __init__(self, K, u_max, region, system, *, i_psi=0, i_theta=1,
+                 i_dpsi=2, latch=True, wheel_ref=False,
                  K_final=None, final_region=None):
         self.K = np.atleast_2d(np.asarray(K, dtype=float))
         self.u_max = float(u_max)
         self.region = region
         self.system = system
+        self.i_psi = int(i_psi)
         self.i_theta = int(i_theta)
-        self.i_phi = int(i_phi)
-        self.i_dtheta = int(i_dtheta)
+        self.i_dpsi = int(i_dpsi)
         self.latch = bool(latch)
         self.wheel_ref = bool(wheel_ref)
         if (K_final is None) != (final_region is None):
@@ -335,24 +335,24 @@ class BangBangLQRController(Controller):
         self.H_upright = float(system.first_integral(
             np.zeros(system.n_state), 0.0))
         self._engaged = None
-        self._phi_ref = None
+        self._theta_ref = None
         self._final = None
 
     def reset(self) -> None:
         self._engaged = None
-        self._phi_ref = None
+        self._theta_ref = None
         self._final = None
 
     def switching_function(self, x_hat):
-        """σ(θ, θ̇) из докстринга класса. Вынесено отдельно ради теста:
+        """σ(ψ, ψ̇) из докстринга класса. Вынесено отдельно ради теста:
         вдоль траектории с постоянным u = −u_max, стартующей с σ = 0,
         величина σ обязана оставаться нулём -- это сохранение H, а не
         сравнение с прошлым прогоном."""
         x = np.asarray(x_hat, dtype=float)
-        theta, dtheta = x[..., self.i_theta], x[..., self.i_dtheta]
-        # При θ̇ = 0 направление задаёт сам наклон: из (θ > 0, θ̇ = 0) надо
+        psi, dpsi = x[..., self.i_psi], x[..., self.i_dpsi]
+        # При ψ̇ = 0 направление задаёт сам наклон: из (ψ > 0, ψ̇ = 0) надо
         # толкать назад, а не «в сторону, куда летим», -- лететь ещё некуда.
-        d = np.where(dtheta != 0.0, np.sign(dtheta), np.sign(theta))
+        d = np.where(dpsi != 0.0, np.sign(dpsi), np.sign(psi))
         return d * (self.system.first_integral(x, -self.u_max * d)
                     - self.H_upright)
 
@@ -360,21 +360,21 @@ class BangBangLQRController(Controller):
         """Состояние, по которому проверяется регион.
 
         При привязке к колесу вопрос звучит как «поместились бы мы, если
-        объявить колесо стоящим там, где оно есть», поэтому phi обнуляется.
+        объявить колесо стоящим там, где оно есть», поэтому theta обнуляется.
         Скорость колеса не трогаем: она не циклична и из проверки не уходит.
         """
         if not self.wheel_ref:
             return x
         probe = np.array(x, dtype=float, copy=True)
-        probe[..., self.i_phi] = 0.0
+        probe[..., self.i_theta] = 0.0
         return probe
 
     def _error(self, x):
-        """Состояние, которое видит ЛКР: x либо x - (0, phi_ref, 0, 0)."""
+        """Состояние, которое видит ЛКР: x либо x - (0, theta_ref, 0, 0)."""
         if not self.wheel_ref:
             return x
         err = np.array(x, dtype=float, copy=True)
-        err[..., self.i_phi] = x[..., self.i_phi] - self._phi_ref
+        err[..., self.i_theta] = x[..., self.i_theta] - self._theta_ref
         return err
 
     def act(self, t: float, x_hat: np.ndarray) -> np.ndarray:
@@ -383,11 +383,11 @@ class BangBangLQRController(Controller):
         inside = np.asarray(self.region(self._probe(x)), dtype=bool)
         if self._engaged is None or self._engaged.shape != inside.shape:
             self._engaged = np.zeros(inside.shape, dtype=bool)
-            self._phi_ref = np.zeros(inside.shape, dtype=float)
-        # phi_ref защёлкивается на переднем фронте: цель фиксируется один раз,
+            self._theta_ref = np.zeros(inside.shape, dtype=float)
+        # theta_ref защёлкивается на переднем фронте: цель фиксируется один раз,
         # в момент передачи, и дальше не уползает вслед за колесом.
         newly = inside & ~self._engaged
-        self._phi_ref = np.where(newly, x[..., self.i_phi], self._phi_ref)
+        self._theta_ref = np.where(newly, x[..., self.i_theta], self._theta_ref)
         self._engaged = (self._engaged | inside) if self.latch else inside
 
         # σ >= 0 -> тормозим. Равенство попадает в ту же ветвь сознательно:
@@ -434,8 +434,8 @@ class TrajectoryTrackingController(Controller):
     u = -K_{N-1} x + (u_bar_{N-1} + K_{N-1} x_bar_N). Если цель плана --
     ноль, а Q_f = P из `lqr()`, то конец плана уже живёт в режиме ЛКР,
     u_bar_{N-1} ≈ -K_{N-1} x_bar_N, скобка ≈ 0, и регулятор превращается в
-    обычный ЛКР с K_{N-1} ≈ K. Замер (theta0 = 0.3, план 3 с, dt = 0.01):
-    скобка ≈ 0.004 Н·м, к 9 с |theta| ≈ 1e-4. Для других целей это не
+    обычный ЛКР с K_{N-1} ≈ K. Замер (psi0 = 0.3, план 3 с, dt = 0.01):
+    скобка ≈ 0.004 Н·м, к 9 с |psi| ≈ 1e-4. Для других целей это не
     гарантировано, и прогон длиннее плана -- отдельный вопрос.
 
     Время. Индекс считается из t, а не счётчиком вызовов: так регулятор не

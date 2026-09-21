@@ -16,19 +16,19 @@ def test_determinant_is_positive_everywhere():
     """Delta = alpha gamma - beta^2 cos^2 > 0: матрица масс положительно
     определена, уравнения всегда разрешимы относительно ускорений."""
     sys_ = WheeledPendulum()
-    thetas = np.linspace(-np.pi, np.pi, 401)
-    assert np.all(sys_.Delta(thetas) > 0.0)
+    psis = np.linspace(-np.pi, np.pi, 401)
+    assert np.all(sys_.Delta(psis) > 0.0)
 
 
 def test_tilt_dynamics_does_not_depend_on_wheel_state():
-    """Key_Formulas §1.4: phi -- циклическая координата, поэтому ddtheta и ddphi
-    не зависят ни от phi, ни от dphi (галилеева инвариантность идеального
+    """Key_Formulas §1.4: theta -- циклическая координата, поэтому ddpsi и ddtheta
+    не зависят ни от theta, ни от dtheta (галилеева инвариантность идеального
     качения).  Меняем колесо -- ускорения обязаны остаться теми же."""
     sys_ = WheeledPendulum()
     u = np.array([0.7])
     base = sys_.f(0.0, np.array([0.2, 0.0, 0.5, 0.0]), u)
-    for phi, dphi in [(3.0, 0.0), (0.0, 12.0), (-7.0, -4.0)]:
-        other = sys_.f(0.0, np.array([0.2, phi, 0.5, dphi]), u)
+    for theta, dtheta in [(3.0, 0.0), (0.0, 12.0), (-7.0, -4.0)]:
+        other = sys_.f(0.0, np.array([0.2, theta, 0.5, dtheta]), u)
         assert np.allclose(base[2:], other[2:])
 
 
@@ -59,7 +59,7 @@ def test_linearization_matches_finite_differences():
 
 def test_torque_sign_pushes_body_and_wheel_opposite_ways():
     """Момент мотора действует на корпус и колесо в противоположные стороны
-    (третий закон Ньютона): знаки ddtheta и ddphi от u должны быть разными."""
+    (третий закон Ньютона): знаки ddpsi и ddtheta от u должны быть разными."""
     sys_ = WheeledPendulum()
     dx = sys_.f(0.0, np.zeros(4), np.array([1.0]))
     assert dx[2] > 0.0
@@ -92,7 +92,7 @@ U_MAX = 3.0
 
 
 def test_saddle_angle_is_an_equilibrium():
-    """theta_eq определён как угол, где предельный момент ровно держит вес.
+    """psi_eq определён как угол, где предельный момент ровно держит вес.
     Оракул прямой: в этой точке ускорение наклона обязано быть нулём."""
     wp = WheeledPendulum()
     th = wp.saddle_angle(U_MAX)
@@ -124,7 +124,7 @@ def test_boundary_lies_on_the_separatrix_level():
 
 def test_sign_flip_past_the_saddle_keeps_the_tongues():
     """Граница -- устойчивое многообразие седла, а не просто линия уровня:
-    за theta_eq нужная ветвь имеет ОТРИЦАТЕЛЬНУЮ dtheta. Поэтому корпус,
+    за psi_eq нужная ветвь имеет ОТРИЦАТЕЛЬНУЮ dpsi. Поэтому корпус,
     наклонённый дальше седла, всё ещё восстановим, если качается назад."""
     wp = WheeledPendulum()
     th_eq = wp.saddle_angle(U_MAX)

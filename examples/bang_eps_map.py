@@ -1,25 +1,25 @@
-"""Реле сразу, передача ЛКР по |theta| < eps: какой ЛКР и какой eps.
+"""Реле сразу, передача ЛКР по |psi| < eps: какой ЛКР и какой eps.
 
 Запуск:  uv run --extra design python examples/bang_eps_map.py [--grid 31] [--horizon 30]
 
-Карта по соглашению проекта (CLAUDE.md, Глеб 17.09): интересен theta в
-[-pi/2, pi/2], сетка берётся с запасом 1.3 по обеим осям -- theta0 до
-±1.3·pi/2, dtheta0 до 1.3 от максимума множества восстановимости на
-[-pi/2, pi/2]; phi0 = dphi0 = 0. «Удержал» -- |theta|
-ни разу не достиг pi, «сошёлся» -- удержал и в конце |theta| < 0.05,
-|dtheta| < 0.1, |dphi| < 0.1. Потолок -- `is_recoverable` (A16).
+Карта по соглашению проекта (CLAUDE.md, Глеб 17.09): интересен psi в
+[-pi/2, pi/2], сетка берётся с запасом 1.3 по обеим осям -- psi0 до
+±1.3·pi/2, dpsi0 до 1.3 от максимума множества восстановимости на
+[-pi/2, pi/2]; theta0 = dtheta0 = 0. «Удержал» -- |psi|
+ни разу не достиг pi, «сошёлся» -- удержал и в конце |psi| < 0.05,
+|dpsi| < 0.1, |dtheta| < 0.1. Потолок -- `is_recoverable` (A16).
 
 Сравниваются три цены ЛКР, каждая сама по себе и после реле:
   base -- Q = diag(100, 1, 10, 1): ЛКР окна;
-  soft -- Q = diag(100, 1e-2, 10, 1e-2): гейны по phi, dphi снижены (bang-eps);
+  soft -- Q = diag(100, 1e-2, 10, 1e-2): гейны по theta, dtheta снижены (bang-eps);
   tilt -- `lqr_tilt`: колесо не в цене вовсе.
-Третья фаза (A27): реле -> |theta| < eps -> soft -> base, передача на base по
+Третья фаза (A27): реле -> |psi| < eps -> soft -> base, передача на base по
 сертифицированному эллипсоиду x^T P_base x <= c* (c* -- `certified_level` при
 том же u_max). Колонка «успокоился» -- медиана и 90-й процентиль момента, после
-которого состояние навсегда в |theta| < 0.05, |dtheta| < 0.1, |phi| < 0.5,
-|dphi| < 0.1 (по сошедшимся клеткам).
-Колонка dth@handover -- медиана и максимум |dtheta| в момент первого входа в
-полосу по восстановимым клеткам: полоса по одному theta скорость не проверяет.
+которого состояние навсегда в |psi| < 0.05, |dpsi| < 0.1, |theta| < 0.5,
+|dtheta| < 0.1 (по сошедшимся клеткам).
+Колонка dth@handover -- медиана и максимум |dpsi| в момент первого входа в
+полосу по восстановимым клеткам: полоса по одному psi скорость не проверяет.
 """
 
 import argparse
@@ -35,7 +35,7 @@ from wpend import (
     LinearFeedbackController,
     RK4Integrator,
     rollout_many,
-    theta_band_region,
+    psi_band_region,
 )
 from wpend import ellipsoid_region
 from wpend.lqr import certified_level, lqr, lqr_tilt
@@ -51,7 +51,7 @@ DT = 1e-3
 
 
 MAP_FIT = 1.3
-THETA_MAP = np.pi / 2
+PSI_MAP = np.pi / 2
 
 
 def gains(wp):
@@ -68,11 +68,11 @@ def gains(wp):
 
 
 def grid(wp, u_max, n):
-    th = np.linspace(-THETA_MAP, THETA_MAP, 401)
+    th = np.linspace(-PSI_MAP, PSI_MAP, 401)
     floor, ceiling = wp.recoverable_bounds(u_max, th)
     reach = np.abs(np.concatenate([floor, ceiling]))
     dth_max = MAP_FIT * float(reach[np.isfinite(reach)].max())
-    TH, DTH = np.meshgrid(np.linspace(-MAP_FIT * THETA_MAP, MAP_FIT * THETA_MAP, n),
+    TH, DTH = np.meshgrid(np.linspace(-MAP_FIT * PSI_MAP, MAP_FIT * PSI_MAP, n),
                           np.linspace(-dth_max, dth_max, n))
     X0 = np.zeros((n * n, 4))
     X0[:, 0], X0[:, 2] = TH.ravel(), DTH.ravel()
@@ -113,7 +113,7 @@ def main():
         wp = WheeledPendulum(u_max=u_max)
         K, P_base = gains(wp)
         c_base, _ = certified_level(wp, K["base"], P_base, u_max=u_max, n_dirs=1500,
-                                    ds=4e-3, s_max=8.0, theta_max=THETA_MAP, seed=0)
+                                    ds=4e-3, s_max=8.0, psi_max=PSI_MAP, seed=0)
         X0 = grid(wp, u_max, args.grid)
         rec = wp.is_recoverable(u_max, X0[:, 0], X0[:, 2])
         print(f"\nu_max = {u_max:g} Н·м: восстановимо {rec.sum()} из {len(X0)}, "
@@ -126,7 +126,7 @@ def main():
             tail = ""
             if eps is not None:
                 # stride прореживает запись, поэтому момент передачи -- с точностью
-                # до 20 шагов; для порядка величины |dtheta| этого хватает.
+                # до 20 шагов; для порядка величины |dpsi| этого хватает.
                 i = np.argmax(np.abs(b.x[:, :, 0]) < eps, axis=1)
                 dth = np.abs(b.x[np.arange(len(X0)), i, 2])[rec]
                 tail = f"   {np.median(dth):.2f} / {dth.max():.2f}"
@@ -137,9 +137,9 @@ def main():
         for eps in args.eps:
             for name in COSTS:
                 line(f"relay -> |th|<{eps:g} -> {name}",
-                     BangBangLQRController(K[name], u_max, theta_band_region(eps), wp), eps)
+                     BangBangLQRController(K[name], u_max, psi_band_region(eps), wp), eps)
             line(f"relay -> |th|<{eps:g} -> soft -> base",
-                 BangBangLQRController(K["soft"], u_max, theta_band_region(eps), wp,
+                 BangBangLQRController(K["soft"], u_max, psi_band_region(eps), wp,
                                        K_final=K["base"],
                                        final_region=ellipsoid_region(P_base, c_base)), eps)
 

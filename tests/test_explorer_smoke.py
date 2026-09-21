@@ -166,7 +166,7 @@ def test_estimator_row_changes_the_map_and_records_the_estimate():
             ["--grid", "9", "--horizon", "2.0", "--stride", "20",
              # Узкая карта прежнего умолчания (u_max = 3): на широкой стандартной
              # почти все клетки падают при любом оценивателе, и разницы не видно.
-             "--theta-max", "0.15", "--dtheta-max", "0.7",
+             "--psi-max", "0.15", "--dpsi-max", "0.7",
              "--main", "lqr", "--estimator", est]
         )
         app = Explorer(args)
@@ -255,14 +255,14 @@ def test_full_lqr_with_the_estimator_holds_what_ideal_holds_near_upright():
     def app_for(est):
         return Explorer(build_parser().parse_args(
             ["--grid", "5", "--horizon", "4.0", "--stride", "20", "--main", "lqr",
-             "--u-max", "10", "--theta-max", "0.15", "--dtheta-max", "0.3",
+             "--u-max", "10", "--psi-max", "0.15", "--dpsi-max", "0.3",
              "--estimator", est]))
 
     ideal, comp = app_for("ideal"), app_for("comp")
     held_ideal = ideal.outcome == HELD
     assert held_ideal.sum() > 0
     assert np.all(comp.outcome[held_ideal] == HELD)
-    err = np.abs(comp.traj.x_hat[:, 1] - comp.traj.x[:-1, 1])   # phi
+    err = np.abs(comp.traj.x_hat[:, 1] - comp.traj.x[:-1, 1])   # theta
     assert np.max(err[np.isfinite(err)]) < 0.1
 
 

@@ -1,7 +1,7 @@
 """Карта: MPC с пределом в планировщике (box-DDP) против «слепого» MPC и ЛКР.
 
 Сетка -- как в `examples/cost_sweep.py` (в 1.3 раза шире множества
-восстановимости), мир обрезает момент, «упал» -- |theta| >= 1.3 за 5 с.
+восстановимости), мир обрезает момент, «упал» -- |psi| >= 1.3 за 5 с.
 Цена -- пять весов, как в `lqr_cost_explorer`, Q_f = P своей цены.
 
     uv run python examples/box_mpc_map.py --u-max 10 --grid 11 --horizon-s 1 2
@@ -26,13 +26,13 @@ from wpend import LinearFeedbackController, MPCController, RK4Integrator, rollou
 from wpend.lqr import lqr
 from wpend.models import WheeledPendulum
 
-DT, T_SIM, THETA_FALL, MAP_FIT, DT_PLAN = 1e-3, 5.0, 1.3, 1.3, 0.02
+DT, T_SIM, PSI_FALL, MAP_FIT, DT_PLAN = 1e-3, 5.0, 1.3, 1.3, 0.02
 OUT = Path(__file__).resolve().parent / "results" / "box_mpc_map.npz"
 
 
 def grid(u_max, n):
     world = WheeledPendulum(u_max=u_max)
-    th_max = min(MAP_FIT * world.saddle_angle(u_max), 0.98 * THETA_FALL)
+    th_max = min(MAP_FIT * world.saddle_angle(u_max), 0.98 * PSI_FALL)
     _, ceil = world.recoverable_bounds(u_max, np.zeros(1))
     ths = np.linspace(-th_max, th_max, n)
     dths = np.linspace(-MAP_FIT * ceil[0], MAP_FIT * ceil[0], n)
@@ -53,7 +53,7 @@ def cell(job):
     ctrl = MPCController(planner, RK4Integrator(), DT_PLAN, steps, Q, R, P, K_init=K)
     traj = rollout(WheeledPendulum(u_max=u_max), ctrl, RK4Integrator(), x0, DT,
                    int(round(T_SIM / DT)))
-    return not (np.abs(traj.x[1:, 0]) >= THETA_FALL).any()
+    return not (np.abs(traj.x[1:, 0]) >= PSI_FALL).any()
 
 
 def main():
@@ -72,7 +72,7 @@ def main():
     K, _ = lqr(A, B, np.diag(args.q), np.array([[args.r]]))
     batch = rollout_many(WheeledPendulum(u_max=args.u_max), LinearFeedbackController(K),
                          RK4Integrator(), X0, DT, int(round(T_SIM / DT)), 10)
-    held = {"lqr": ~(np.abs(batch.x[:, 1:, 0]) >= THETA_FALL).any(axis=1)}
+    held = {"lqr": ~(np.abs(batch.x[:, 1:, 0]) >= PSI_FALL).any(axis=1)}
     print(f"u_max = {args.u_max}, Q = diag{tuple(args.q)}, R = {args.r}, сетка "
           f"{args.grid}x{args.grid}: восстановимо {rec.sum()}")
     print(f"  ЛКР + clip:                   удержан {held['lqr'].sum():3d}", flush=True)
