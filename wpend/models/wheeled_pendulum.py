@@ -125,6 +125,8 @@ class WheeledPendulum(System):
     # --- динамика ----------------------------------------------------------
 
     def f(self, t, x, u):
+        if np.ndim(x) == 1 and np.ndim(u) == 1:
+            return self._f1(x, u)
         # Индексы x[..., i], а не распаковка: так одна и та же формула считает
         # и одно состояние (4,), и пачку (M, 4) -- см. System.f.
         psi = x[..., 0]
@@ -145,9 +147,30 @@ class WheeledPendulum(System):
 
         return np.stack([dpsi, dtheta, ddpsi, ddtheta], axis=-1)
 
+    def _f1(self, x, u):
+        """f для одного состояния (4,) на float (docs/kalman_speed.md §3, S4).
+
+        Одна клетка звала f с массивами формы (4,): ~20 операций над
+        скалярами numpy и np.stack -- около 18 мкс на вызов, четыре вызова
+        на шаг RK4.  Здесь та же формула в том же порядке операций на float.
+        sin и cos -- те же np.sin/np.cos, квадраты -- умножением (numpy так и
+        считает x**2), поэтому результат совпадает с батч-формулой бит в бит
+        (оракул -- tests/test_accel_kalman.py)."""
+        p = self.p
+        psi, dpsi, dtheta = float(x[0]), float(x[2]), float(x[3])
+        torque = float(u[0])
+        s, c = float(np.sin(psi)), float(np.cos(psi))
+        al, be, ga, D = p.alpha, p.beta, p.gamma, p.D
+        be2 = be ** 2
+        Delta = al * ga - be2 * (c * c)
+        dp2 = dpsi * dpsi
+        ddpsi = ((ga + be * c) * torque + ga * D * s - be2 * s * c * dp2) / Delta
+        ddtheta = (al * be * s * dp2 - be * D * s * c - (al + be * c) * torque) / Delta
+        return np.array([dpsi, dtheta, ddpsi, ddtheta])
+
     # --- что видит акселерометр (физика датчика, а не датчик) ---------------
 
-    def specific_force(self, t, x, u, d: float = 0.0):
+    def specific_force(self, t, x, u, d: float = 0.0, w=None):
         """Удельная сила на датчике, стоящем на корпусе на выносе d от оси колеса.
 
         Акселерометр меряет НЕ ускорение, а удельную силу f = R^T (a - g_world):
@@ -177,6 +200,11 @@ class WheeledPendulum(System):
         Соглашение о пачках соблюдено: x формы (4,) или (M, 4), результат --
         пара массивов той же ведущей формы.
 
+        w -- необязательная внешняя обобщённая сила (w_psi, w_theta) формы
+        (..., 2): её вклад M^-1 w прибавляется к ускорениям.  Модель с
+        возмущением (DisturbedWheeledPendulum) её не передаёт -- у неё сила
+        уже внутри f; параметр нужен фильтру, который подставляет ОЦЕНКУ w.
+
         Источники: Groves, "Principles of GNSS, Inertial, and Multisensor
         Integrated Navigation Systems", 2-е изд., гл. 2.4 (удельная сила) и
         гл. 4.1; docs/Key_Formulas.md §1.3 (откуда ddpsi и ddtheta).
@@ -193,11 +221,213 @@ class WheeledPendulum(System):
         dpsi = x[..., 2]
         ddpsi = dx[..., 2]
         ddtheta = dx[..., 3]
+        if w is not None:
+            # Внешняя обобщённая сила (w_psi, w_theta): добавка к ускорениям
+            # M^-1 w.  Нужна фильтру, который оценивает возмущение и должен
+            # предсказать, что покажет датчик (docs/accel_kalman.md §8).
+            qdd = self.accel_from_force(psi, w)
+            ddpsi = ddpsi + qdd[..., 0]
+            ddtheta = ddtheta + qdd[..., 1]
         s, c = np.sin(psi), np.cos(psi)
         g, r = self.p.g, self.p.r
         f_x = -g * s + d * ddpsi + r * c * ddtheta
         f_z = g * c - d * dpsi ** 2 + r * s * ddtheta
         return f_x, f_z
+
+    # --- внешние обобщённые силы (ER-025, docs/accel_kalman.md §6.1) --------
+
+    def mass_matrix_inverse(self, psi):
+        """M(psi)^-1 формы (..., 2, 2), где M = [[alpha, beta c], [beta c, gamma]].
+
+        Нужна там, где на машину действует обобщённая сила w = (w_psi, w_theta)
+        помимо мотора: добавка к ускорениям равна M^-1 w (Key_Formulas §1.1).
+        Явная формула обращения 2x2, а не np.linalg.inv: так она сама
+        соблюдает соглашение о пачках и точна до округления.
+        """
+        psi = np.asarray(psi, dtype=float)
+        p = self.p
+        c = np.cos(psi)
+        Delta = p.alpha * p.gamma - p.beta ** 2 * c ** 2
+        row0 = np.stack([p.gamma / Delta, -p.beta * c / Delta], axis=-1)
+        row1 = np.stack([-p.beta * c / Delta, p.alpha / Delta], axis=-1)
+        return np.stack([row0, row1], axis=-2)
+
+    def accel_from_force(self, psi, w):
+        """Добавка к ускорениям (ddpsi, ddtheta) = M(psi)^-1 w, форма (..., 2).
+
+        То же, что mass_matrix_inverse(psi) @ w, но без сборки матрицы: эту
+        добавку модель с возмущением и фильтр считают по нескольку раз на
+        шаг для каждой клетки карты, и сборка 2x2 через np.stack стоила
+        дороже самого умножения (docs/explorer_kalman.md §10.1).
+        """
+        psi = np.asarray(psi, dtype=float)
+        w = np.asarray(w, dtype=float)
+        p = self.p
+        c = np.cos(psi)
+        Delta = p.alpha * p.gamma - p.beta ** 2 * c ** 2
+        w_psi, w_th = w[..., 0], w[..., 1]
+        return np.stack([(p.gamma * w_psi - p.beta * c * w_th) / Delta,
+                         (p.alpha * w_th - p.beta * c * w_psi) / Delta], axis=-1)
+
+    def _numerators(self, x, u, w):
+        """Числители N, R ускорений ddpsi = N/Delta, ddtheta = R/Delta
+        (Key_Formulas §2) с необязательной внешней силой w и их производные
+        по psi и dpsi.  Общая заготовка для jacobian и specific_force_jacobian.
+
+        С силой w числители получают (правило Крамера для M q'' = rhs):
+            N += gamma w_psi - beta c w_theta,
+            R += -beta c w_psi + alpha w_theta.
+        """
+        p = self.p
+        psi = x[..., 0]
+        dpsi = x[..., 2]
+        s, c = np.sin(psi), np.cos(psi)
+        torque = u[..., 0]
+        N = (p.gamma + p.beta * c) * torque + p.gamma * p.D * s - p.beta ** 2 * s * c * dpsi ** 2
+        R = p.alpha * p.beta * s * dpsi ** 2 - p.beta * p.D * s * c - (p.alpha + p.beta * c) * torque
+        # d/dpsi -- Key_Formulas §2: N_psi, R_psi
+        N_psi = -p.beta * s * torque + p.gamma * p.D * c - p.beta ** 2 * np.cos(2 * psi) * dpsi ** 2
+        R_psi = p.alpha * p.beta * c * dpsi ** 2 - p.beta * p.D * np.cos(2 * psi) + p.beta * s * torque
+        # d/d(dpsi) и d/du
+        N_dpsi = -2.0 * p.beta ** 2 * s * c * dpsi
+        R_dpsi = 2.0 * p.alpha * p.beta * s * dpsi
+        N_u = p.gamma + p.beta * c
+        R_u = -(p.alpha + p.beta * c)
+        if w is not None:
+            w = np.asarray(w, dtype=float)
+            w_psi, w_th = w[..., 0], w[..., 1]
+            N = N + p.gamma * w_psi - p.beta * c * w_th
+            R = R - p.beta * c * w_psi + p.alpha * w_th
+            N_psi = N_psi + p.beta * s * w_th
+            R_psi = R_psi + p.beta * s * w_psi
+        Delta = p.alpha * p.gamma - p.beta ** 2 * c ** 2
+        dDelta = p.beta ** 2 * np.sin(2 * psi)
+        return dict(N=N, R=R, N_psi=N_psi, R_psi=R_psi, N_dpsi=N_dpsi,
+                    R_dpsi=R_dpsi, N_u=N_u, R_u=R_u, Delta=Delta, dDelta=dDelta)
+
+    def jacobian(self, t, x, u, w=None):
+        """Аналитический якобиан поля: (A, B, G) = (df/dx, df/du, df/dw).
+
+        A формы (..., 4, 4), B -- (..., 4, 1), G -- (..., 4, 2).  Формулы --
+        Key_Formulas §2, §2.1: столбцы theta и dtheta нулевые (§1.4), ненулевые
+        элементы -- производные дробей N/Delta и R/Delta по правилу частного
+
+            d(N/Delta)/dpsi = (N_psi Delta - N Delta') / Delta^2,
+            Delta' = beta^2 sin(2 psi).
+
+        w -- необязательная внешняя обобщённая сила (w_psi, w_theta), в
+        которой линеаризуется поле; без неё w = 0.  G = [0; M(psi)^-1] от w
+        не зависит.  Нужен фильтру Калмана (прогноз ковариации) и якобиану
+        датчика (specific_force_jacobian).  Оракул -- конечные разности f,
+        tests/test_accel_kalman.py.
+        """
+        x = np.asarray(x, dtype=float)
+        u = np.atleast_1d(np.asarray(u, dtype=float))
+        k = self._numerators(x, u, w)
+        De, dDe = k["Delta"], k["dDelta"]
+        ddpsi_psi = (k["N_psi"] * De - k["N"] * dDe) / De ** 2
+        ddth_psi = (k["R_psi"] * De - k["R"] * dDe) / De ** 2
+        prefix = np.broadcast_shapes(x.shape[:-1], u.shape[:-1])
+        A = np.zeros(prefix + (4, 4))
+        A[..., 0, 2] = 1.0
+        A[..., 1, 3] = 1.0
+        A[..., 2, 0] = ddpsi_psi
+        A[..., 3, 0] = ddth_psi
+        A[..., 2, 2] = k["N_dpsi"] / De
+        A[..., 3, 2] = k["R_dpsi"] / De
+        B = np.zeros(prefix + (4, 1))
+        B[..., 2, 0] = k["N_u"] / De
+        B[..., 3, 0] = k["R_u"] / De
+        G = np.zeros(prefix + (4, 2))
+        G[..., 2:, :] = self.mass_matrix_inverse(x[..., 0])
+        return A, B, G
+
+    @property
+    def center_of_percussion(self) -> float:
+        """d* = alpha/(m_b l) -- центр качания корпуса относительно оси колеса.
+
+        Горизонтальный канал акселерометра на выносе d удовлетворяет ТОЧНОМУ
+        тождеству (docs/accel_kalman.md §3.2, из первого уравнения §1.1):
+
+            a_x = (u + w_psi)/(m_b l) - (d* - d) ddpsi.
+
+        В точке d = d* датчик видит только момент, а не состояние.
+        """
+        return self.p.alpha / (self.p.mb * self.p.l)
+
+    def specific_force_jacobian(self, t, x, u, d: float = 0.0, w=None):
+        """Якобиан удельной силы: (C, D_u, C_w) = d(f_x, f_z)/d(x, u, w).
+
+        C -- (..., 2, 4), D_u -- (..., 2, 1), C_w -- (..., 2, 2).  Это цепное
+        правило от кинематики датчика (specific_force)
+
+            f_x = -g s + d ddpsi + r c ddtheta,
+            f_z =  g c - d dpsi^2 + r s ddtheta,
+
+        где производные ddpsi, ddtheta -- строки 3 и 4 якобиана поля
+        (docs/accel_kalman.md §3.4).  По theta и dtheta производные нулевые.
+        """
+        x = np.asarray(x, dtype=float)
+        u = np.atleast_1d(np.asarray(u, dtype=float))
+        A, B, G = self.jacobian(t, x, u, w)
+        k = self._numerators(x, u, w)
+        ddth = k["R"] / k["Delta"]
+        psi, dpsi = x[..., 0], x[..., 2]
+        s, c = np.sin(psi), np.cos(psi)
+        g, r = self.p.g, self.p.r
+        C = np.zeros(A.shape[:-2] + (2, 4))
+        C[..., 0, 0] = -g * c + d * A[..., 2, 0] - r * s * ddth + r * c * A[..., 3, 0]
+        C[..., 0, 2] = d * A[..., 2, 2] + r * c * A[..., 3, 2]
+        C[..., 1, 0] = -g * s + r * c * ddth + r * s * A[..., 3, 0]
+        C[..., 1, 2] = -2.0 * d * dpsi + r * s * A[..., 3, 2]
+        Du = np.stack([d * B[..., 2, :] + r * c[..., None] * B[..., 3, :],
+                       r * s[..., None] * B[..., 3, :]], axis=-2)
+        Cw = np.stack([d * G[..., 2, :] + r * c[..., None] * G[..., 3, :],
+                       r * s[..., None] * G[..., 3, :]], axis=-2)
+        return C, Du, Cw
+
+    def specific_force_with_jacobian(self, t, x, u, d: float = 0.0, w=None):
+        """(f_x, f_z, C, D_u, C_w) за ОДИН расчёт числителей.
+
+        То же, что specific_force(..., w=w) и specific_force_jacobian вместе,
+        но N, R, Delta и их производные считаются один раз: фильтр Калмана
+        зовёт это на каждом шаге для каждой клетки карты, и тройной пересчёт
+        стоил ~8 % его времени (docs/explorer_kalman.md §10.1).  Оракул --
+        совпадение с двумя отдельными методами (tests/test_accel_kalman.py).
+        """
+        x = np.asarray(x, dtype=float)
+        u = np.atleast_1d(np.asarray(u, dtype=float))
+        p = self.p
+        k = self._numerators(x, u, w)
+        De, dDe = k["Delta"], k["dDelta"]
+        ddpsi = k["N"] / De
+        ddth = k["R"] / De
+        ddpsi_psi = (k["N_psi"] * De - k["N"] * dDe) / De ** 2
+        ddth_psi = (k["R_psi"] * De - k["R"] * dDe) / De ** 2
+        ddpsi_dpsi = k["N_dpsi"] / De
+        ddth_dpsi = k["R_dpsi"] / De
+        psi, dpsi = x[..., 0], x[..., 2]
+        s, c = np.sin(psi), np.cos(psi)
+        g, r = p.g, p.r
+        f_x = -g * s + d * ddpsi + r * c * ddth
+        f_z = g * c - d * dpsi ** 2 + r * s * ddth
+        prefix = f_x.shape
+        C = np.zeros(prefix + (2, 4))
+        C[..., 0, 0] = -g * c + d * ddpsi_psi - r * s * ddth + r * c * ddth_psi
+        C[..., 0, 2] = d * ddpsi_dpsi + r * c * ddth_dpsi
+        C[..., 1, 0] = -g * s + r * c * ddth + r * s * ddth_psi
+        C[..., 1, 2] = -2.0 * d * dpsi + r * s * ddth_dpsi
+        Du = np.zeros(prefix + (2, 1))
+        Du[..., 0, 0] = (d * k["N_u"] + r * c * k["R_u"]) / De
+        Du[..., 1, 0] = r * s * k["R_u"] / De
+        # d(ddpsi, ddtheta)/dw = M^-1 = [[gamma, -beta c], [-beta c, alpha]]/Delta
+        Mi00, Mi01, Mi11 = p.gamma / De, -p.beta * c / De, p.alpha / De
+        Cw = np.zeros(prefix + (2, 2))
+        Cw[..., 0, 0] = d * Mi00 + r * c * Mi01
+        Cw[..., 0, 1] = d * Mi01 + r * c * Mi11
+        Cw[..., 1, 0] = r * s * Mi01
+        Cw[..., 1, 1] = r * s * Mi11
+        return f_x, f_z, C, Du, Cw
 
     # --- оракулы для тестов и анализа --------------------------------------
 
@@ -223,6 +453,138 @@ class WheeledPendulum(System):
         return (0.5 * self.Delta(psi) * dpsi ** 2
                 - u_const * (p.gamma * psi + p.beta * np.sin(psi))
                 + p.gamma * p.D * np.cos(psi))
+
+    # --- полная энергия (Key_Formulas §4) -----------------------------------
+
+    @property
+    def E_upright(self) -> float:
+        """E в верхнем положении при нулевых скоростях: E* = D.
+
+        Именно к этому уровню качает энергетическое реле (ER-018).  Значение
+        равно D ровно потому, что из потенциала отброшена постоянная m_b g r
+        (см. `energy`): начало отсчёта выбрано так, чтобы уровень цели был
+        коротким выражением, а не суммой с нефизичным слагаемым.
+        """
+        return float(self.p.D)
+
+    def energy(self, x):
+        """E(x) = 1/2 alpha dpsi^2 + beta cos(psi) dpsi dtheta
+                  + 1/2 gamma dtheta^2 + D cos(psi)      (Key_Formulas §4).
+
+        Полная механическая энергия машины.  Постоянная m_b g r из потенциала
+        отброшена: на динамику она не влияет, а уровень верхнего положения при
+        этом равен ровно D (`E_upright`).
+
+        Оракул, НЕЗАВИСИМЫЙ от H.  При u = 0 система консервативна, dE/dt = 0;
+        при постоянном u != 0 сохраняется H (§3), но НЕ E.  Две величины ловят
+        разные ошибки в правой части: H слепа к колесу (его координаты в неё
+        не входят вовсе), E видит и наклон, и колесо, и перекрёстный член.
+
+        theta в E не входит -- та же цикличность, что в §1.4: энергия не
+        зависит от того, ГДЕ стоит колесо, только от того, как быстро оно
+        крутится.
+
+        Соглашение о пачках (A8): x формы (4,) или (M, 4).
+        """
+        x = np.asarray(x, dtype=float)
+        psi, dpsi, dtheta = x[..., 0], x[..., 2], x[..., 3]
+        p = self.p
+        return (0.5 * p.alpha * dpsi ** 2
+                + p.beta * np.cos(psi) * dpsi * dtheta
+                + 0.5 * p.gamma * dtheta ** 2
+                + p.D * np.cos(psi))
+
+    def wheel_momentum(self, x):
+        """p_theta = dT/d(dtheta) = beta cos(psi) dpsi + gamma dtheta.
+
+        Обобщённый импульс колеса.  Нужен ради ТОЧНОГО разложения (§4.2)
+
+            E = H(psi, dpsi; 0) / gamma + p_theta^2 / (2 gamma),
+
+        которое и объясняет, чем накачка по E отличается от слежения за H:
+        при p_theta != 0 один и тот же уровень E набирается при МЕНЬШЕЙ H,
+        то есть часть энергии крутит колесо, а не поднимает корпус.  Формула
+        живёт в модели, как `first_integral` (A7) и `specific_force` (A21):
+        это свойство машины, а не регулятора.
+
+        При u = 0 сохраняется (theta циклична, §1.4); при u != 0 выполняется
+        dp_theta/dt = -u -- второе уравнение §1.1, записанное как теорема об
+        изменении импульса.
+        """
+        x = np.asarray(x, dtype=float)
+        psi, dpsi, dtheta = x[..., 0], x[..., 2], x[..., 3]
+        p = self.p
+        return p.beta * np.cos(psi) * dpsi + p.gamma * dtheta
+
+    def power(self, x, u):
+        """dE/dt = u (dpsi - dtheta) -- мощность, вводимая мотором (§4.1).
+
+        Момент приложен МЕЖДУ корпусом и колесом (Q_psi = u, Q_theta = -u),
+        поэтому в мощность входит ОТНОСИТЕЛЬНАЯ скорость, а не скорость
+        наклона.  Практическое следствие, на котором стоит энергетическое
+        реле: при dpsi = dtheta мотор не вводит энергии ВОВСЕ, каким бы ни был
+        момент, и знак закона накачки в этом месте не определён -- см.
+        `EnergyBangBangController`.
+
+        u -- скаляр либо массив, транслируемый на ведущую форму x (как у
+        `first_integral`): у релейного закона знак момента свой в каждой
+        строке пачки.
+
+        Оракул: конечная разность E вдоль прогона совпадает с этой формулой
+        (tests/test_energy_bang.py).
+        """
+        x = np.asarray(x, dtype=float)
+        dpsi, dtheta = x[..., 2], x[..., 3]
+        return np.asarray(u, dtype=float) * (dpsi - dtheta)
+
+    def tilt_energy(self, x):
+        """E_psi(x) = H(psi, dpsi; 0) / gamma = 1/2 (Delta(psi)/gamma) dpsi^2 + D cos psi.
+
+        Энергия ПРИВЕДЁННОЙ динамики наклона -- то, что остаётся от полной
+        энергии, если отдать колесу его долю (Key_Formulas §4.2):
+
+            E_psi = E - p_theta^2 / (2 gamma) .
+
+        Уровень верхнего положения у неё ТОТ ЖЕ, что у полной энергии:
+        E_psi(0, *, 0, *) = D = `E_upright`. Разница в том, ЧТО именно
+        считается: `energy` спрашивает «сколько энергии в машине», а
+        `tilt_energy` -- «сколько её досталось корпусу». Поскольку
+        p_theta^2/(2 gamma) >= 0, всегда E_psi <= E, и равенство только при
+        нулевом импульсе колеса.
+
+        Это НЕ новая величина: H -- первый интеграл §3, по уровням которого
+        построен сепаратрисный закон. Деление на gamma сделано ради того,
+        чтобы промах по энергии мерился в тех же джоулях, что у `energy`, и
+        eps_E у обоих значил одно и то же.
+        """
+        return self.first_integral(x, 0.0) / self.p.gamma
+
+    def tilt_power(self, x, u):
+        """dE_psi/dt = b(psi) u dpsi / gamma,  b(psi) = gamma + beta cos(psi).
+
+        Баланс мощности ПРИВЕДЁННОЙ динамики -- вывод в Key_Formulas §4.3.
+        Главное отличие от `power`: скорости колеса здесь НЕТ ВООБЩЕ. Мотор
+        толкает колесо, колесо через инерционную связь толкает корпус, и с
+        точки зрения наклона всё это сводится к множителю b(psi).
+
+        ЛОВУШКА: b(psi) МЕНЯЕТ ЗНАК. При параметрах по умолчанию
+        (gamma = 1.053, beta = 3) это происходит на |psi| = arccos(-gamma/beta)
+        = 1.929 рад, то есть ВНУТРИ стандартной карты (|psi| до 2.04). За этим
+        углом тот же момент качает наклон в другую сторону: корпус завален
+        так далеко, что отталкивание колеса назад роняет его вперёд. Закон,
+        который смотрит только на знак dpsi, за этой границей работает
+        наоборот -- поэтому знак берётся у произведения b(psi) dpsi, а не у
+        одной скорости.
+
+        u -- скаляр либо массив, транслируемый на ведущую форму x (как у
+        `first_integral` и `power`).
+
+        Оракул: конечная разность tilt_energy вдоль прогона с постоянным u
+        совпадает с этой формулой со вторым порядком (измерено 2.0).
+        """
+        x = np.asarray(x, dtype=float)
+        psi, dpsi = x[..., 0], x[..., 2]
+        return np.asarray(u, dtype=float) * self.b(psi) * dpsi / self.p.gamma
 
     # --- множество восстановимости (Key_Formulas §3.2) ----------------------
     #

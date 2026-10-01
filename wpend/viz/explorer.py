@@ -13,7 +13,33 @@
 Управление: клик по клетке -- проиграть её траекторию; кнопки сверху либо
 1..8 (основной) и Shift+1..8 (сравнение, Shift+0 -- выключить); слайдер u_max
 или клавиши [ и ]; кнопка settings или S -- панель цен ЛКР (Q, R), eps и
-горизонта; кнопка noise или N -- панель корреляций каналов ИДУ; ПРОБЕЛ -- пауза; R -- сначала; Esc -- выход.
+горизонта; кнопка noise или N -- панель корреляций каналов ИДУ; кнопка switch
+или C -- показать / спрятать кривую переключения реле sigma = 0 на карте
+(линия уровня первого интеграла через (0, 0)); ПРОБЕЛ -- пауза; R -- сначала;
+Esc -- выход.
+
+Мир, модель и фильтр Калмана (ER-025, docs/explorer_kalman.md): W или кнопка
+`world` -- чистый мир / ветер (DisturbedWheeledPendulum); M или `model` --
+физика мира и номинала (что знают регулятор и фильтр) и параметры ветра;
+K или `kalman` -- чип (калиброванный / сырой MPU-6050), априор смещений
+(code / калибровка на подставке), модель толчка в фильтре; P или `[P] u | w`
+-- нижний график: момент или толчок (истина против оценки kalman+enc).
+Виды фильтра (docs/kalman_views.md): V или `[V] P ellipse` -- ошибка
+(psi, dpsi) и эллипс 1 sigma по P; H или `[H] y vs h(x,u)` -- показания и
+предсказание фильтра против чистого h(x, u).  Вид закрывает правую половину,
+карта и дорожка времени остаются.
+В окне две модели: app.world -- что происходит (прогон, датчики, граница
+восстановимости, карта), app.system -- что знает проект (K, P, c*, реле,
+фильтры).  По умолчанию это один объект.
+
+Время выбирается дорожкой под графиками (ER-015). Она не перематывает прогон,
+а выбирает кадр УЖЕ посчитанной траектории, и на этот кадр смотрят сразу все
+панели: карта, робот, оба графика и обе сравниваемые системы. Схваченная ручка
+останавливает воспроизведение и держит кадр, пока не нажмут ПРОБЕЛ; стрелки
+<- и -> двигают ровно на кадр, с Shift -- на десять. Каждая панель подписана
+легендой теми же цветами, какими нарисованы кривые: без неё картинку читает
+только тот, кто писал код. Панель V = x^T P x убрана (решение Глеба 21.09):
+в логарифмической шкале три кривые и два уровня не читались.
 
 Раскладка окна -- фиксированные 1280x940 (см. W, H и прямоугольники ниже).
 Если экран меньше, окно не перевёрстывается, а ужимается целиком: рисунок
@@ -49,17 +75,23 @@ import numpy as np
 
 from ..controller import (
     BangBangLQRController,
+    EnergyBangBangController,
     LinearFeedbackController,
+    all_regions,
     ellipsoid_region,
-    grid_region,
+    energy_band_region,
     psi_band_region,
 )
-from ..estimator import ComplementaryEstimator, optimal_tau
+from ..estimator import (ComplementaryEstimator, KalmanEstimator, calibrate_on_stand,
+                         optimal_tau)
 from ..integrator import RK4Integrator
-from ..models import WheeledPendulum
+from ..models import DisturbedWheeledPendulum, WheeledPendulum, WheeledPendulumParams
 from ..rollout import rollout_many
-from ..sensor import EncoderSensor, IMUSensor, StackedSensor
+from ..sensor import (MPU6050_RAW_B0, EncoderSensor, IMUSensor, StackedSensor,
+                      draw_turn_on_bias)
 from .grid import FELL_BACKWARD, FELL_FORWARD, HELD, GridSpec, classify
+from .phases import (PHASE_BANG, PHASE_FINAL, PHASE_LABEL, PHASE_LQR,
+                     track_line, track_summary)
 
 # ЛКР для линеаризации в верхнем положении, Q = diag(100, 1, 10, 1), R = 1.
 # Синтез (wpend.lqr.lqr) требует scipy и вызывается только при старте окна;
@@ -77,6 +109,17 @@ NOISE_Y = 156                       # ряд слайдеров датчика �
 MAP = (56, 214, 568, 632)           # x, y, w, h
 ANIM = (656, 214, 600, 316)
 PLOT = (656, 546, 600, 300)
+#: Дорожка времени и подписи под ней живут ВНУТРИ PLOT, см. plot_layout.
+TIME_H = 14
+TIME_LABEL_H = 18
+#: Дорожка фаз (ER-016) -- между графиком u и дорожкой времени. Высота на три
+#: строки: основной регулятор и до двух призраков; одна строка тоньше 5 px
+#: уже не читается, отсюда 18.
+PHASE_H = 18
+#: Легенда карты -- две строки под ней. Верхняя принадлежит задаче (цвета
+#: исходов, граница восстановимости), нижняя -- нажатым кнопкам.
+LEGEND_Y = 870
+LEGEND_ROW = 22
 
 #: Слайдеры датчика и фильтра: ключ, подпись, границы, логарифмическая ли
 #: шкала, формат.  Шум задаётся ПЛОТНОСТЬЮ и меняется на порядки, поэтому
@@ -101,23 +144,33 @@ U_MIN, U_MAX, U_STEP = 0.25, 10.0, 0.25
 #: переключается по сепаратрисе при том же пределе. Без предела не определено
 #: ни то, ни другое, поэтому окно их отключает -- как отключает эллипсоид без
 #: scipy: кнопка перечёркнута, и рядом написано, чего не хватает.
-RELAY_KEYS = ("bang", "bang-ell", "bang-ell-theta", "bang-tilt", "bang-map",
-              "bang-eps", "bang-eps-ell")
+RELAY_KEYS = ("bang-eps-ell", "bang-energy-ell")
 
-#: Цена ЛКР второй фазы у `bang-eps`: веса колеса в сто раз меньше базовых.
-#: Замер (PROPOSALS.md A26, карта 31x31, psi +-pi/2): с этой ценой и ЛКР, и
-#: реле -> |psi| < eps -> ЛКР удерживают всё восстановимое при u_max = 1.5, 3, 10;
-#: с базовой ценой реле -> eps теряет 4 и 10 клеток при 3 и 10 Н*м.
-Q_SOFT_WHEEL = np.diag([100.0, 1e-2, 10.0, 1e-2])
+#: Цена ЛКР второй фазы у `bang-eps`, R = 250 (ER-017, A38; прежняя --
+#: diag(100, 1e-2, 10, 1e-2) при R = 1, A26). Прежняя держала всё
+#: восстановимое только на карте +-pi/2; на стандартной карте с запасом 1.3
+#: при слабом моторе мягкий ЛКР после передачи упирался в предел и выносил
+#: состояние за сепаратрису: 9 из 27 клеток при 1.5 Н*м, 53 из 57 при 3.
+#: Почему R: при R >> q_psi гейны по наклону почти не меняются (58 -> 52,
+#: полюса наклона -- зеркало неустойчивых), а гейн по скорости колеса
+#: падает 0.53 -> 0.14; именно его доля момента и не помещалась в предел.
+#: Остаётся одна ручка -- отношение q_theta / R: оно задаёт медленную пару
+#: полюсов колеса. q_theta = 2e-2 -- наибольшее из проверенных, при котором
+#: реле -> |psi| < 0.05 -> soft держит 100% восстановимого при u_max =
+#: 1, 1.5, 2, 3, 5, 10 (карта 31x31, 30 с; при 1 и 1.5 ещё и 61x61);
+#: 3e-2 уже теряет 2 из 91 при 1 Н*м. Цена -- колесо: медленный полюс -0.065
+#: против -0.216, колесо возвращается за ~45 с вместо ~15.
+Q_SOFT_WHEEL = np.diag([100.0, 2e-2, 10.0, 1e-2])
+R_SOFT = 250.0
 
 #: Цены ЛКР, с которыми окно стартует: (q_psi, q_theta, q_dpsi, q_dtheta, R).
 #: Панель настроек (кнопка `settings`, клавиша S) меняет КОПИЮ -- app.cost, --
 #: а эти числа остаются опорой: кнопка `defaults` возвращает ровно их.
-#: base -- K для `lqr`, `bang-ell*`, `bang-map` и третьей фазы `bang-eps-ell`;
-#: soft -- K второй фазы `bang-eps*`. ЛКР наклона (`bang-tilt`) панель не трогает.
+#: base -- K для `lqr` и третьей фазы обеих релейных схем;
+#: soft -- K второй фазы обеих релейных схем.
 DEFAULT_COST = {
     "base": (100.0, 1.0, 10.0, 1.0, 1.0),
-    "soft": (100.0, 1e-2, 10.0, 1e-2, 1.0),
+    "soft": tuple(float(q) for q in np.diag(Q_SOFT_WHEEL)) + (R_SOFT,),
 }
 COST_LABELS = ("q_psi", "q_theta", "q_dpsi", "q_dtheta", "R")
 
@@ -138,6 +191,24 @@ TEXT = (216, 219, 224)
 DIM = (140, 146, 156)
 ACCENT = (240, 198, 92)
 CURVE = (245, 247, 250)
+#: Направляющие на графиках (psi_fall, +-u_max) и их подписи в легенде. Были
+#: почти чёрными (70, 60, 50): саму линию на панели видно, а подпись её
+#: цветом -- уже нет, и легенда получилась бы нечитаемой ровно там, где она
+#: и нужна.
+GUIDE = (152, 134, 102)
+#: Цвета кривых графиков. Вынесены из draw_plots: их называет легенда, и
+#: разойтись рисунку с расшифровкой нельзя.
+PSI_CURVE = (120, 180, 240)
+U_CURVE = (240, 170, 110)
+#: Цвета дорожки фаз (ER-016). Красный конец -- реле: мотор выжат в упор;
+#: синий -- ЛКР после передачи; зелёный -- третья фаза, сертифицированный
+#: эллипсоид. Цвета нарочно не совпадают с цветами кривых: полоса отвечает на
+#: другой вопрос -- не «сколько», а «кто сейчас рулит».
+PHASE_COLOR = {
+    PHASE_BANG: (198, 112, 72),
+    PHASE_LQR: (72, 140, 200),
+    PHASE_FINAL: (110, 200, 160),
+}
 
 # Сравнение всюду рисуется этим цветом и этой прозрачностью -- один цвет на
 # все три панели, чтобы глаз связывал призрака робота, вторую фазовую кривую и
@@ -145,6 +216,10 @@ CURVE = (245, 247, 250)
 GHOST = (104, 214, 200)
 GHOST_A = 132
 LIMIT = (170, 255, 120)     # граница восстановимости -- свойство системы
+#: Кривая переключения реле sigma = 0 (кнопка `switch`, клавиша C). Цвет --
+#: родственник красного конца дорожки фаз (реле), но ярче: кривая лежит
+#: поверх карты и должна читаться и на синем, и на красном фоне.
+SWITCH = (255, 150, 70)
 #: Оценка состояния. Свой цвет, не GHOST: призрак -- это ДРУГОЙ регулятор на
 #: той же истине, а оценка -- то же самое состояние, увиденное фильтром.
 #: Путать эти две вещи одним цветом было бы хуже, чем не рисовать вовсе.
@@ -200,6 +275,44 @@ DEFAULT_CORR = {m: (0.0, 0.0, 0.0) for m, _, _ in CORR_MATRICES}
 #: Порядок обхода по Tab: матрица за матрицей (столбец за столбцом панели).
 NOISE_KEYS = [f"{m}.{i}" for m, _, _ in CORR_MATRICES for i in range(len(CORR_PAIRS))]
 NOISE_PANEL = (300, 190, 680, 400)  # панель шума: x, y, w, h
+
+
+# ---------------------------------------------------------------------------
+#  Мир, номинал и фильтр Калмана (ER-025, docs/explorer_kalman.md)
+# ---------------------------------------------------------------------------
+#  В окне ДВЕ модели: app.world -- что происходит (по ней идёт прогон, её
+#  чувствуют датчики, от неё граница восстановимости и карта), app.system --
+#  что знает проект (K, P, c*, реле, прогноз фильтров).  По умолчанию это
+#  один и тот же объект, и окно бит в бит прежнее.
+
+#: Физика машины по умолчанию -- поля WheeledPendulumParams.
+PHYS_KEYS = ("mb", "mw", "l", "r")
+DEFAULT_PHYS = {k: float(getattr(WheeledPendulumParams(), k)) for k in PHYS_KEYS}
+#: Ветер (DisturbedWheeledPendulum): установившееся СКО по каналам, время
+#: корреляции, зерно.  Решение Глеба 30.09: всё настраиваемое.
+DEFAULT_WIND = {"sigma_psi": 0.3, "sigma_theta": 0.3, "tau_w": 0.2, "seed": 7.0}
+#: Фильтр Калмана и процедура запуска: чип (свойство мира), априор смещений,
+#: стоянка, уход, модель возмущения в фильтре, q_acc, итерации.
+#: q_acc = 1e-4 рад/с^2/sqrt(Гц), а не 0 (решение Глеба 01.10, kalman_views §17.1):
+#: при Q = 0 блок P по (psi, dpsi) вырождается в отрезок и фильтр самоуверен.
+DEFAULT_KF = {"chip": "calibrated", "prior": "code", "T_c": 1.0, "sigma_jig": 1e-2,
+              "drift": "off", "w_model": "matched", "sigma_psi": 0.3,
+              "sigma_theta": 0.3, "tau_w": 0.2, "q_acc": 1e-4, "iterations": 1.0}
+KF_CHOICES = {"chip": ("calibrated", "raw"), "prior": ("code", "calibrate"),
+              "drift": ("off", "on"), "w_model": ("off", "matched", "own")}
+#: Цвет истинного толчка на графике `w`.
+WIND = (200, 200, 120)
+#: Панель model (клавиша M): поля в порядке обхода по Tab.
+MODEL_KEYS = ([f"world.{k}" for k in PHYS_KEYS] + [f"nominal.{k}" for k in PHYS_KEYS]
+              + [f"wind.{k}" for k in DEFAULT_WIND])
+MODEL_PANEL = (300, 170, 680, 540)
+#: Панель kalman (клавиша K): числовые поля; выборы -- кнопками.
+KF_FIELDS = ("T_c", "sigma_jig", "sigma_psi", "sigma_theta", "tau_w", "q_acc",
+             "iterations")
+KF_LABELS = {"T_c": "stand T_c, s", "sigma_jig": "stand sigma_jig, rad",
+             "sigma_psi": "own w: sigma_psi", "sigma_theta": "own w: sigma_theta",
+             "tau_w": "own w: tau_w, s", "q_acc": "q_acc", "iterations": "iterations"}
+KF_PANEL = (300, 170, 680, 460)
 
 
 def corr_matrix(rho):
@@ -272,49 +385,48 @@ def _shade(color, factor):
 #  сепаратрисе и оба предиката региона живут в wpend/controller.py, синтез K, P
 #  и уровня c* -- в wpend/lqr.py. Окно только выбирает.
 
-def _never(x):
-    """Регион, в который нельзя войти: изолирует чистую релейную фазу."""
-    return np.zeros(np.shape(x)[:-1], dtype=bool)
+def _energy_region(app):
+    """Критерий передачи энергетической схемы: энергия на уровне И корпус в
+    полосе. Собирается здесь, а не в лямбде ниже: два экземпляра одного
+    условия разъехались бы при первой же правке."""
+    return all_regions(
+        energy_band_region(app.system, app.args.eps_e, energy=app.args.energy),
+        psi_band_region(app.args.eps))
 
 
+#: Три варианта, а не десять (решение Глеба 24.09). Раньше окно предлагало
+#: восемь релейных схем -- следы поиска: реле с эллипсоидом, с привязкой
+#: колеса, с ЛКР наклона, с картой, двухфазные версии. Поиск кончился, и
+#: держать их на кнопках значит держать на экране вопросы, на которые уже
+#: ответили (числа -- PROPOSALS.md A26, A27, §B8). Осталось ровно то, что
+#: сравнивают сейчас: две трёхфазные схемы, различающиеся ПЕРВОЙ фазой и
+#: критерием передачи, и чистый ЛКР как база.
+#:
+#: ЛКР держим не из осторожности, а потому что он нужен по существу: это
+#: ответ на вопрос «что было бы без первой фазы вообще», и это единственный
+#: вариант, который работает и без scipy, и при снятом пределе момента
+#: (кнопка `no limit`) -- туда окно откатывает выбор, когда реле недоступно.
 CONTROLLERS = [
     ("lqr", "LQR",
      lambda app: LinearFeedbackController(app.K)),
-    ("bang", "bang-bang",
-     lambda app: BangBangLQRController(app.K, app.u_max, _never, app.system)),
-    ("bang-ell", "bang -> ell",
-     lambda app: BangBangLQRController(app.K, app.u_max,
-                                       ellipsoid_region(app.P, app.c_star),
-                                       app.system)),
-    ("bang-ell-theta", "bang -> ell+theta",
-     lambda app: BangBangLQRController(app.K, app.u_max,
-                                       ellipsoid_region(app.P, app.c_star),
-                                       app.system, wheel_ref=True)),
-    ("bang-tilt", "bang -> tilt",
-     lambda app: BangBangLQRController(app.K_tilt, app.u_max,
-                                       ellipsoid_region(app.P_tilt, app.c_tilt),
-                                       app.system)),
-    ("bang-map", "bang -> map",
-     lambda app: BangBangLQRController(app.K, app.u_max,
-                                       grid_region(app.lqr_mask(), app.spec.psis,
-                                                   app.spec.dpsis),
-                                       app.system)),
-    # Реле сразу, передача по |psi| < eps (eps -- --eps), дальше ЛКР с
-    # пониженными гейнами по theta, dtheta. Критерий без сертификата, поэтому
-    # K_soft, а не K: базовый ЛКР после такой передачи роняет корпус чаще.
-    ("bang-eps", "bang -> eps",
-     lambda app: BangBangLQRController(app.K_soft, app.u_max,
-                                       psi_band_region(app.args.eps),
-                                       app.system)),
-    # То же, плюс третья фаза (A27): мягкий ЛКР отдаёт управление базовому K,
-    # когда состояние входит в ЕГО сертифицированный эллипсоид x^T P x <= c*.
-    # c* окно и так пересчитывает под текущий u_max (_certify), поэтому пара
-    # «критерий + регулятор» здесь честная.
+    # Реле по сепаратрисе -> |psi| < eps -> мягкий ЛКР -> базовый ЛКР по его
+    # сертифицированному эллипсоиду (A26, A27).
     ("bang-eps-ell", "bang -> eps -> ell",
      lambda app: BangBangLQRController(app.K_soft, app.u_max,
                                        psi_band_region(app.args.eps),
                                        app.system, K_final=app.K,
                                        final_region=ellipsoid_region(app.P, app.c_star))),
+    # То же, но первая фаза качает энергию к уровню верхнего положения, а
+    # передача идёт по КОНЪЮНКЦИИ «энергия на уровне И корпус в полосе»
+    # (ER-018, решение Глеба 22.09). Какую энергию -- задаёт --energy:
+    # "tilt" (по умолчанию) -- энергию приведённой динамики наклона,
+    # "total" -- полную энергию машины. Замер 22.09: tilt держит 9 / 55 / 153
+    # клетки при 1.5 / 3 / 10 Н*м, total -- 1 / 3 / 11, сепаратриса -- 9 / 53 / 173.
+    ("bang-energy-ell", "bang-energy -> ell",
+     lambda app: EnergyBangBangController(
+         app.K_soft, app.u_max, _energy_region(app), app.system,
+         energy=app.args.energy, K_final=app.K,
+         final_region=ellipsoid_region(app.P, app.c_star))),
 ]
 CONTROLLER_KEYS = [key for key, _, _ in CONTROLLERS]
 CONTROLLER_LABEL = {key: label for key, label, _ in CONTROLLERS}
@@ -343,26 +455,162 @@ CONTROLLER_BUILD = {key: build for key, _, build in CONTROLLERS}
 IMU_D = 0.20
 
 
-def _imu(app):
-    return IMUSensor(app.system, dt=app.args.dt, mode="imu", seed=app.args.seed, d=IMU_D,
-                     sigma_g=app.noise["sigma_g"], sigma_a=app.noise["sigma_a"],
-                     b0_g=app.noise["b0_g"], b0_a=app.noise["b0_g"] * 9.8,
-                     **{name: corr_matrix(app.corr[m]) for m, _, name in CORR_MATRICES})
+class _BiasTap:
+    """Обёртка датчика для видов фильтра: запоминает настоящее смещение ИДУ
+    на каждом отсчёте (IMUSensor.bias -- величина, которая есть только в
+    симуляции).  Только для диагностического пересчёта клетки."""
+
+    def __init__(self, sensor):
+        self.sensor = sensor
+        self.imu = sensor.sensors[0]
+        self.biases = []
+
+    def reset(self):
+        self.sensor.reset()
+        self.biases = []
+
+    def measure(self, t, x, u_prev=None):
+        y = self.sensor.measure(t, x, u_prev)
+        self.biases.append(self.imu.bias)
+        return y
 
 
-def _imu_enc(app):
+class _NeesTap:
+    """Обёртка оценивателя ПАЧКИ: после шага считает NEES смещений по каждой
+    клетке и хранит среднее по клеткам (kalman_speed §6.2, решение Глеба 01.10).
+
+        eps_m = e_m^T P_bb,m^-1 e_m,   e_m = b^_m - b_m,
+
+    у честного фильтра eps ~ chi^2_3, среднее по M клеткам ~ 3.  Настоящее
+    смещение берётся у датчика пачки (IMUSensor.bias -- только в симуляции),
+    сразу после estimate: датчик только что отдал отсчёт этого шага.
+    P всех клеток не хранится -- одно число на шаг.  Считается каждый
+    every-й шаг (как кадры пачки): решение 3x3 на клетку не бесплатно."""
+
+    def __init__(self, est, imu, every=1):
+        self.est, self.imu, self.every = est, imu, max(1, int(every))
+        self.t, self.mean, self.count, self.wild = [], [], [], []
+        self._k = 0
+
+    def __getattr__(self, name):                 # aux, state, ... -- от фильтра
+        return getattr(self.est, name)
+
+    def reset(self, y0=None):
+        self.est.reset(y0)
+        self.t, self.mean, self.count, self.wild = [], [], [], []
+        self._k = 0
+
+    def estimate(self, t, y, u_prev):
+        x = self.est.estimate(t, y, u_prev)
+        if self._k % self.every == 0:
+            self._record(t)
+        self._k += 1
+        return x
+
+    def _record(self, t):
+        est = self.est
+        ib = est._ib
+        P = est.covariance.reshape(-1, est.n, est.n)[:, ib][:, :, ib]
+        e = est.aux["b_hat"].reshape(-1, 3) - np.asarray(self.imu.bias).reshape(-1, 3)
+        with np.errstate(all="ignore"):
+            try:
+                eps = np.einsum("mi,mi->m", e, np.linalg.solve(P, e[..., None])[..., 0])
+            except np.linalg.LinAlgError:
+                eps = np.full(len(e), np.nan)
+        ok = np.isfinite(eps)
+        self.t.append(float(t))
+        self.mean.append(float(eps[ok].mean()) if ok.any() else np.nan)
+        self.count.append(int(ok.sum()))
+        # Клетки, где eps выше квантиля 0.999 chi^2_3: у честного фильтра их
+        # ~0.1 %.  Среднее одно их не покажет -- оно просто улетит.
+        self.wild.append(int(np.sum(eps[ok] > NEES_WILD)))
+
+    def result(self) -> dict:
+        return {"t": np.array(self.t), "mean": np.array(self.mean),
+                "count": np.array(self.count), "wild": np.array(self.wild)}
+
+
+#: Квантиль 0.999 распределения chi^2_3: выше -- клетка «дикая».
+NEES_WILD = 16.27
+
+
+def _chi2_mean_band(dof, M, z=1.96):
+    """Коридор 95 % для среднего M независимых chi^2_dof: квантили chi^2_{dof M},
+    делённые на M.  Квантиль -- приближение Уилсона--Хилферти
+    nu (1 - 2/(9 nu) + z sqrt(2/(9 nu)))^3: при nu ~ 10^3 ошибка ~1e-4,
+    и scipy окну не нужен."""
+    nu = np.maximum(dof * np.asarray(M, float), 1.0)
+    a = 2.0 / (9.0 * nu)
+    return (nu * (1 - a - z * np.sqrt(a)) ** 3 / np.maximum(M, 1),
+            nu * (1 - a + z * np.sqrt(a)) ** 3 / np.maximum(M, 1))
+
+
+def _imu_params(app) -> dict:
+    """Параметры ИДУ окна -- ОДНИ для датчика прогона и для подставки
+    калибровки (calibrate_on_stand): разойдясь, калибровка мерила бы другой
+    датчик."""
+    return dict(dt=app.args.dt, d=IMU_D,
+                sigma_g=app.noise["sigma_g"], sigma_a=app.noise["sigma_a"],
+                b0_g=app.noise["b0_g"], b0_a=app.noise["b0_g"] * 9.8,
+                **{name: corr_matrix(app.corr[m]) for m, _, name in CORR_MATRICES})
+
+
+#  Фабрики получают (app, rows): rows -- номера клеток карты, которые идут
+#  строками пачки (None -- вся карта).  Ветер и чип у клетки m ОДНИ И ТЕ ЖЕ и
+#  в пачке, и в отдельном пересчёте (решение Глеба 30.09: у сравниваемых
+#  регуляторов и оценивателей один ветер) -- см. Explorer._world_for и
+#  Explorer._chip_for.
+
+def _imu(app, rows=None):
+    return IMUSensor(app._world_for(rows), mode="imu", seed=app.args.seed,
+                     b_init=app._chip_for(rows), **_imu_params(app))
+
+
+def _imu_enc(app, rows=None):
     """ИДУ плюс моторный энкодер. Порядок -- часть контракта оценивателя."""
-    return StackedSensor(_imu(app),
-                         EncoderSensor(app.system, dt=app.args.dt,
+    return StackedSensor(_imu(app, rows),
+                         EncoderSensor(app._world_for(rows), dt=app.args.dt,
                                        counts_per_rev=app.args.counts))
 
 
 def _comp(tau=None):
-    """tau=None -- взять со слайдера; число -- вырожденный режим (0 или inf)."""
-    return lambda app: ComplementaryEstimator(
+    """tau=None -- взять со слайдера; число -- вырожденный режим (0 или inf).
+    Фильтр знает НОМИНАЛ (app.system), а не мир."""
+    return lambda app, rows=None: ComplementaryEstimator(
         app.system, dt=app.args.dt,
         tau=app.noise["tau"] if tau is None else tau,
         wheel="encoder", accel_offset=IMU_D)
+
+
+def _kalman(app, rows=None, diagnostics=False):
+    """Фильтр Калмана с уравнениями акселерометра (ER-025).
+
+    Модель -- НОМИНАЛ app.system (никогда не мир).  Шум ИДУ -- с тех же
+    слайдеров и из той же панели noise, что у датчика: по умолчанию фильтр
+    знает датчик точно.  Остальное -- из панели kalman (app.kf).
+    """
+    kf = app.kf
+    prior = None
+    if kf["prior"] == "calibrate":
+        b_hat, P_bb = app._calibration()
+        prior = (b_hat if rows is None else b_hat[rows], P_bb)
+    drift = None
+    if kf["drift"] == "on":
+        s = IMUSensor(app.system, dt=app.args.dt, mode="imu")   # плотности ухода датчика
+        drift = dict(sigma_ba=float(s.sigma_b[0]), sigma_bg=float(s.sigma_b[2]))
+    dist = None
+    if kf["w_model"] == "matched" and app.phys["wind"]:
+        dist = dict(sigma_w=(app.phys["sigma_psi"], app.phys["sigma_theta"]),
+                    tau_w=app.phys["tau_w"])
+    elif kf["w_model"] == "own":
+        dist = dict(sigma_w=(kf["sigma_psi"], kf["sigma_theta"]), tau_w=kf["tau_w"])
+    return KalmanEstimator(
+        app.system, dt=app.args.dt, d=IMU_D,
+        sigma_a=app.noise["sigma_a"], sigma_g=app.noise["sigma_g"],
+        corr_w=corr_matrix(app.corr["w"]), counts_per_rev=app.args.counts,
+        b0_a=app.noise["b0_g"] * 9.8, b0_g=app.noise["b0_g"], bias_prior=prior,
+        bias_drift=drift, disturbance=dist, q_acc=kf["q_acc"],
+        iterations=int(kf["iterations"]), diagnostics=diagnostics)
 
 
 ESTIMATORS = [
@@ -373,11 +621,54 @@ ESTIMATORS = [
     # датчик ИДУ умеет в одиночку (колесо -- от энкодера в обоих).
     ("gyro", "gyro+enc", _imu_enc, _comp(np.inf)),
     ("acc", "accel+enc", _imu_enc, _comp(0.0)),
+    # ER-025: оба канала акселерометра как есть, смещения и толчок в состоянии.
+    ("kalman", "kalman+enc", _imu_enc, _kalman),
 ]
 ESTIMATOR_KEYS = [key for key, _, _, _ in ESTIMATORS]
 ESTIMATOR_LABEL = {key: label for key, label, _, _ in ESTIMATORS}
 ESTIMATOR_SENSOR = {key: mk for key, _, mk, _ in ESTIMATORS}
 ESTIMATOR_BUILD = {key: mk for key, _, _, mk in ESTIMATORS}
+
+
+def _parse_params(text, base):
+    """'mb=10,l=0.8' -> копия base с этими полями."""
+    out = dict(base)
+    if not text:
+        return out
+    for item in text.split(","):
+        key, _, value = item.partition("=")
+        key = key.strip()
+        if key not in PHYS_KEYS:
+            raise ValueError(f"неизвестный параметр {key!r}: нужны {PHYS_KEYS}")
+        out[key] = float(value)
+    return out
+
+
+def _phys_from_args(args) -> dict:
+    """Мир, номинал и ветер из командной строки (docs/explorer_kalman.md §7)."""
+    world = _parse_params(getattr(args, "world_params", None), DEFAULT_PHYS)
+    nominal_text = getattr(args, "nominal_params", None)
+    nominal = _parse_params(nominal_text, world) if nominal_text else dict(world)
+    sigma = getattr(args, "sigma_w", None) or (DEFAULT_WIND["sigma_psi"],
+                                               DEFAULT_WIND["sigma_theta"])
+    return {"world": world, "nominal": nominal, "same": nominal == world,
+            "wind": getattr(args, "world", "clean") == "wind",
+            "sigma_psi": float(sigma[0]), "sigma_theta": float(sigma[1]),
+            "tau_w": float(getattr(args, "tau_w", None) or DEFAULT_WIND["tau_w"]),
+            "seed": float(getattr(args, "wind_seed", None) or DEFAULT_WIND["seed"])}
+
+
+def _kf_from_args(args) -> dict:
+    kf = dict(DEFAULT_KF)
+    for key, attr in (("chip", "chip"), ("prior", "bias_prior"), ("T_c", "calib_time"),
+                      ("sigma_jig", "sigma_jig"), ("w_model", "kf_w"),
+                      ("q_acc", "kf_q_acc"), ("iterations", "kf_iter")):
+        value = getattr(args, attr, None)
+        if value is not None:
+            kf[key] = value if key in KF_CHOICES else float(value)
+    if getattr(args, "kf_drift", False):
+        kf["drift"] = "on"
+    return kf
 
 
 class Explorer:
@@ -395,7 +686,14 @@ class Explorer:
         self.u_max = _finite_or_none(args.u_max)
         if self.u_max is not None:
             self.u_max = self.u_finite
-        self.system = WheeledPendulum(u_max=self.u_max)
+        # Мир и номинал (docs/explorer_kalman.md §1).  phys -- единственный
+        # источник правды о физике; обе модели собирает _build_models, и её же
+        # зовут слайдер u_max, кнопка no limit и панель model.
+        self.phys = _phys_from_args(args)
+        self.kf = _kf_from_args(args)
+        self._bias_key = None           # кэш чипа и калибровки
+        self._bias_val = (None, None)
+        self._build_models()
         self.integrator = RK4Integrator()
         self.pinned = args.psi_max is not None or args.dpsi_max is not None
         self.spec = GridSpec(args.grid, *self._map_bounds())
@@ -411,6 +709,8 @@ class Explorer:
         # формул динамики нет. Форма замкнутая, поэтому пересчёт бесплатен и
         # идёт прямо во время перетаскивания.
         self._refresh_limits()
+        # Кривая переключения реле на карте (кнопка `switch`, клавиша C).
+        self.show_switch = True
 
         # Цены ЛКР -- копия DEFAULT_COST, которую двигает панель настроек.
         self.cost = {k: tuple(v) for k, v in DEFAULT_COST.items()}
@@ -418,12 +718,11 @@ class Explorer:
         self.settings_text = {}
         self.settings_focus = None
         self.settings_error = ""
-        self.K, self.P, self.K_tilt, self.P_tilt, self._drift = self._synthesize()
+        self.K, self.P, self._drift = self._synthesize()
         self.K_soft = self._synthesize_soft()
         self.design_note = "no scipy"
-        self.c_star, self.c_tilt = self._certify()
+        self.c_star = self._certify()
         self._refresh_hint()
-        self._lqr_mask_cache = None
         self.stale = False          # предел сдвинут, а сетка ещё от старого
         self.dragging = False
         # Предел, при котором посчитаны ТРАЕКТОРИИ. Пока слайдер тащат, он
@@ -450,6 +749,29 @@ class Explorer:
         self.noise = {"sigma_g": args.sigma_g, "sigma_a": args.sigma_a,
                       "b0_g": args.b0_g, "tau": args.tau}
         self.noise_drag = None          # какой слайдер тащат
+        # Панели model и kalman (ER-025) -- устроены как settings и noise.
+        self.model_open = False
+        self.model_text = {}
+        self.model_focus = None
+        self.model_error = ""
+        self.kf_open = False
+        self.kf_text = {}
+        self.kf_focus = None
+        self.kf_error = ""
+        # Нижний график: момент u или толчок w (клавиша P).
+        self.plot_w = False
+        self.w_true = None              # истинный толчок выбранной клетки
+        # Виды фильтра (docs/kalman_views.md): None, "A" -- эллипс 1σ по P на
+        # плоскости (psi, dpsi), "B" -- показания y против h(x, u) и h(x^-, u).
+        # Открываются кнопками, закрывают правую половину окна; карта и
+        # дорожка времени остаются.
+        self.view = None
+        self.diag = None
+        self.diag_note = ""
+        # Шрифт кнопок считается один раз на окно и здесь же и живёт: объект
+        # шрифта привязан к инициализированному pygame, и модульный кэш
+        # пережил бы pg.quit() мёртвой ссылкой.
+        self._pick_font = None
         # Корреляции каналов ИДУ -- тоже параметры датчика, но не слайдеры:
         # у матрицы есть условие допустимости (положительная определённость),
         # которое у отдельного числа не проверить, поэтому они вводятся
@@ -469,6 +791,7 @@ class Explorer:
         self._refresh_hint()
 
         self.batch = None
+        self.nees = None          # NEES смещений по ансамблю клеток (вид C)
         self.outcome = np.full(self.spec.n * self.spec.n, -1, dtype=int)
         self.t_fall = np.full(self.spec.n * self.spec.n, np.nan)
         self.cache: dict[int, object] = {}
@@ -483,12 +806,324 @@ class Explorer:
         self.traj = None
         self.traj_cmp = None
         self.traj_est_cmp = None
+        self.controller_cmp = None
+        # Дорожки фаз выбранной клетки (ER-016): кто рулил на каждом шаге и
+        # числа к этому -- время передачи, число релейных переключений.
+        # Считаются в _update_tracks вместе с траекториями, а не при отрисовке.
+        self.track = None
+        self.track_cmp = None
+        self.track_est_cmp = None
         self.playing = True
         self.play_time = 0.0
+        self.time_drag = False      # ручку дорожки времени держат мышью
         # Стартовая клетка -- внутри множества восстановимости (_start_state):
         # на широкой карте «0.6 края» -- это уже лёгший корпус, и первое, что
         # видит пользователь, была бы падающая траектория.
         self._select_nearest(*self._start_state())
+
+    # --- мир и номинал (ER-025) ---------------------------------------------
+
+    def _build_models(self):
+        """Собрать app.system (номинал) и app.world (мир) из self.phys и
+        текущего предела момента.  Предел ставится ОБЕИМ: мотор один.
+
+        Пока номинал равен миру и ветра нет, это один и тот же объект -- окно
+        бит в бит прежнее (оракул tests/test_explorer_kalman.py)."""
+        ph = self.phys
+        pw = WheeledPendulumParams(**ph["world"], u_max=self.u_max)
+        pn = pw if ph["same"] else WheeledPendulumParams(**ph["nominal"], u_max=self.u_max)
+        self.system = WheeledPendulum(pn)
+        if ph["wind"]:
+            self.world = DisturbedWheeledPendulum(
+                pw, sigma_w=(ph["sigma_psi"], ph["sigma_theta"]), tau_w=ph["tau_w"],
+                dt=self.args.dt, seed=int(ph["seed"]))
+        elif ph["same"]:
+            self.world = self.system
+        else:
+            self.world = WheeledPendulum(pw)
+
+    def _world_for(self, rows):
+        """Мир для строк пачки rows (None -- вся карта).  С ветром клетка m
+        получает путь СВОЕЙ строки (row_offset): у второго регулятора и
+        второго оценивателя тот же ветер, что у основного."""
+        if rows is None or not isinstance(self.world, DisturbedWheeledPendulum):
+            return self.world
+        return self.world.with_row_offset(int(np.asarray(rows).ravel()[0]))
+
+    def _bias_state(self):
+        """(чип, калибровка) карты -- по строке на клетку.  Кэш по всему, от
+        чего они зависят.
+
+        Чип разыгрывается явно, если он сырой или нужна калибровка (ей надо
+        знать, что именно калибровать); иначе -- None, и смещение, как
+        раньше, разыгрывает сам IMUSensor (бит в бит прежнее окно)."""
+        kf, n = self.kf, self.spec.n * self.spec.n
+        explicit = kf["chip"] == "raw" or kf["prior"] == "calibrate"
+        key = (n, explicit, kf["chip"], kf["prior"], kf["T_c"], kf["sigma_jig"],
+               self.args.seed, tuple(sorted((k, float(np.sum(v))) for k, v in
+                                            _imu_params(self).items())))
+        if key == self._bias_key:
+            return self._bias_val
+        chip = calib = None
+        if explicit:
+            if kf["chip"] == "raw":
+                chip = draw_turn_on_bias(**MPU6050_RAW_B0, shape=n, seed=self.args.seed + 1)
+            else:
+                b0 = self.noise["b0_g"]
+                chip = draw_turn_on_bias(b0_a=9.8 * b0, b0_g=b0, shape=n,
+                                         seed=self.args.seed + 1,
+                                         corr_b0=corr_matrix(self.corr["b0"]))
+            if kf["prior"] == "calibrate":
+                params = _imu_params(self)
+                params.pop("b0_g"), params.pop("b0_a"), params.pop("corr_b0")
+                calib = calibrate_on_stand(self.world, params, b_init=chip,
+                                           T_c=kf["T_c"], sigma_jig=kf["sigma_jig"],
+                                           seed=self.args.seed + 2)
+        self._bias_key, self._bias_val = key, (chip, calib)
+        return self._bias_val
+
+    def _chip_for(self, rows):
+        chip = self._bias_state()[0]
+        if chip is None:
+            return None
+        return chip if rows is None else chip[rows]
+
+    def _calibration(self):
+        return self._bias_state()[1]
+
+    def mismatch_growth(self):
+        """max Re eig(A_w - B_w K_n): номинальный ЛКР в МИРЕ (§1.2).  None --
+        номинал равен миру."""
+        if self.phys["same"]:
+            return None
+        A, B = self.world.linearize_upright()
+        return float(np.linalg.eigvals(A - B @ self.K).real.max())
+
+    def _rebuild_all(self):
+        """Физика или ветер поменялись: всё, что от них зависит, -- заново.
+        Мир: границы карты, граница восстановимости, сетка.  Номинал: K, P,
+        K_soft, c*, кривая реле.  Клетка -- по состоянию, как у слайдера."""
+        self._build_models()
+        self.spec = GridSpec(self.spec.n, *self._map_bounds())
+        self._refresh_limits()
+        self.K, self.P, self._drift = self._synthesize()
+        self.K_soft = self._synthesize_soft()
+        self.c_star = self._certify()
+        self._refresh_hint()
+        if not self.available(self.main_key):
+            self.main_key = "lqr"
+        if self.cmp_key is not None and not self.available(self.cmp_key):
+            self.cmp_key = None
+        self._invalidate()
+        self.controller = CONTROLLER_BUILD[self.main_key](self)
+        if self.args.precompute:
+            self._precompute()
+        self._select_nearest(*self.selected_state)
+
+    def toggle_world(self):
+        """Клавиша W: чистый мир <-> ветер."""
+        self.phys["wind"] = not self.phys["wind"]
+        if not self.w_available:
+            self.plot_w = False
+        self._rebuild_all()
+
+    @property
+    def w_available(self) -> bool:
+        """График толчка осмыслен, только если толчок есть."""
+        return bool(self.phys["wind"])
+
+    def toggle_plot_w(self):
+        if self.w_available:
+            self.plot_w = not self.plot_w
+
+    # --- виды фильтра (docs/kalman_views.md) ---------------------------------
+
+    def toggle_view(self, key):
+        """V -- вид A, H -- вид B, B -- вид C (смещения); повторное нажатие
+        закрывает."""
+        self.view = None if self.view == key else key
+        self._update_diag()
+
+    def _update_diag(self):
+        """Диагностический пересчёт выбранной клетки: фильтр отдаёт P, y,
+        h(x^-, u) и S на КАЖДОМ шаге (record_aux), а окно -- чистые показания
+        мира h(x, u): настоящее состояние, без шума и смещения.
+
+        Пересчёт отдельный (около 4 с на клетку): записывать P для всей карты
+        -- это гигабайты (§5.2).  Ветер и чип у клетки те же, что в пачке
+        (row_offset, _chip_for); белый шум датчика -- свой розыгрыш.
+        """
+        self.diag = None
+        if self.view is None or self.selected is None:
+            return
+        if self.est_key != "kalman":
+            self.diag_note = "views show the Kalman filter: choose kalman+enc"
+            return
+        from ..rollout import rollout
+        m = self.spec.index(*self.selected)
+        x0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m]
+        world = self._world_for(m)
+        tap = _BiasTap(_imu_enc(self, m))
+        with self._errstate():
+            traj = rollout(world, CONTROLLER_BUILD[self.main_key](self), self.integrator,
+                           x0, self.args.dt, self.n_steps,
+                           sensor=tap, estimator=_kalman(self, m, True),
+                           record_aux=True)
+        t = traj.t[:-1]
+        X = traj.x[:-1]
+        U_prev = np.vstack([np.zeros((1, 1)), traj.u[:-1]])
+        clean = WheeledPendulum(world.p)
+        W = (world.disturbance(t) if isinstance(world, DisturbedWheeledPendulum) else None)
+        a_x, a_z = clean.specific_force(0.0, X, U_prev, IMU_D, w=W)
+        y_clean = np.column_stack([a_x, a_z, X[:, I_DPSI], X[:, I_THETA] - X[:, I_PSI]])
+        # Масштаб увеличенного эллипса на фазовой плоскости (§14): степень
+        # десяти, ОДНА на прогон -- эллипс первого кадра ~10 % ширины.
+        P0 = traj.aux["P"][0]
+        span_psi = max(np.ptp(X[:, I_PSI]), 1e-6)
+        span_dpsi = max(np.ptp(X[:, I_DPSI]), 1e-6)
+        rel = max(np.sqrt(P0[I_PSI, I_PSI]) / span_psi, np.sqrt(P0[I_DPSI, I_DPSI]) / span_dpsi)
+        scale_k = 10.0 ** np.round(np.log10(0.05 / max(rel, 1e-15)))
+        # Смещение до коррекции: при Q_b = 0 априорное b^- равно оценке
+        # прошлого шага; на первом шаге -- самой первой оценке.
+        b_hat = traj.aux["b_hat"]
+        b_prior = np.vstack([b_hat[:1], b_hat[:-1]])
+        self.diag = {"t": t, "x": X, "x_hat": traj.x_hat, "P": traj.aux["P"],
+                     "y": traj.aux["y"], "y_pred": traj.aux["y_pred"],
+                     "S": traj.aux["S_diag"], "y_clean": y_clean[:, :traj.aux["y"].shape[1]],
+                     "b_prior": b_prior, "b_hat": b_hat,
+                     "b_true": np.asarray(tap.biases[1:1 + len(t)]),
+                     "scale_k": float(scale_k), "cell": m,
+                     "lens_half": (1.5 * float(np.sqrt(P0[I_PSI, I_PSI])),
+                                   1.5 * float(np.sqrt(P0[I_DPSI, I_DPSI])))}
+        self.diag_note = ""
+
+    def diag_frame(self) -> int:
+        if self.diag is None:
+            return 0
+        return int(np.clip(round(self.play_time / self.args.dt), 0, len(self.diag["t"]) - 1))
+
+    # --- панель model --------------------------------------------------------
+
+    def model_values(self) -> dict:
+        ph = self.phys
+        v = {f"world.{k}": ph["world"][k] for k in PHYS_KEYS}
+        v.update({f"nominal.{k}": ph["nominal"][k] for k in PHYS_KEYS})
+        v.update({f"wind.{k}": ph[k] for k in DEFAULT_WIND})
+        return v
+
+    def open_model(self):
+        self.model_text = {k: f"{v:g}" for k, v in self.model_values().items()}
+        self.model_text["same"] = "yes" if self.phys["same"] else "no"
+        self.model_text["wind"] = "on" if self.phys["wind"] else "off"
+        self.model_focus = MODEL_KEYS[0]
+        self.model_error = ""
+        self.model_open = True
+        self.settings_open = self.noise_open = self.kf_open = False
+
+    def apply_model(self, values: dict):
+        """Принять физику мира, номинала и ветра.  None -- успех, строка --
+        отказ; при отказе окно не меняется ни в чём."""
+        merged = self.model_values()
+        same = self.phys["same"]
+        wind = self.phys["wind"]
+        try:
+            for key, value in values.items():
+                if key == "same":
+                    same = value in ("yes", True)
+                elif key == "wind":
+                    wind = value in ("on", True)
+                elif key in merged:
+                    merged[key] = float(value)
+                else:
+                    return f"unknown field {key}"
+        except (TypeError, ValueError):
+            return f"not a number: {key} = {value!r}"
+        if not all(np.isfinite(v) for v in merged.values()):
+            return "all values must be finite"
+        for group in ("world", "nominal"):
+            for k in PHYS_KEYS:
+                if merged[f"{group}.{k}"] <= 0:
+                    return f"{group}.{k} must be > 0"
+        if merged["wind.sigma_psi"] < 0 or merged["wind.sigma_theta"] < 0:
+            return "wind sigma must be >= 0"
+        if merged["wind.tau_w"] <= 0:
+            return "wind tau_w must be > 0"
+        if merged["wind.seed"] < 0 or merged["wind.seed"] != int(merged["wind.seed"]):
+            return "wind seed must be a non-negative integer"
+        world = {k: merged[f"world.{k}"] for k in PHYS_KEYS}
+        nominal = dict(world) if same else {k: merged[f"nominal.{k}"] for k in PHYS_KEYS}
+        # Пробный синтез по номиналу: Риккати может не решиться -- узнать
+        # можно, только решив (как в apply_settings).
+        try:
+            trial = WheeledPendulum(WheeledPendulumParams(**nominal))
+            A, B = trial.linearize_upright()
+            from ..lqr import lqr
+            with np.errstate(all="raise"):
+                lqr(A, B, *_cost_matrices(self.cost["base"]))
+        except ImportError:                              # pragma: no cover
+            pass
+        except Exception as exc:                         # noqa: BLE001
+            return f"nominal: Riccati failed ({type(exc).__name__})"
+        self.phys = {"world": world, "nominal": nominal, "same": same, "wind": wind,
+                     **{k: merged[f"wind.{k}"] for k in DEFAULT_WIND}}
+        if not self.w_available:
+            self.plot_w = False
+        self.model_error = ""
+        self._rebuild_all()
+        return None
+
+    # --- панель kalman -------------------------------------------------------
+
+    def kf_values(self) -> dict:
+        return dict(self.kf)
+
+    def open_kf(self):
+        self.kf_text = {k: (v if isinstance(v, str) else f"{v:g}")
+                        for k, v in self.kf_values().items()}
+        self.kf_focus = "q_acc"
+        self.kf_error = ""
+        self.kf_open = True
+        self.settings_open = self.noise_open = self.model_open = False
+
+    def apply_kf(self, values: dict):
+        """Принять настройки фильтра Калмана и чипа.  None -- успех."""
+        merged = self.kf_values()
+        try:
+            for key, value in values.items():
+                if key not in merged:
+                    return f"unknown field {key}"
+                if key in KF_CHOICES:
+                    if value not in KF_CHOICES[key]:
+                        return f"{key}: one of {'/'.join(KF_CHOICES[key])}"
+                    merged[key] = value
+                else:
+                    merged[key] = float(value)
+        except (TypeError, ValueError):
+            return f"not a number: {key} = {value!r}"
+        nums = [v for k, v in merged.items() if k not in KF_CHOICES]
+        if not all(np.isfinite(v) for v in nums):
+            return "all values must be finite"
+        if merged["T_c"] <= 0:
+            return "T_c must be > 0"
+        if merged["sigma_jig"] < 0:
+            return "sigma_jig must be >= 0"
+        if merged["sigma_psi"] < 0 or merged["sigma_theta"] < 0:
+            return "filter sigma_w must be >= 0"
+        if merged["tau_w"] <= 0:
+            return "filter tau_w must be > 0"
+        if merged["q_acc"] < 0:
+            return "q_acc must be >= 0"
+        it = merged["iterations"]
+        if it != int(it) or not 1 <= it <= 5:
+            return "iterations: integer 1..5"
+        changed = merged != self.kf
+        self.kf = merged
+        self.kf_error = ""
+        # Чип -- свойство мира: он меняет датчик у ВСЕХ оценивателей.
+        uses_imu = self.est_key != "ideal" or self.est_cmp_key is not None
+        if changed and uses_imu:
+            self.commit_noise()
+        return None
 
     # --- проект регулятора -------------------------------------------------
 
@@ -507,31 +1142,30 @@ class Explorer:
         ставили без extra `design`), берём K_LQR, а варианты, которым нужен
         эллипсоид, окно отключит.
 
-        Второй проект -- ЛКР по ОДНОМУ наклону, уже вложенный в полное
-        пространство: P выходит вырожденной (ранг 2), её множество уровня --
-        цилиндр, а не эллипсоид.
+        ЛКР по ОДНОМУ наклону (`lqr_tilt`) окно больше не синтезирует: его
+        читал только вариант `bang -> tilt`, убранный 24.09. Сама функция
+        осталась в `wpend/lqr.py` -- её читают примеры и тесты.
         """
         A, B = self.system.linearize_upright()
         Q, R = _cost_matrices(self.cost["base"])
         try:
-            from ..lqr import lqr, lqr_tilt
+            from ..lqr import lqr
             K, P = lqr(A, B, Q, R)
-            K_t, P_t = lqr_tilt(self.system, np.diag([100.0, 10.0]),
-                                np.array([[1.0]]))
         except ImportError:                              # pragma: no cover
-            return K_LQR, None, None, None, ""
+            return K_LQR, None, ""
         drift = float(np.abs(K - K_LQR).max())
         note = ""
         # Сверка с константой имеет смысл только для той цены, под которую
         # константа записана: при цене из панели K обязано отличаться.
         if drift > 1e-4 and self.cost["base"] == DEFAULT_COST["base"]:  # pragma: no cover
             note = f"  (!) K ушло от константы на {drift:.2g}"
-        return K, P, K_t, P_t, note
+        return K, P, note
 
     def _synthesize_soft(self):
         """ЛКР второй фазы `bang-eps`: та же задача, что в _synthesize, но с
-        ценой self.cost["soft"]. По умолчанию это Q_SOFT_WHEEL, R = 1 -- гейны
-        по theta и dtheta ниже базовых в 10 и 4.4 раза.
+        ценой self.cost["soft"]. По умолчанию это Q_SOFT_WHEEL, R_SOFT = 250
+        (ER-017): гейн по скорости колеса ниже базового в 17 раз, по наклону --
+        в 1.5, почему так -- комментарий у Q_SOFT_WHEEL.
 
         Без scipy -- None, и `bang-eps` окно отключает, как эллипсоид.
         """
@@ -553,12 +1187,12 @@ class Explorer:
         u = self.u_finite if self.u_max is None else self.u_max
         X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)
         th, dth = X0[:, I_PSI], X0[:, I_DPSI]
-        ok = self.system.is_recoverable(u, th, dth) & (np.abs(th) <= PSI_MAP)
+        ok = self.world.is_recoverable(u, th, dth) & (np.abs(th) <= PSI_MAP)
         if (self.outcome >= 0).all() and (ok & (self.outcome == HELD)).any():
             ok &= self.outcome == HELD
         if not ok.any():
             return 0.0, 0.0
-        floor, ceiling = self.system.recoverable_bounds(u, th)
+        floor, ceiling = self.world.recoverable_bounds(u, th)
         score = np.where(ok, np.abs(th) - 1e-6 * np.abs(dth - 0.5 * (floor + ceiling)),
                          -np.inf)
         m = int(np.argmax(score))
@@ -584,6 +1218,7 @@ class Explorer:
         self.settings_error = ""
         self.settings_open = True
         self.noise_open = False         # модальная панель -- одна за раз
+        self.model_open = self.kf_open = False
 
     def apply_settings(self, values: dict):
         """Принять новые цены ЛКР, eps и горизонт; пересчитать всё зависимое.
@@ -643,15 +1278,15 @@ class Explorer:
         self.n_steps = int(round(self.args.horizon / self.args.dt))
         if self.n_steps % self.args.stride:
             self.n_steps += self.args.stride - self.n_steps % self.args.stride
-        self.K, self.P, self.K_tilt, self.P_tilt, self._drift = self._synthesize()
+        self.K, self.P, self._drift = self._synthesize()
         self.K_soft = self._synthesize_soft()
-        self.c_star, self.c_tilt = self._certify()
+        self.c_star = self._certify()
         self._refresh_hint()
         if not self.available(self.main_key):
             self.main_key = "lqr"
         if self.cmp_key is not None and not self.available(self.cmp_key):
             self.cmp_key = None
-        self._invalidate(mask=True)
+        self._invalidate()
         self.controller = CONTROLLER_BUILD[self.main_key](self)
         if self.args.precompute:
             self._precompute()
@@ -673,6 +1308,7 @@ class Explorer:
         self.noise_error = ""
         self.noise_open = True
         self.settings_open = False
+        self.model_open = self.kf_open = False
 
     def apply_noise(self, values: dict):
         """Принять корреляции каналов ИДУ; None -- успех, строка -- отказ.
@@ -717,33 +1353,26 @@ class Explorer:
         return None
 
     def _certify(self):
-        """Сертифицированные уровни (c*, c*_наклон) для ТЕКУЩЕГО предела.
+        """Сертифицированный уровень c* для ТЕКУЩЕГО предела.
 
         Единственное место проекта, куда предел мотора входит по существу:
         уровень строится по vdot ПРИ ОБРЕЗАННОМ управлении, и забыть здесь
         u_max -- получить ответ для другого мотора (при u_max = 1.5 он выходит
-        в 16 раз оптимистичнее). Цилиндрической форме обязательно передаются
-        coords: без них луч вдоль оси цилиндра даёт c* = 0 молча.
-
-        Цена -- 0.14 с на полную форму и 0.63 с на наклонную; ради этих 0.8 с
-        слайдер и пересчитывает на отпускании, а не на каждом пикселе.
+        в 16 раз оптимистичнее). Цена -- 0.14 с, ради неё
+        слайдер и пересчитывает уровень на отпускании, а не на каждом пикселе.
         """
         if self.P is None:                               # pragma: no cover
             self.design_note = "no scipy"
-            return None, None
+            return None
         from ..lqr import certified_level
 
         c_star, _ = certified_level(self.system, self.K, self.P, u_max=self.u_max,
                                     n_dirs=1500, ds=4e-3, s_max=8.0,
                                     psi_max=self.args.psi_fall)
-        c_tilt, _ = certified_level(self.system, self.K_tilt, self.P_tilt,
-                                    u_max=self.u_max, coords=(I_PSI, I_DPSI),
-                                    n_dirs=4000, ds=2e-3, s_max=8.0,
-                                    psi_max=self.args.psi_fall)
         self.design_note = (f"c*={c_star:.3g}"
                             + ("" if self.u_max is not None else " unclipped")
                             + self._drift)
-        return c_star, c_tilt
+        return c_star
 
     # --- карта под предел момента ------------------------------------------
 
@@ -773,7 +1402,7 @@ class Explorer:
         u = self.u_finite if self.u_max is None else self.u_max
         psi_max = min(MAP_FIT * PSI_MAP, 0.98 * self.args.psi_fall)
         th = np.linspace(-PSI_MAP, PSI_MAP, 401)
-        floor, ceiling = self.system.recoverable_bounds(u, th)
+        floor, ceiling = self.world.recoverable_bounds(u, th)
         reach = np.abs(np.concatenate([floor, ceiling]))
         dpsi_max = MAP_FIT * float(reach[np.isfinite(reach)].max())
         if self.args.psi_max is not None:
@@ -801,12 +1430,17 @@ class Explorer:
             # просто нет -- и легенда говорит об этом словами.
             self.limit_psi = self.limit_floor = self.limit_ceiling = None
             self.psi_eq = None
+            self.switch_up = self.switch_down = None
             return
         self.limit_psi = np.linspace(-self.spec.psi_max * 1.05,
                                        self.spec.psi_max * 1.05, 601)
-        self.limit_floor, self.limit_ceiling = self.system.recoverable_bounds(
+        # Граница и седло -- свойства МИРА; кривая реле -- того, что знает
+        # реле, то есть номинала (docs/explorer_kalman.md §1.1).
+        self.limit_floor, self.limit_ceiling = self.world.recoverable_bounds(
             self.u_max, self.limit_psi)
-        self.psi_eq = self.system.saddle_angle(self.u_max)
+        self.psi_eq = self.world.saddle_angle(self.u_max)
+        self.switch_up, self.switch_down = switching_curve(
+            self.system, self.u_max, self.limit_psi)
 
     def toggle_limit(self):
         """Выключить предел или вернуть последнее конечное значение.
@@ -833,7 +1467,9 @@ class Explorer:
         if value is not None:
             self.u_finite = value
         self.u_max = value
-        self.system = WheeledPendulum(u_max=value)
+        # Обе модели -- из self.phys: собрать здесь WheeledPendulum(u_max=...)
+        # значило бы молча сбросить физику из панели model на заводскую.
+        self._build_models()
         self.spec = GridSpec(self.spec.n, *self._map_bounds())
         self._refresh_limits()
         self.stale = True
@@ -860,8 +1496,8 @@ class Explorer:
             self.main_key = "lqr"
         if self.cmp_key is not None and not self.available(self.cmp_key):
             self.cmp_key = None
-        self.c_star, self.c_tilt = self._certify()
-        self._invalidate(mask=True)
+        self.c_star = self._certify()
+        self._invalidate()
         self.controller = CONTROLLER_BUILD[self.main_key](self)
         if self.args.precompute:
             self._precompute()
@@ -871,15 +1507,16 @@ class Explorer:
 
     # --- слой оценки -------------------------------------------------------
 
-    def _sensor(self, key=None):
-        """Датчик оценивателя key (None -- идеальный, y = x)."""
+    def _sensor(self, key=None, rows=None):
+        """Датчик оценивателя key (None -- идеальный, y = x).  rows -- клетки
+        карты, идущие строками пачки (None -- вся карта)."""
         make = ESTIMATOR_SENSOR[key or self.est_key]
-        return None if make is None else make(self)
+        return None if make is None else make(self, rows)
 
-    def _estimator(self, key=None):
+    def _estimator(self, key=None, rows=None):
         """Оцениватель (None -- тождественный, x_hat = y)."""
         make = ESTIMATOR_BUILD[key or self.est_key]
-        return None if make is None else make(self)
+        return None if make is None else make(self, rows)
 
     @property
     def records_estimate(self) -> bool:
@@ -937,10 +1574,11 @@ class Explorer:
         try:
             self.noise["tau"] = np.repeat(taus, n_reps)
             with self._errstate():
-                batch = rollout_many(
-                    self.system, self.controller, self.integrator, X0,
+                rows = np.full(len(X0), m)
+            batch = rollout_many(
+                    self._world_for(rows), self.controller, self.integrator, X0,
                     self.args.dt, self.n_steps, self.args.stride,
-                    sensor=self._sensor(), estimator=self._estimator(),
+                    sensor=self._sensor(rows=rows), estimator=self._estimator(rows=rows),
                     record_estimate=True)
         finally:
             self.noise["tau"] = keep
@@ -982,7 +1620,7 @@ class Explorer:
         Клавиша T пересчитывает её отдельно, не трогая сетку.
         """
         self.stale = False
-        self._invalidate(mask=True)
+        self._invalidate()
         if self.args.precompute:
             self._precompute()
         if self.selected is not None:
@@ -995,6 +1633,7 @@ class Explorer:
             return
         self.est_cmp_key = None if key == self.est_cmp_key else key
         self._update_estimator_compare()
+        self._update_tracks()
 
     def _update_estimator_compare(self):
         """Пересчитать траекторию второго оценивателя для выбранной клетки.
@@ -1007,11 +1646,12 @@ class Explorer:
             return
         m = self.spec.index(*self.selected)
         X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m:m + 1]
+        rows = np.array([m])
         with self._errstate():
-            batch = rollout_many(self.system, self.controller, self.integrator,
+            batch = rollout_many(self._world_for(rows), self.controller, self.integrator,
                                  X0, self.args.dt, self.n_steps, self.args.stride,
-                                 sensor=self._sensor(self.est_cmp_key),
-                                 estimator=self._estimator(self.est_cmp_key),
+                                 sensor=self._sensor(self.est_cmp_key, rows),
+                                 estimator=self._estimator(self.est_cmp_key, rows),
                                  record_estimate=self.est_cmp_key != "ideal")
         self.traj_est_cmp = batch[0]
 
@@ -1025,26 +1665,27 @@ class Explorer:
             return
         self.est_key = key
         self._refresh_hint()
-        self._invalidate(mask=True)
+        self._invalidate()
         if self.args.precompute:
             self._precompute()
         if self.selected is not None:
             self.select(*self.selected)
         self.tau_star_measured = None
 
+    def pick_font(self, pg):
+        """Шрифт кнопок, посчитанный один раз на окно (см. `picker_font_size`)."""
+        if self._pick_font is None:
+            self._pick_font = picker_font(pg)
+        return self._pick_font
+
     def available(self, key: str) -> bool:
-        """Вариант с эллипсоидом требует P (то есть scipy), любое реле --
-        конечного предела момента."""
-        if key in RELAY_KEYS and self.u_max is None:
-            return False
-        if key in ("bang-ell", "bang-ell-theta"):
-            return self.P is not None
-        if key == "bang-tilt":
-            return self.P_tilt is not None
-        if key == "bang-eps":
-            return self.K_soft is not None
-        if key == "bang-eps-ell":
-            return self.K_soft is not None and self.P is not None
+        """Обе трёхфазные схемы требуют конечного предела момента (реле и
+        накачка подают ровно +-u_max) и scipy (третья фаза -- эллипсоид по P,
+        вторая -- мягкий ЛКР). ЛКР доступен всегда: он и есть то, куда окно
+        откатывается, когда остальное недоступно."""
+        if key in RELAY_KEYS:
+            return (self.u_max is not None and self.K_soft is not None
+                    and self.P is not None)
         return True
 
     def _refresh_hint(self):
@@ -1057,37 +1698,15 @@ class Explorer:
         else:
             self.design_hint = ""
 
-    def lqr_mask(self):
-        """Маска клеток, из которых чистый ЛКР удержал корпус, -- та самая
-        «карта», по которой один из вариантов решает, когда отдавать
-        управление. Считается лениво и один раз: если основной регулятор и
-        так ЛКР и сетка посчитана, берём готовое."""
-        if self._lqr_mask_cache is None:
-            if self.main_key == "lqr" and self.batch is not None:
-                outcome = self.outcome
-            else:
-                X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)
-                with self._errstate():
-                    batch = rollout_many(self.system, LinearFeedbackController(self.K),
-                                         self.integrator, X0, self.args.dt,
-                                         self.n_steps, self.args.stride,
-                                         sensor=self._sensor(),
-                                         estimator=self._estimator())
-                outcome, _ = classify(batch, I_PSI, self.args.psi_fall)
-            self._lqr_mask_cache = (outcome == HELD).reshape(self.spec.n, self.spec.n)
-        return self._lqr_mask_cache
-
     # --- смена регулятора --------------------------------------------------
 
-    def _invalidate(self, *, mask: bool = False):
-        """Забыть посчитанное. mask=True -- ещё и маску чистого ЛКР: она не
-        зависит от того, кто красит карту, но зависит от предела момента."""
+    def _invalidate(self):
+        """Забыть посчитанное: сетку, исходы, моменты падения и кэш клеток."""
         self.batch = None
+        self.nees = None
         self.outcome[:] = -1
         self.t_fall[:] = np.nan
         self.cache.clear()
-        if mask:
-            self._lqr_mask_cache = None
 
     def set_main(self, key: str):
         """Основной красит карту, поэтому сетку приходится пересчитать."""
@@ -1123,13 +1742,20 @@ class Explorer:
         """Один векторный прогон всей сетки: M начальных условий одновременно."""
         X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)
         t0 = time.perf_counter()
+        sensor, estimator = self._sensor(), self._estimator()
+        self.nees = None
+        if self.est_key == "kalman":
+            # Честность фильтра по ансамблю клеток -- для вида C (§6.2).
+            estimator = _NeesTap(estimator, sensor.sensors[0], every=self.args.stride)
         with self._errstate():
-            self.batch = rollout_many(self.system, self.controller, self.integrator,
+            self.batch = rollout_many(self.world, self.controller, self.integrator,
                                       X0, self.args.dt, self.n_steps,
                                       self.args.stride,
-                                      sensor=self._sensor(),
-                                      estimator=self._estimator(),
+                                      sensor=sensor,
+                                      estimator=estimator,
                                       record_estimate=self.records_estimate)
+        if isinstance(estimator, _NeesTap):
+            self.nees = estimator.result()
         self.outcome, self.t_fall = classify(self.batch, I_PSI, self.args.psi_fall)
         self.compute_seconds = time.perf_counter() - t0
         # Без предела ЛКР -- линейный закон, продолженный на все углы: за
@@ -1152,11 +1778,13 @@ class Explorer:
         if m in self.cache:
             return self.cache[m]
         X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m:m + 1]
+        rows = np.array([m])
         t0 = time.perf_counter()
         with self._errstate():
-            batch = rollout_many(self.system, self.controller, self.integrator,
+            batch = rollout_many(self._world_for(rows), self.controller, self.integrator,
                                  X0, self.args.dt, self.n_steps, self.args.stride,
-                                 sensor=self._sensor(), estimator=self._estimator(),
+                                 sensor=self._sensor(rows=rows),
+                                 estimator=self._estimator(rows=rows),
                                  record_estimate=self.records_estimate)
         self.compute_seconds = time.perf_counter() - t0
         outcome, t_fall = classify(batch, I_PSI, self.args.psi_fall)
@@ -1178,10 +1806,12 @@ class Explorer:
     def _run_one(self, controller, m: int):
         """Один прогон одной клетки выбранным регулятором."""
         X0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m:m + 1]
+        rows = np.array([m])
         with self._errstate():
-            batch = rollout_many(self.system, controller, self.integrator,
+            batch = rollout_many(self._world_for(rows), controller, self.integrator,
                                  X0, self.args.dt, self.n_steps, self.args.stride,
-                                 sensor=self._sensor(), estimator=self._estimator(),
+                                 sensor=self._sensor(rows=rows),
+                                 estimator=self._estimator(rows=rows),
                                  record_estimate=self.records_estimate)
         return batch[0]
 
@@ -1189,9 +1819,35 @@ class Explorer:
         """Пересчитать траекторию сравнения для выбранной клетки."""
         if self.cmp_key is None or self.selected is None:
             self.traj_cmp = None
+            self.controller_cmp = None
             return
         m = self.spec.index(*self.selected)
-        self.traj_cmp = self._run_one(CONTROLLER_BUILD[self.cmp_key](self), m)
+        # Регулятор сравнения запоминается, а не выбрасывается: дорожке фаз он
+        # нужен целиком -- с его регионом, его K и его защёлкой. Собрать его
+        # заново значило бы получить ВТОРОЙ объект с той же ценой, и при
+        # изменившихся настройках это были бы разные регуляторы.
+        self.controller_cmp = CONTROLLER_BUILD[self.cmp_key](self)
+        self.traj_cmp = self._run_one(self.controller_cmp, m)
+
+    def _update_tracks(self):
+        """Дорожки фаз для всех показанных траекторий (ER-016).
+
+        Считаются ОДИН раз на выбранную клетку, а не каждый кадр: повтор
+        прогоняет регулятор по всем сохранённым отсчётам, и на 60 кадрах в
+        секунду это была бы самая дорогая вещь в окне при неизменном ответе.
+
+        Оцениватель сравнения идёт под ОСНОВНЫМ регулятором (так его и
+        считает `_update_estimator_compare`), поэтому и фаза у него считается
+        основным -- другим он и не управлялся.
+        """
+        def track(traj, controller):
+            if traj is None or controller is None:
+                return None
+            return track_summary(traj, controller, self.system)
+
+        self.track = track(self.traj, self.controller)
+        self.track_cmp = track(self.traj_cmp, getattr(self, "controller_cmp", None))
+        self.track_est_cmp = track(self.traj_est_cmp, self.controller)
 
     def select(self, ix: int, iy: int):
         self.selected = (ix, iy)
@@ -1200,9 +1856,16 @@ class Explorer:
         # моторе» требует именно состояния.
         self.selected_state = (float(self.spec.psis[ix]),
                                float(self.spec.dpsis[iy]))
-        self.traj = self._trajectory(self.spec.index(ix, iy))
+        m = self.spec.index(ix, iy)
+        self.traj = self._trajectory(m)
+        # Истинный толчок клетки: окно строило мир, окно его и спрашивает;
+        # рисование получает готовый массив (правило 6).
+        self.w_true = (self._world_for([m]).disturbance(self.traj.t[:-1])
+                       if isinstance(self.world, DisturbedWheeledPendulum) else None)
         self._update_compare()
         self._update_estimator_compare()
+        self._update_tracks()
+        self._update_diag()
         self.play_time = 0.0
         self.playing = True
 
@@ -1223,6 +1886,44 @@ class Explorer:
         self.play_time += dt_wall * self.args.speed
         if self.play_time > self.traj.t[-1] - self.traj.t[0]:
             self.play_time = 0.0
+
+    @property
+    def play_span(self) -> float:
+        """Длина прогона в секундах: правый край дорожки времени. 0, пока
+        клетка не выбрана."""
+        if self.traj is None:
+            return 0.0
+        return float(self.traj.t[-1] - self.traj.t[0])
+
+    def scrub(self, t: float):
+        """Встать на момент t и ОСТАНОВИТЬ воспроизведение.
+
+        Решение Глеба 21.09: отпущенная ручка держит кадр, а не едет дальше.
+        Слайдер существует ради «остановиться на передаче управления и
+        посмотреть, что в этот момент делают обе системы»; автоматический пуск
+        отнимал бы ровно это. Вернуть ход -- ПРОБЕЛ.
+
+        Траектория не пересчитывается: кадр уже лежит в Trajectory, меняется
+        одно число.
+        """
+        if self.traj is None:
+            return
+        self.play_time = float(np.clip(t, 0.0, self.play_span))
+        self.playing = False
+
+    def step_frame(self, delta: int):
+        """Шаг ровно на кадр траектории, а не на «немного времени».
+
+        Встаём В СЕРЕДИНУ кадра: frame_of переводит время в номер отбрасыванием
+        дробной части, и время ровно на границе кадра при накопленной ошибке
+        округления попадало бы то в k, то в k-1 -- стрелка через раз стояла бы
+        на месте.
+        """
+        if self.traj is None:
+            return
+        dt_frame = float(self.traj.t[1] - self.traj.t[0])
+        k = int(np.clip(self.frame + delta, 0, len(self.traj) - 1))
+        self.scrub((k + 0.5) * dt_frame)
 
 
 # ---------------------------------------------------------------------------
@@ -1336,6 +2037,87 @@ def _draw_limits(app, screen, pg):
     screen.set_clip(clip)
 
 
+def switching_curve(system, u_max, psi):
+    """Кривая переключения реле sigma = 0 -- ветвь линии уровня первого
+    интеграла, проходящая через (0, 0). Возвращает (up, down): dpsi кривой при
+    dpsi > 0 и при dpsi < 0; где ветви нет -- nan.
+
+    Реле (`BangBangLQRController`, ARCHITECTURE.md «Двухфазный регулятор»)
+    переключается на уровне H(psi, dpsi; -u_max d) = H(0, 0) = gamma D,
+    d = sign dpsi (Key_Formulas §3). Отсюда при d = +-1
+
+        1/2 Delta(psi) dpsi^2 = H(0, 0) - H(psi, 0; -u_max d),
+
+    и dpsi = d sqrt(...). H берётся у самой модели (`first_integral`), а не
+    переписывается здесь: формула живёт в одном месте, и кривая на карте не
+    может разойтись с тем, по чему переключается регулятор.
+
+    Берётся только компонента через ноль: ветвь d = +1 -- при psi <= 0
+    (корпус летит к вертикали слева и тормозит), d = -1 -- при psi >= 0. У
+    того же уровня есть вторая компонента за psi* ~ 2 psi_eq (A34), целиком
+    вне множества восстановимости; она про вырождение закона, а не про
+    переключение, и здесь не рисуется.
+    """
+    psi = np.asarray(psi, dtype=float)
+    H0 = system.first_integral(np.zeros(4), 0.0)
+    x = np.zeros(psi.shape + (4,))
+    x[..., 0] = psi
+    out = []
+    for d in (+1.0, -1.0):
+        rhs = 2.0 * (H0 - system.first_integral(x, -u_max * d)) / system.Delta(psi)
+        own = (d * psi <= 0.0) & (rhs >= 0.0)
+        out.append(np.where(own, d * np.sqrt(np.clip(rhs, 0.0, None)), np.nan))
+    return out[0], out[1]
+
+
+def _draw_switch(app, screen, pg):
+    """Кривая переключения реле поверх карты. Выше неё (sigma > 0) реле
+    подаёт -u_max, ниже -- +u_max; по ней самой корпус приезжает в вертикаль
+    с нулевой скоростью. Траектория с одним переключением доезжает до кривой
+    по одной линии уровня и дальше идёт вдоль неё."""
+    if not app.show_switch or app.switch_up is None:
+        return
+    x, y, w, h = MAP
+    clip = screen.get_clip()
+    screen.set_clip((x, y, w, h))
+    for values in (app.switch_up, app.switch_down):
+        run = []
+        for th, dth in zip(app.limit_psi, values):
+            if not np.isfinite(dth):
+                if len(run) > 1:
+                    pg.draw.lines(screen, SWITCH, False, run, 2)
+                run = []
+                continue
+            run.append(_to_map_px(app, th, dth))
+        if len(run) > 1:
+            pg.draw.lines(screen, SWITCH, False, run, 2)
+    screen.set_clip(clip)
+
+
+def switch_button_rect(font):
+    """Кнопка «switch» в строке заголовка карты, у правого края панели.
+    Чистая функция, как limit_button_rect: одна раскладка и на отрисовку, и на
+    обработку клика."""
+    x, y, w, _ = MAP
+    bw = font.size("switch")[0] + 18
+    return (x + w - bw, y - 25, bw, 22)
+
+
+def draw_switch_button(app, screen, pg, font):
+    rect = switch_button_rect(font)
+    on = app.show_switch
+    # Без предела реле не определено и рисовать нечего: кнопка гаснет, но
+    # помнит своё положение -- как ручка слайдера при `no limit`.
+    live = app.u_max is not None
+    fill = BTN_ON if on else BTN
+    if not live:
+        fill = _shade(fill, 0.5)
+    pg.draw.rect(screen, fill, rect, border_radius=4)
+    pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=4)
+    color = (BG if on else TEXT) if live else DIM
+    screen.blit(font.render("switch", True, color), (rect[0] + 9, rect[1] + 3))
+
+
 def _draw_horizon(app, screen, pg, font):
     """Пунктир на psi = +-pi/2: корпус лёг горизонтально.
 
@@ -1383,6 +2165,8 @@ def draw_map(app, screen, pg, font):
 
     _draw_horizon(app, screen, pg, font)
     _draw_limits(app, screen, pg)
+    _draw_switch(app, screen, pg)
+    draw_switch_button(app, screen, pg, font)
 
     # Сравнение рисуется ПОД основным: основная кривая должна оставаться
     # читаемой там, где они совпадают.
@@ -1432,7 +2216,7 @@ def _draw_body(target, pg, app, state, ox, oy, body_color, wheel_color, tip_colo
     полупрозрачной подложке): различаются только цвета и куда рисуем.
     """
     _, _, w, h = ANIM
-    p = app.system.p
+    p = app.world.p
     wheel_px = 26.0
     m2px = wheel_px / p.r
     cx, cy = ox + w / 2, oy + h * 0.72
@@ -1461,20 +2245,22 @@ def draw_robot(app, screen, pg, font):
     finite_t = app.traj.t[np.isfinite(app.traj.x).all(axis=1)]
     diverged = len(finite_t) < len(app.traj)
 
-    p = app.system.p
+    p = app.world.p
     wheel_px = 26.0
     m2px = wheel_px / p.r
     cy = y + h * 0.72
 
     # Дорога и её бегущие метки -- декорация сцены, а не робота: рисуются один
     # раз и по theta ОСНОВНОГО прогона, иначе два робота ехали бы по двум дорогам.
-    pg.draw.line(screen, GRID_LINE, (x + 8, cy + wheel_px), (x + w - 8, cy + wheel_px), 2)
+    road_x = x + 190            # левее стоит колонка чисел, см. ниже
+    pg.draw.line(screen, GRID_LINE, (road_x, cy + wheel_px),
+                 (x + w - 8, cy + wheel_px), 2)
     shift = (p.r * theta * m2px) % (0.1 * m2px)
     step = 0.1 * m2px
     k = -int(w / (2 * step)) - 1
     while x + w / 2 + k * step - shift < x + w:
         tx = x + w / 2 + k * step - shift
-        if x + 8 < tx < x + w - 8:
+        if road_x < tx < x + w - 8:
             pg.draw.line(screen, GRID_LINE, (tx, cy + wheel_px), (tx, cy + wheel_px + 8), 2)
         k += 1
 
@@ -1514,27 +2300,68 @@ def draw_robot(app, screen, pg, font):
         px = bx + bar_w / 2 + np.clip(t2 / limit, -1, 1) * bar_w / 2
         pg.draw.line(screen, GHOST, (px, by - 2), (px, by + 14), 2)
 
+    # Состояние на ВЫБРАННОМ кадре -- блоком на каждую систему, одними и теми
+    # же строками и цветом своей кривой. Ради этого сравнения дорожка времени
+    # и заведена: «здесь основной уже отдал управление, а сравнение ещё
+    # упирается в предел» читается по числам, а не восстанавливается в голове.
+    # Дорога начинается правее (road_x): линия шла бы сквозь цифры.
     # Колонка "=" выровнена вручную: имена после смены нотации (ER-022) стали
     # другой длины, автоподбора тут нет -- шрифт моноширинный.
-    info = [f"t     = {app.traj.t[app.frame] - app.traj.t[0]:5.2f} s",
-            f"psi   = {state[I_PSI]:+.4f} rad",
-            f"dpsi  = {state[I_DPSI]:+.4f} rad/s",
-            f"theta = {theta:+.3f} rad"]
-    for i, line in enumerate(info):
-        screen.blit(font.render(line, True, TEXT), (x + 14, y + 14 + 18 * i))
+    line_h = 16
+    ty = y + 14
+    screen.blit(font.render("t = %5.2f s" % (app.traj.t[app.frame] - app.traj.t[0]),
+                            True, ACCENT), (x + 14, ty))
+    ty += line_h + 6
+    blocks = [("main   ", CONTROLLER_LABEL[app.main_key], app.traj, TEXT, app.frame)]
+    if app.traj_cmp is not None:
+        blocks.append(("compare", CONTROLLER_LABEL[app.cmp_key], app.traj_cmp,
+                       GHOST, app.frame_of(app.traj_cmp)))
+    if app.traj_est_cmp is not None:
+        blocks.append(("vs est ", ESTIMATOR_LABEL[app.est_cmp_key],
+                       app.traj_est_cmp, GHOST_EST,
+                       app.frame_of(app.traj_est_cmp)))
+    for name, label, traj, color, frame in blocks:
+        s = traj.x[frame]
+        torque_k = traj.u[min(frame, traj.n_steps - 1), 0]
+        screen.blit(font.render("%s %s" % (name, label), True, color), (x + 14, ty))
+        rows = [" psi   = %+.4f" % s[I_PSI], " dpsi  = %+.4f" % s[I_DPSI],
+                " theta = %+.3f" % s[I_THETA], " u     = %s" % _fmt(torque_k)]
+        for i, line in enumerate(rows):
+            screen.blit(font.render(line, True, color),
+                        (x + 14, ty + line_h * (i + 1)))
+        ty += line_h * (len(rows) + 1) + 6
     if diverged:
         gone = float(finite_t[-1] - app.traj.t[0]) if len(finite_t) else 0.0
-        screen.blit(font.render(f"diverged at t = {gone:.2f} s", True, ACCENT),
-                    (x + 14, y + 14 + 18 * len(info)))
-    if app.traj_cmp is not None:
-        s2 = app.traj_cmp.x[app.frame_of(app.traj_cmp)]
-        cmp_info = [f"psi   = {s2[I_PSI]:+.4f}", f"theta = {s2[I_THETA]:+.3f}"]
-        for i, line in enumerate(cmp_info):
-            screen.blit(font.render(line, True, GHOST), (x + 14, y + 92 + 18 * i))
+        screen.blit(font.render("diverged at t = %.2f s" % gone, True, ACCENT),
+                    (x + 14, ty))
+
+
+def _legend_inline(screen, pg, font, x, y, stop, items):
+    """Легенда одной строкой: отрезок цвета кривой плюс подпись рядом.
+
+    Правый верхний угол панели занят числами шкалы, поэтому строка обязана
+    оборваться, не доходя до них. Обрыв не молчаливый: если поместилось не
+    всё, в конце стоит `+n`. Молча пропавшая подпись читается как «такой
+    кривой нет» -- это хуже, чем признаться, что не влезло.
+    """
+    left = list(items)
+    while left:
+        text, color = left[0]
+        need = 16 + font.size(text)[0] + 14
+        if x + need > stop:
+            break
+        pg.draw.line(screen, color, (x, y + 7), (x + 12, y + 7), 3)
+        screen.blit(font.render(text, True, color), (x + 16, y))
+        x += need
+        left.pop(0)
+    if left:
+        tail = "+%d" % len(left)
+        screen.blit(font.render(tail, True, DIM),
+                    (min(x, stop - font.size(tail)[0]), y))
 
 
 def _plot(screen, pg, rect, ts, ys, color, label, font, guides=(), ghosts=(),
-          limit=None, estimate=None):
+          limit=None, estimate=None, legend=()):
     """ghosts -- список (ts, ys, цвет): вторые кривые полупрозрачным. Их может
     быть две -- другой РЕГУЛЯТОР и другой ОЦЕНИВАТЕЛЬ, -- и цвета у них разные,
     потому что вопросы разные. Масштаб оси берётся по ВСЕМ кривым, иначе
@@ -1542,7 +2369,12 @@ def _plot(screen, pg, rect, ts, ys, color, label, font, guides=(), ghosts=(),
 
     estimate = (ts3, ys3) -- ОЦЕНКА той же величины, тонкой линией цвета
     ESTIMATE. Это не третий регулятор, а то же самое состояние, увиденное
-    фильтром; расстояние до основной кривой и есть ошибка оценки."""
+    фильтром; расстояние до основной кривой и есть ошибка оценки.
+
+    legend -- [(подпись, цвет), ...] ровно по нарисованным линиям. Список
+    собирает ВЫЗЫВАЮЩИЙ: только он знает, каким регулятором посчитана каждая
+    кривая, панель же знает одни массивы. Класса-легенды тут нет и не нужно
+    (запрет ER-005): функция и список."""
     x, y, w, h = rect
     pg.draw.rect(screen, GRID_LINE, (x, y, w, h), 1)
     lo, hi = _span(ys)
@@ -1569,7 +2401,7 @@ def _plot(screen, pg, rect, ts, ys, color, label, font, guides=(), ghosts=(),
         for sign in (+1, -1):
             gy = to_px(ts[0], sign * abs(g))[1]
             if y <= gy <= y + h:
-                pg.draw.line(screen, (70, 60, 50), (x, gy), (x + w, gy), 1)
+                pg.draw.line(screen, GUIDE, (x, gy), (x + w, gy), 1)
     if limit is not None:
         # ±psi_eq: за этим наклоном из состояния покоя не вернуться никаким
         # управлением. Не путать с psi_fall -- тот просто «считаем упавшим».
@@ -1598,148 +2430,320 @@ def _plot(screen, pg, rect, ts, ys, color, label, font, guides=(), ghosts=(),
     for text, ty in ((_fmt(hi), y + 4), (_fmt(lo), y + h - 18)):
         screen.blit(font.render(text, True, DIM),
                     (x + w - font.size(text)[0] - 6, ty))
+    _legend_inline(screen, pg, font, x + 6 + font.size(label)[0] + 16, y + 4,
+                   x + w - font.size(_fmt(hi))[0] - 16, legend)
     return to_px
 
 
-#: Три разложения функции Ляпунова V = x^T P x. Вопрос «почему реле не отдаёт
-#: управление» имеет численный ответ, и ответ этот -- в том, КАКАЯ координата
-#: держит V наверху. Поэтому кривых три, а не одна.
-V_COLORS = ((230, 120, 140), (196, 160, 240), (120, 220, 160))
-V_LABELS = ("V full", "V wheel-anchored", "V tilt (P_t)")
+def plot_layout():
+    """Прямоугольники панели TRAJECTORY: график psi, график u, дорожка ФАЗ,
+    дорожка времени.
 
+    Чистая функция, как picker_layout: по одной раскладке и рисуют, и ловят
+    мышь. Обе дорожки стоят РОВНО под графиками и той же ширины -- тогда
+    ручка времени, вертикальный курсор кадра на графиках и цветная полоса
+    фазы это одно и то же место по оси t, и объяснять их словами не нужно.
 
-def _lyapunov_curves(app, traj):
-    """(V полное, V с привязкой theta, V только наклон) вдоль траектории.
-
-    Читается только Trajectory плюс константы проекта P и c*, которые окно и
-    так держит, чтобы собрать регулятор. Закон управления здесь не
-    повторяется: это диагностика сертификата, а не вторая копия регулятора.
+    Высоту под дорожку фаз отняли у графиков (ER-016, решение Глеба 21.09):
+    полоса поверх u(t) сделала бы фон цветным ровно там, где читают кривую.
     """
-    X = traj.x
-    anchored = X.copy()
-    anchored[:, I_THETA] = 0.0                       # колесо объявлено стоящим
-    # Третья кривая считается ДРУГОЙ формой -- P от lqr_tilt, -- и сравнивать
-    # её надо с c*_t, а не с c*. Подставлять сюда P от четырёхмерного проекта
-    # и класть рядом уровень c* значило бы сравнивать разные квадратичные
-    # формы: числа получились бы, а смысла в них -- нет.
-    return (np.einsum("ti,ij,tj->t", X, app.P, X),
-            np.einsum("ti,ij,tj->t", anchored, app.P, anchored),
-            np.einsum("ti,ij,tj->t", X, app.P_tilt, X))
+    x, y, w, h = PLOT
+    half = (h - 46 - TIME_H - TIME_LABEL_H - PHASE_H - 10) / 2
+    return ((x + 12, y + 10, w - 24, half),
+            (x + 12, y + 20 + half, w - 24, half),
+            (x + 12, y + 26 + 2 * half, w - 24, PHASE_H),
+            (x + 12, y + 36 + 2 * half + PHASE_H, w - 24, TIME_H))
 
 
-def draw_lyapunov(app, screen, pg, rect, font):
-    """log10 V против log10 c*. В линейной шкале эта картинка бесполезна:
-    полное V выше уровня в сотни раз и прижимает остальные две к нулю."""
+def _ghost_curves(app):
+    """Вторые кривые графиков: [(траектория, цвет, подпись), ...].
+
+    Подпись берётся у КНОПКИ, которая эту кривую завела: второй регулятор
+    зовётся своим именем, второй оцениватель -- своим. Собранная здесь
+    легенда поэтому не может разойтись с тем, что нарисовано.
+    """
+    out = []
+    if app.traj_cmp is not None:
+        out.append((app.traj_cmp, GHOST, CONTROLLER_LABEL[app.cmp_key]))
+    if app.traj_est_cmp is not None:
+        out.append((app.traj_est_cmp, GHOST_EST,
+                    "est " + ESTIMATOR_LABEL[app.est_cmp_key]))
+    return out
+
+
+def _phase_rows(app):
+    """Строки дорожки фаз: [(сводка, цвет подписи, подпись), ...].
+
+    Порядок тот же, что у кривых: сначала основной, потом призраки в порядке
+    легенды. Строка без сводки (траектории нет) в список не попадает -- пустая
+    полоса читалась бы как «фазы не было».
+    """
+    rows = []
+    if app.track is not None:
+        rows.append((app.track, CURVE, CONTROLLER_LABEL[app.main_key]))
+    if app.track_cmp is not None:
+        rows.append((app.track_cmp, GHOST, CONTROLLER_LABEL[app.cmp_key]))
+    if app.track_est_cmp is not None:
+        rows.append((app.track_est_cmp, GHOST_EST,
+                     "est " + ESTIMATOR_LABEL[app.est_cmp_key]))
+    return rows
+
+
+def _phase_segments(phases):
+    """Отрезки постоянной фазы: [(начало, конец_включительно, код), ...].
+
+    Рисовать поотсчётно нельзя: при 500 отсчётах на 576 пикселей соседние
+    прямоугольники накладывались бы, и граница фазы вставала бы не там, где
+    она есть. Отрезок же переводится в пиксели ровно теми же формулами, что и
+    кривая над ним.
+    """
+    phases = np.asarray(phases, dtype=int)
+    if phases.size == 0:
+        return []
+    edges = np.flatnonzero(np.diff(phases)) + 1
+    starts = np.concatenate([[0], edges])
+    stops = np.concatenate([edges - 1, [phases.size - 1]])
+    return [(int(a), int(b), int(phases[a])) for a, b in zip(starts, stops)]
+
+
+def draw_phase_track(app, screen, pg, font, rect, ts):
+    """Дорожка фаз (ER-016): кто рулил в каждый момент.
+
+    Строка на систему, цвет на фазу, те же пиксели по t, что у графиков и у
+    дорожки времени. Это ответ на вопрос куратора «упал прогон в релейной
+    фазе или уже после передачи»: раньше его угадывали по излому u(t).
+
+    Фаза берётся из `app.track*` -- она посчитана один раз при выборе клетки
+    (`Explorer._update_tracks`), здесь только рисование.
+    """
     x, y, w, h = rect
     pg.draw.rect(screen, GRID_LINE, (x, y, w, h), 1)
-    if app.P is None or app.P_tilt is None or app.traj is None:
-        screen.blit(font.render("V = xTPx  --  needs scipy", True, GRID_LINE),
-                    (x + 6, y + 4))
+    rows = _phase_rows(app)
+    if not rows:
         return
-    curves = [np.log10(np.maximum(v, 1e-12)) for v in _lyapunov_curves(app, app.traj)]
-    # Два сертификата -- две пары «кривая + свой уровень». Красная и
-    # фиолетовая живут с c* (форма P), зелёная -- с c*_t (форма P_t).
-    levels = [(float(np.log10(max(app.c_star, 1e-12))), ACCENT, f"c* = {app.c_star:.3g}"),
-              (float(np.log10(max(app.c_tilt, 1e-12))), V_COLORS[2],
-               f"c*t = {app.c_tilt:.3g}")]
-    ts = app.traj.t - app.traj.t[0]
+    span = max(ts[-1] - ts[0], 1e-9)
+    row_h = h / len(rows)
+    for i, (summary, _, _) in enumerate(rows):
+        phases = summary["phases"]
+        ry = y + i * row_h
+        for a, b, code in _phase_segments(phases):
+            # Правая граница отрезка -- НАЧАЛО следующего отсчёта: последний
+            # шаг отрезка действует до него, и без этого между фазами
+            # оставалась бы щель в один кадр.
+            t0 = ts[a] - ts[0]
+            t1 = (ts[b + 1] if b + 1 < len(ts) else ts[-1]) - ts[0]
+            px0 = x + t0 / span * w
+            px1 = x + t1 / span * w
+            pg.draw.rect(screen, PHASE_COLOR[code],
+                         (px0, ry + 1, max(px1 - px0, 1.0), row_h - 2))
+        # Подпись фазы пишется ВНУТРИ отрезка, когда он шире подписи, и только
+        # в одну строку: на трёх строках высоты под текст нет, и там ключом
+        # работает легенда графика u.
+        if len(rows) == 1:
+            for a, b, code in _phase_segments(phases):
+                text = PHASE_LABEL[code]
+                tw = font.size(text)[0]
+                t0, t1 = ts[a] - ts[0], (ts[min(b + 1, len(ts) - 1)] - ts[0])
+                px0, px1 = x + t0 / span * w, x + t1 / span * w
+                if px1 - px0 > tw + 10:
+                    screen.blit(font.render(text, True, BG),
+                                (px0 + (px1 - px0 - tw) / 2, ry + (row_h - 14) / 2))
 
-    c_lo, c_hi = _span(*curves)
-    lo = min(min(l for l, _, _ in levels), c_lo)
-    hi = max(max(l for l, _, _ in levels), c_hi)
-    lo = max(lo, hi - 12.0)                        # ноль в логарифме -- -inf
-    pad = 0.08 * max(hi - lo, 1e-9)
-    lo, hi = lo - pad, hi + pad
 
-    def to_px(t, v):
-        return (x + (t - ts[0]) / max(ts[-1] - ts[0], 1e-9) * w,
-                y + h - (np.clip(v, lo, hi) - lo) / (hi - lo) * h)
+def _handover_lines(app, screen, pg, rect, to_px, ts):
+    """Вертикали моментов передачи на графике: одна на фазу, цветом фазы.
 
-    # Уровни бывают близки (c* = 2.53 против c*t = 3.27 -- в логарифме почти
-    # одно и то же), и подписи налезали друг на друга. Вторую в таком случае
-    # кладём под линию, а не над.
-    taken = []
-    for value, color, text in levels:
-        ly = to_px(ts[0], value)[1]
-        pg.draw.line(screen, color, (x, ly), (x + w, ly), 1)
-        ty = ly - 17
-        if any(abs(ty - t) < 15 for t in taken):
-            ty = ly + 2
-        taken.append(ty)
-        screen.blit(font.render(text, True, color),
-                    (x + w - font.size(text)[0] - 6, ty))
-
-    for curve, color in zip(curves, V_COLORS):
-        pts = [to_px(t, v) for t, v in zip(*_finite(ts, curve))]
-        if len(pts) > 1:
-            pg.draw.lines(screen, color, False, pts, 2)
-    if app.traj_cmp is not None:
-        layer = pg.Surface((w, h), pg.SRCALPHA)
-        c2 = np.log10(np.maximum(_lyapunov_curves(app, app.traj_cmp)[0], 1e-12))
-        ts2 = app.traj_cmp.t - app.traj_cmp.t[0]
-        pts = [(px - x, py - y) for px, py in
-               (to_px(t, v) for t, v in zip(*_finite(ts2, c2)))]
-        if len(pts) > 1:
-            pg.draw.lines(layer, GHOST + (GHOST_A,), False, pts, 4)
-        screen.blit(layer, (x, y))
-
-    lx = x + 6
-    for label, color in zip(V_LABELS, V_COLORS):
-        screen.blit(font.render(label, True, color), (lx, y + 4))
-        lx += font.size(label)[0] + 14
-    rng = f"log10  {hi:+.1f}..{lo:+.1f}"
-    screen.blit(font.render(rng, True, DIM), (x + w - font.size(rng)[0] - 6, y + 4))
-    cursor = to_px(ts[min(app.frame, len(ts) - 1)], lo)[0]
-    pg.draw.line(screen, ACCENT, (cursor, y), (cursor, y + h), 1)
+    Линии рисуются по ОСНОВНОМУ регулятору: призраков может быть двое, и шесть
+    вертикалей на графике -- это уже не подсказка, а сетка. Призрачные
+    передачи видно на его строке дорожки.
+    """
+    if app.track is None:
+        return
+    for key, code in (("t_handover", PHASE_LQR), ("t_final", PHASE_FINAL)):
+        t = app.track[key]
+        if not np.isfinite(t):
+            continue
+        px = to_px(min(max(t, ts[0]), ts[-1]), 0.0)[0]
+        pg.draw.line(screen, PHASE_COLOR[code], (px, rect[1]),
+                     (px, rect[1] + rect[3]), 1)
 
 
 def draw_plots(app, screen, pg, font):
-    x, y, w, h = PLOT
+    """Два графика (psi и u), легенды к ним и дорожка времени под ними.
+
+    Панель V = x^T P x убрана 21.09 по решению Глеба: в логарифмической шкале
+    три кривые и два уровня не читались, а вопрос «почему реле держит V
+    наверху» она всё равно не решала. Сами разложения никуда не делись --
+    считать их умеет любой скрипт по Trajectory, P и c*, которые окно и так
+    отдаёт; просто окно их больше не рисует.
+    """
     _panel(screen, pg, PLOT, "TRAJECTORY", font)
     if app.traj is None:
         return
+    rect_psi, rect_u, rect_phase, _ = plot_layout()
     ts = app.traj.t - app.traj.t[0]
-    half = (h - 40) / 3
-    g_psi, g_u = [], []
-    for traj2, color in ((app.traj_cmp, GHOST), (app.traj_est_cmp, GHOST_EST)):
-        if traj2 is None:
-            continue
-        ts2 = traj2.t - traj2.t[0]
-        g_psi.append((ts2, traj2.x[:, I_PSI], color))
-        g_u.append((ts2[:-1], traj2.u[:, 0], color))
+    ghosts = _ghost_curves(app)
+    g_psi = [(g.t - g.t[0], g.x[:, I_PSI], c) for g, c, _ in ghosts]
+    g_u = [((g.t - g.t[0])[:-1], g.u[:, 0], c) for g, c, _ in ghosts]
+
     # Оценка приходит из самой Trajectory (правило 6): окно не пересчитывает
     # фильтр и вообще не знает, какой датчик её породил. x_hat выровнена по u,
     # то есть на один кадр короче x -- отсюда ts[:-1].
     e_psi = None
     if app.traj.x_hat is not None:
         e_psi = (ts[:-1], app.traj.x_hat[:, I_PSI])
-    to_px1 = _plot(screen, pg, (x + 12, y + 10, w - 24, half),
-                   ts, app.traj.x[:, I_PSI], (120, 180, 240), "psi (rad)", font,
+
+    # Порядок легенды -- по важности: сначала кривые (их и спрашивают: «что к
+    # чему относится при сравнении двух регуляторов»), потом опорные линии.
+    # Если строка не влезет, обрежется хвост из опорных, а не из кривых.
+    legend = [(CONTROLLER_LABEL[app.main_key], PSI_CURVE)]
+    legend += [(name, color) for _, color, name in ghosts]
+    if e_psi is not None:
+        legend.append(("x_hat " + ESTIMATOR_LABEL[app.est_key], ESTIMATE))
+    if app.psi_eq is not None:
+        legend.append(("psi_eq", LIMIT))
+    legend.append(("psi_fall", GUIDE))
+    to_px1 = _plot(screen, pg, rect_psi,
+                   ts, app.traj.x[:, I_PSI], PSI_CURVE, "psi (rad)", font,
                    guides=(app.args.psi_fall,), ghosts=g_psi,
-                   limit=app.psi_eq, estimate=e_psi)
+                   limit=app.psi_eq, estimate=e_psi, legend=legend)
     if e_psi is not None:
         err = app.traj.x_hat[:, I_PSI] - app.traj.x[:-1, I_PSI]
         finite = err[np.isfinite(err)]
         rmse = float(np.sqrt(np.mean(finite ** 2))) if finite.size else float("nan")
-        # Слева под подписью панели: справа стоят числа шкалы, и надпись
-        # наезжала бы на верхнюю границу диапазона.
-        text = f"est RMSE {rmse:.4f}"
-        screen.blit(font.render(text, True, ESTIMATE), (x + 18, y + 10 + 22))
+        # Вторая строка панели: первую занимает легенда, справа стоят числа
+        # шкалы, и надпись наезжала бы на верхнюю границу диапазона.
+        text = "est RMSE %.4f" % rmse
+        screen.blit(font.render(text, True, ESTIMATE),
+                    (rect_psi[0] + 6, rect_psi[1] + 22))
         if app.traj_est_cmp is not None and app.traj_est_cmp.x_hat is not None:
             e2 = (app.traj_est_cmp.x_hat[:, I_PSI]
                   - app.traj_est_cmp.x[:-1, I_PSI])
             f2 = e2[np.isfinite(e2)]
             r2 = float(np.sqrt(np.mean(f2 ** 2))) if f2.size else float("nan")
-            screen.blit(font.render(f"vs {r2:.4f}", True, GHOST_EST),
-                        (x + 18 + font.size(text)[0] + 10, y + 10 + 22))
-    to_px2 = _plot(screen, pg, (x + 12, y + 20 + half, w - 24, half),
-                   ts[:-1], app.traj.u[:, 0], (240, 170, 110), "u (N*m)", font,
-                   guides=() if app.run_u_max is None else (app.run_u_max,),
-                   ghosts=g_u)
-    for to_px, rect_y in ((to_px1, y + 10), (to_px2, y + 20 + half)):
+            screen.blit(font.render("vs %.4f" % r2, True, GHOST_EST),
+                        (rect_psi[0] + 6 + font.size(text)[0] + 10,
+                         rect_psi[1] + 22))
+
+    tx, ty, tw, th = plot_toggle_rect(font)
+    live_w = app.w_available and app.w_true is not None
+    pg.draw.rect(screen, BTN_ON if app.plot_w else BTN, (tx, ty, tw, th), border_radius=4)
+    screen.blit(font.render("[P] u | w", True, (BG if app.plot_w else
+                                                (TEXT if live_w else GRID_LINE))),
+                (tx + 7, ty + 2))
+    if app.plot_w and live_w:
+        # Толчок: истина -- из мира (её отдал Explorer.select), оценка -- из
+        # Trajectory.w_hat (её записал rollout из Estimator.aux).
+        tw_ = ts[:-1]
+        w_true = app.w_true
+        est = None
+        if app.traj.w_hat is not None:
+            est = (tw_, app.traj.w_hat[:, 1])
+        legend_w = [("w_theta true", WIND), ("w_psi true", _shade(WIND, 0.55))]
+        if est is not None:
+            legend_w.append(("w_hat " + ESTIMATOR_LABEL[app.est_key], ESTIMATE))
+        to_px2 = _plot(screen, pg, rect_u, tw_, w_true[:, 1], WIND, "w (N*m)", font,
+                       ghosts=[(tw_, w_true[:, 0], _shade(WIND, 0.55))]
+                       + ([] if app.traj.w_hat is None
+                          else [(tw_, app.traj.w_hat[:, 0], _shade(ESTIMATE, 0.6))]),
+                       estimate=est, legend=legend_w)
+        if est is not None:
+            err = app.traj.w_hat - w_true
+            ok = np.isfinite(err).all(axis=1)
+            if ok.any():
+                rm = np.sqrt(np.mean(err[ok] ** 2, axis=0))
+                screen.blit(font.render(f"w RMSE  psi {rm[0]:.3f}  theta {rm[1]:.3f}",
+                                        True, ESTIMATE), (rect_u[0] + 6, rect_u[1] + 22))
+        elif app.est_key != "kalman":
+            screen.blit(font.render("no estimate: choose kalman+enc", True, DIM),
+                        (rect_u[0] + 6, rect_u[1] + 22))
+    else:
+        legend_u = [(CONTROLLER_LABEL[app.main_key], U_CURVE)]
+        legend_u += [(name, color) for _, color, name in ghosts]
+        if app.run_u_max is not None:
+            legend_u.append(("+-u_max", GUIDE))
+        to_px2 = _plot(screen, pg, rect_u, ts[:-1], app.traj.u[:, 0], U_CURVE,
+                       "u (N*m)", font,
+                       guides=() if app.run_u_max is None else (app.run_u_max,),
+                       ghosts=g_u, legend=legend_u)
+    # Числа передачи -- второй строкой панели u, как est RMSE у панели psi:
+    # они про ту же кривую, и искать их в другом конце окна незачем.
+    if app.track is not None and not (app.plot_w and live_w):
+        screen.blit(font.render(track_line(app.track), True, DIM),
+                    (rect_u[0] + 6, rect_u[1] + 22))
+    for to_px, rect in ((to_px1, rect_psi), (to_px2, rect_u)):
+        _handover_lines(app, screen, pg, rect, to_px, ts)
         cursor = to_px(ts[min(app.frame, len(ts) - 1)], 0.0)[0]
-        pg.draw.line(screen, ACCENT, (cursor, rect_y), (cursor, rect_y + half), 1)
-    draw_lyapunov(app, screen, pg, (x + 12, y + 30 + 2 * half, w - 24, half), font)
+        pg.draw.line(screen, ACCENT, (cursor, rect[1]),
+                     (cursor, rect[1] + rect[3]), 1)
+    draw_phase_track(app, screen, pg, font, rect_phase, ts)
+    # Курсор кадра проходит и сквозь полосу: «на этом кадре рулит реле» должно
+    # читаться в одном месте, а не сопоставлением двух картинок.
+    cursor = to_px2(ts[min(app.frame, len(ts) - 1)], 0.0)[0]
+    pg.draw.line(screen, ACCENT, (cursor, rect_phase[1]),
+                 (cursor, rect_phase[1] + rect_phase[3]), 1)
+    draw_time_slider(app, screen, pg, font)
+
+
+# --- дорожка времени -----------------------------------------------------
+#
+# Геометрия отдельными чистыми функциями -- как у слайдера u_max: одни и те же
+# формулы читают отрисовка, мышь и тест. Разойтись им тут особенно легко,
+# потому что дорожка живёт внутри чужой панели.
+
+def time_to_px(app, t: float) -> float:
+    """Момент времени -> пиксель на дорожке. Ноль дорожки -- старт прогона."""
+    x, _, w, _ = plot_layout()[3]
+    span = app.play_span
+    return x + float(np.clip(t, 0.0, span)) / max(span, 1e-9) * w
+
+
+def time_from_px(app, px: float) -> float:
+    """Пиксель -> момент времени. Округления до кадра тут НЕТ: кадр выбирает
+    frame_of, и делать это в двух местах значило бы разойтись в одном."""
+    x, _, w, _ = plot_layout()[3]
+    f = float(np.clip((px - x) / w, 0.0, 1.0))
+    return f * app.play_span
+
+
+def time_hit(pos) -> bool:
+    """Попали ли мышью в дорожку времени. Область шире на 8 px: ручка
+    выступает за дорожку, и промах по собственной ручке -- баг интерфейса."""
+    x, y, w, h = plot_layout()[3]
+    return x - 8 <= pos[0] <= x + w + 8 and y - 8 <= pos[1] <= y + h + 8
+
+
+def draw_time_slider(app, screen, pg, font):
+    """Дорожка времени: выбор кадра УЖЕ посчитанной траектории.
+
+    Пересчёта здесь нет и быть не может: все кадры лежат в Trajectory, а
+    слайдер двигает одно число -- play_time. Поэтому дорожка не «перематывает
+    прогон», а выбирает момент, на который смотрят сразу все панели: карта,
+    робот, оба графика и обе сравниваемые системы.
+    """
+    x, y, w, h = plot_layout()[3]
+    if app.traj is None:
+        return
+    span = app.play_span
+    t = min(app.play_time, span)
+    pg.draw.rect(screen, BTN, (x, y, w, h), border_radius=4)
+    # На паузе дорожка ярче, чем на ходу: остановленное время -- это режим, а
+    # не случайность, и по одной ручке его не отличить.
+    tone = BTN_ON if not app.playing else _shade(BTN_ON, 0.7)
+    pg.draw.rect(screen, tone, (x, y, max(time_to_px(app, t) - x, 1.0), h),
+                 border_radius=4)
+    pg.draw.rect(screen, GRID_LINE, (x, y, w, h), 1, border_radius=4)
+    pg.draw.circle(screen, ACCENT, (int(time_to_px(app, t)), int(y + h / 2)), 7)
+
+    ly = y + h + 4
+    screen.blit(font.render("0", True, DIM), (x, ly))
+    right = "%.2f s" % span
+    screen.blit(font.render(right, True, DIM),
+                (x + w - font.size(right)[0], ly))
+    mid = "t = %.2f s   frame %d/%d   %s" % (
+        t, app.frame, len(app.traj) - 1, "playing" if app.playing else "paused")
+    screen.blit(font.render(mid, True, DIM if app.playing else ACCENT),
+                (x + (w - font.size(mid)[0]) / 2, ly))
 
 
 #: Подписи рядов кнопок. row 0 -- регулятор, красящий карту; row 1 -- второй
@@ -1755,11 +2759,61 @@ def pick_label(row: int, key) -> str:
     return ESTIMATOR_LABEL[key] if row == 2 else CONTROLLER_LABEL[key]
 
 
+#: Размеры шрифта кнопок, от крупного к мелкому. Ряд кнопок -- единственное
+#: место окна, ширина которого растёт от СПИСКА регуляторов, а не от раскладки:
+#: каждый новый закон добавляет кнопку. Поэтому размер подбирается, а не задан
+#: числом -- иначе очередная запись в CONTROLLERS молча уезжала бы за край
+#: (после ER-018 ряд COMPARE при 15 пунктах кончался на 1459 при W = 1280).
+PICK_FONT_NAME = "consolas,dejavusansmono,monospace"
+PICK_FONT_SIZES = (15, 14, 13, 12, 11, 10)
+PICK_MARGIN = 16
+_PICK_SIZE_CACHE = {}
+
+
+def picker_font_size(pg):
+    """Самый КРУПНЫЙ размер из PICK_FONT_SIZES, при котором самый длинный ряд
+    кнопок влезает в окно. Мельче минимального не опускаемся: нечитаемая
+    кнопка -- такой же баг интерфейса, как обрезанная, и если ряд не влез даже
+    так, честнее увидеть обрез, чем пиксельную кашу.
+
+    Кэшируется ЧИСЛО, а не объект шрифта. Объект привязан к инициализированному
+    pygame: модульный кэш пережил бы `pg.quit()` мёртвой ссылкой, и следующий
+    же `render` по нему падает сегфолтом (ловится прогоном виз-тестов подряд).
+    """
+    rows = (CONTROLLER_KEYS, CONTROLLER_KEYS + [None], ESTIMATOR_KEYS)
+    key = tuple(tuple(r) for r in rows)
+    if key in _PICK_SIZE_CACHE:
+        return _PICK_SIZE_CACHE[key]
+    size = PICK_FONT_SIZES[-1]
+    for candidate in PICK_FONT_SIZES:
+        font = pg.font.SysFont(PICK_FONT_NAME, candidate)
+        ends = []
+        for row, keys in enumerate(rows):
+            bx = PICK[0] + 108
+            for k in keys:
+                bx += font.size(pick_label(row, k))[0] + 18 + 6
+            ends.append(bx - 6)
+        if max(ends) <= W - PICK_MARGIN:
+            size = candidate
+            break
+    _PICK_SIZE_CACHE[key] = size
+    return size
+
+
+def picker_font(pg):
+    """Шрифт кнопок. Объект живёт не дольше окна -- см. `picker_font_size`."""
+    return pg.font.SysFont(PICK_FONT_NAME, picker_font_size(pg))
+
+
 def picker_layout(app, font):
     """Прямоугольники кнопок: [(rect, row, key), ...]. row 0 -- основной,
     row 1 -- сравнение, row 2 -- оцениватель. Одна и та же раскладка нужна и
     отрисовке, и обработке клика, поэтому она -- чистая функция, а не побочный
-    эффект рисования."""
+    эффект рисования.
+
+    `font` обязан быть тем же, которым кнопки РИСУЮТСЯ (`picker_font`):
+    раскладка, посчитанная другим шрифтом, ловила бы мышь не там, где рисует.
+    """
     out = []
     rows = (CONTROLLER_KEYS, CONTROLLER_KEYS + [None], ESTIMATOR_KEYS)
     for row, keys in enumerate(rows):
@@ -1842,6 +2896,13 @@ def draw_noise(app, screen, pg, font):
         screen.blit(font.render("ideal: sensor knobs do nothing", True, GRID_LINE),
                     (hx, NOISE_Y))
         return
+    if app.est_key == "kalman":
+        # tau -- ручка комплементарного фильтра; Калману она ни к чему.
+        # Надпись -- только если влезает до кнопок мира.
+        text = "kalman: tau unused"
+        if hx + font.size(text)[0] <= world_buttons(app, font)[-1][2][0] - 10:
+            screen.blit(font.render(text, True, GRID_LINE), (hx, NOISE_Y))
+        return
     # Две метки подписаны рядом с дорожкой, чтобы не гадать, какая из них
     # какая. "white" -- напоминание, что модель считает ошибку акселерометра
     # белой; всё расхождение с замером живёт именно в этом слове.
@@ -1851,13 +2912,13 @@ def draw_noise(app, screen, pg, font):
             text = "meas: press T"
         else:
             text = f"{name} {'--' if value is None else format(value, '.3f')}"
-        if hx + 12 + font.size(text)[0] > W - 24:
+        if hx + 12 + font.size(text)[0] > world_buttons(app, font)[-1][2][0] - 10:
             break
         pg.draw.rect(screen, color, (hx, NOISE_Y + 4, 8, 8))
         screen.blit(font.render(text, True, color), (hx + 12, NOISE_Y))
         hx += 12 + font.size(text)[0] + 14
     tail = "tau*, white-accel model vs measured"
-    if hx + font.size(tail)[0] <= W - 24:
+    if hx + font.size(tail)[0] <= world_buttons(app, font)[-1][2][0] - 10:
         screen.blit(font.render(tail, True, GRID_LINE), (hx, NOISE_Y))
 
 
@@ -2005,7 +3066,7 @@ def draw_settings(app, screen, pg, font):
     pg.draw.rect(screen, GRID_LINE, SETTINGS, 1, border_radius=6)
     screen.blit(font.render("SETTINGS  --  LQR cost  Q = diag(q_psi, q_theta, q_dpsi, q_dtheta)",
                             True, TEXT), (x + 24, y + 16))
-    screen.blit(font.render("base: lqr, bang-ell*, bang-map, phase 3;  soft: phase 2 of bang-eps*",
+    screen.blit(font.render("base: LQR and phase 3;  soft: phase 2 of both relay schemes",
                             True, DIM), (x + 24, y + 38))
     screen.blit(font.render("base", True, TEXT), (x + 160, y + 66))
     screen.blit(font.render("soft", True, TEXT), (x + 340, y + 66))
@@ -2213,7 +3274,675 @@ def noise_key(app, event, pg):
     return True
 
 
+# --- виды фильтра: A (эллипс 1σ) и B (измерения) -------------------------------
+#  Рисуются поверх правой половины окна (PLANT + графики), до дорожки времени:
+#  карта слева и дорожка внизу остаются и управляют видом (решение Глеба 01.10).
+
+
+def filter_view_rect():
+    """Прямоугольник вида: от верха PLANT до дорожки фаз (не включая)."""
+    phase = plot_layout()[2]
+    return (ANIM[0], ANIM[1], ANIM[2], phase[1] - ANIM[1] - 6)
+
+
+def view_buttons(app, font):
+    """[(key, label, rect)] в строке заголовка PLANT, справа."""
+    out, right = [], ANIM[0] + ANIM[2]
+    for key, label in (("C", "[B] biases"), ("B", "[H] y vs h(x,u)"), ("A", "[V] P ellipse")):
+        w = font.size(label)[0] + 14
+        right -= w
+        out.append((key, label, (right, ANIM[1] - 22, w, 20)))
+        right -= 8
+    return out
+
+
+def draw_view_buttons(app, screen, pg, font):
+    for key, label, rect in view_buttons(app, font):
+        on = app.view == key
+        pg.draw.rect(screen, BTN_ON if on else BTN, rect, border_radius=4)
+        screen.blit(font.render(label, True, BG if on else TEXT), (rect[0] + 7, rect[1] + 2))
+
+
+def view_buttons_click(app, pos, font) -> bool:
+    for key, _, (rx, ry, rw, rh) in view_buttons(app, font):
+        if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
+            app.toggle_view(key)
+            return True
+    return False
+
+
+def _ellipse_1sigma(P2, n=96):
+    """Контур e^T P2^-1 e = 1: полуоси sqrt(lambda) по собственным векторам
+    (docs/kalman_views.md §9.2, §10).  Возвращает (n, 2)."""
+    a, b, d = P2[0, 0], P2[0, 1], P2[1, 1]
+    half, root = 0.5 * (a + d), np.sqrt((0.5 * (a - d)) ** 2 + b ** 2)
+    l1, l2 = max(half + root, 0.0), max(half - root, 0.0)
+    phi = 0.5 * np.arctan2(2 * b, a - d)
+    v1 = np.array([np.cos(phi), np.sin(phi)])
+    v2 = np.array([-np.sin(phi), np.cos(phi)])
+    tt = np.linspace(0, 2 * np.pi, n)
+    return (np.sqrt(l1) * np.cos(tt)[:, None] * v1 + np.sqrt(l2) * np.sin(tt)[:, None] * v2)
+
+
+#: Порог вырождения блока P2 (§17.1): cond выше -- эллипс считаем отрезком.
+COND_FLAT = 1e8
+
+
+def _mahalanobis2(e, P2):
+    """d^2 = e^T P2^-1 e по кадрам через спектр, без inv (§17.1).
+
+    При Q = 0 блок P2 к нескольким секундам вырождается (cond ~ 1e16, а
+    округление даёт и отрицательное собственное число) -- inv падал с
+    Singular matrix.  Собственные числа поднимаем до 1e-12 * tr P2;
+    flat[k] = True, если cond P2[k] > COND_FLAT, -- такое d^2 не показатель.
+    Возвращает (d2, flat), оба формы (n,)."""
+    lam, V = np.linalg.eigh(0.5 * (P2 + np.swapaxes(P2, -1, -2)))
+    tr = np.maximum(lam.sum(axis=-1, keepdims=True), np.finfo(float).tiny)
+    floor = 1e-12 * tr
+    flat = lam[:, 0] < lam[:, -1] / COND_FLAT
+    lam = np.maximum(lam, floor)
+    z = np.einsum("kij,ki->kj", V, e)
+    return np.sum(z * z / lam, axis=-1), flat
+
+
+def _series(screen, pg, font, rect, t, series, title, cursor_t, band=None, log=False,
+            clip_q=99.5):
+    """Маленький график: series = [(y, color, label)], band = (lo, hi, color).
+    log -- ось log10 для положительных величин (sqrt(P) падает на порядки).
+    Масштаб -- по квантилю clip_q, чтобы всплеск первых шагов не съел всё."""
+    x, y, w, h = rect
+    pg.draw.rect(screen, BG, rect, border_radius=3)
+    pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=3)
+    tx = x + 6
+    screen.blit(font.render(title, True, DIM), (tx, y + 3))
+    tx += font.size(title)[0] + 12
+    for _, color, label in series:
+        screen.blit(font.render(label, True, color), (tx, y + 3))
+        tx += font.size(label)[0] + 12
+    stack = [np.asarray(v, float) for v, _, _ in series]
+    if band is not None:
+        stack += [np.asarray(band[0], float), np.asarray(band[1], float)]
+    vals = np.concatenate([v[np.isfinite(v)] for v in stack]) if stack else np.zeros(1)
+    if log:
+        vals = vals[vals > 0]
+        if vals.size == 0:
+            return
+        lo, hi = np.log10(np.percentile(vals, 100 - clip_q)), np.log10(vals.max())
+        f = lambda v: np.log10(np.maximum(v, 10 ** lo))
+    else:
+        m = np.percentile(np.abs(vals), clip_q) if vals.size else 1.0
+        lo, hi = -m, m
+        f = lambda v: v
+    if not np.isfinite(hi - lo) or hi <= lo:
+        hi = lo + 1.0
+    top, bot = y + 22, y + h - 4
+    t0, t1 = float(t[0]), float(t[-1]) if t[-1] > t[0] else float(t[0]) + 1.0
+    step = max(1, len(t) // max(1, w))
+    tt = np.asarray(t)[::step]
+
+    def px(tv, v):
+        vv = np.clip(f(v), lo, hi)
+        return (x + 4 + (tv - t0) / (t1 - t0) * (w - 8), bot - (vv - lo) / (hi - lo) * (bot - top))
+
+    if band is not None:
+        blo, bhi = np.asarray(band[0])[::step], np.asarray(band[1])[::step]
+        pts = [px(a, b) for a, b in zip(tt, bhi)] + [px(a, b) for a, b in zip(tt[::-1], blo[::-1])]
+        pts = [p for p in pts if np.isfinite(p[1])]
+        if len(pts) > 2:
+            surf = pg.Surface((W, H), pg.SRCALPHA)
+            pg.draw.polygon(surf, band[2] + (70,), pts)
+            screen.blit(surf, (0, 0))
+    if not log:
+        _, zy = px(t0, 0.0)
+        pg.draw.line(screen, GRID_LINE, (x + 4, zy), (x + w - 4, zy), 1)
+    for v, color, _ in series:
+        vv = np.asarray(v)[::step]
+        pts = [px(a, b) for a, b in zip(tt, vv) if np.isfinite(b)]
+        if len(pts) > 1:
+            pg.draw.lines(screen, color, False, pts, 1)
+    lab_hi = f"{10 ** hi:.1e}" if log else f"{hi:+.2g}"
+    lab_lo = f"{10 ** lo:.1e}" if log else f"{lo:+.2g}"
+    screen.blit(font.render(lab_hi, True, GRID_LINE), (x + w - 6 - font.size(lab_hi)[0], y + 3))
+    screen.blit(font.render(lab_lo, True, GRID_LINE), (x + w - 6 - font.size(lab_lo)[0], bot - 16))
+    cx = px(cursor_t, 0.0 if not log else 10 ** hi)[0]
+    pg.draw.line(screen, ACCENT, (cx, top), (cx, bot), 1)
+
+
+#: Окно скользящего среднего на виде B (§17.3 а), с: 100 отсчётов при dt = 1 мс.
+MEAN_WINDOW_S = 0.1
+
+
+def _running_mean(v, n):
+    """Скользящее среднее назад по n отсчётам (в начале -- по тому, что есть).
+    Назад, а не по центру: линия не знает будущего, как и фильтр."""
+    v = np.asarray(v, float)
+    n = max(1, int(round(n)))
+    c = np.concatenate([[0.0], np.cumsum(v)])
+    i = np.arange(1, len(v) + 1)
+    lo = np.maximum(i - n, 0)
+    return (c[i] - c[lo]) / (i - lo)
+
+
+def _ellipse_px(center_px, P2, sx, sy, k=1.0):
+    """Контур эллипса 1σ (× k) в пикселях: sx, sy -- пикселей на единицу
+    по psi и по dpsi (ось dpsi вверх)."""
+    pts = _ellipse_1sigma(P2) * k
+    return [(center_px[0] + p[0] * sx, center_px[1] - p[1] * sy) for p in pts]
+
+
+def draw_view_a(app, screen, pg, font):
+    """Вид A (§12, §14): фазовая плоскость (psi, dpsi) -- истинная траектория
+    и оценка растут до текущего кадра; в текущей точке эллипс 1σ по P,
+    увеличенный в k раз (одно k на прогон).  Лупа в углу -- та же точка в
+    НАСТОЯЩЕМ масштабе: оценка, истина и эллипс 1σ."""
+    x, y, w, h = filter_view_rect()
+    d = app.diag
+    k = app.diag_frame()
+    X = d["x"][:, [I_PSI, I_DPSI]]
+    Xh = d["x_hat"][:, [I_PSI, I_DPSI]]
+    P2 = d["P"][:, [I_PSI, I_DPSI]][:, :, [I_PSI, I_DPSI]]
+    s_psi, s_dpsi = np.sqrt(P2[:, 0, 0]), np.sqrt(P2[:, 1, 1])
+
+    # --- большая плоскость
+    plane = (x + 12, y + 34, w - 24, h - 34 - 150)
+    pg.draw.rect(screen, BG, plane, border_radius=3)
+    pg.draw.rect(screen, GRID_LINE, plane, 1, border_radius=3)
+    both = np.vstack([X, Xh])
+    both = both[np.isfinite(both).all(axis=1)]
+    lo, hi = both.min(axis=0), both.max(axis=0)
+    pad = 0.08 * np.maximum(hi - lo, 1e-6)
+    lo, hi = lo - pad, hi + pad
+    px_per = ((plane[2] - 16) / (hi[0] - lo[0]), (plane[3] - 16) / (hi[1] - lo[1]))
+
+    def to(p):
+        return (plane[0] + 8 + (p[0] - lo[0]) * px_per[0],
+                plane[1] + plane[3] - 8 - (p[1] - lo[1]) * px_per[1])
+
+    if lo[0] < 0 < hi[0]:
+        pg.draw.line(screen, GRID_LINE, to((0, lo[1])), to((0, hi[1])), 1)
+    if lo[1] < 0 < hi[1]:
+        pg.draw.line(screen, GRID_LINE, to((lo[0], 0)), to((hi[0], 0)), 1)
+    step = max(1, (k + 1) // 1500)
+    for traj, color in ((X, CURVE), (Xh, ESTIMATE)):
+        pts = [to(p) for p in traj[:k + 1:step] if np.all(np.isfinite(p))]
+        if len(pts) > 1:
+            pg.draw.lines(screen, color, False, pts, 2 if color is CURVE else 1)
+    kk = d["scale_k"]
+    if np.all(np.isfinite(Xh[k])):
+        ell = _ellipse_px(to(Xh[k]), P2[k], px_per[0], px_per[1], kk)
+        pg.draw.lines(screen, ESTIMATE, True, ell, 2)
+    if np.all(np.isfinite(X[k])):
+        tx_, ty_ = to(X[k])
+        pg.draw.circle(screen, ACCENT, (int(tx_), int(ty_)), 4)
+    screen.blit(font.render("psi [rad] ->", True, DIM),
+                (plane[0] + plane[2] - 110, plane[1] + plane[3] - 20))
+    screen.blit(font.render("dpsi [rad/s]", True, DIM), (plane[0] + 6, plane[1] + 4))
+    legend = [("truth x(t)", CURVE), ("estimate x_hat(t)", ESTIMATE),
+              (f"ellipse 1 sigma x{kk:.0e}", ESTIMATE)]
+    lx = plane[0] + 120
+    for label, color in legend:
+        screen.blit(font.render(label, True, color), (lx, plane[1] + 4))
+        lx += font.size(label)[0] + 14
+
+    # --- лупа: настоящий масштаб вокруг оценки
+    # Лупа -- в тот угол плоскости, где меньше всего кривой: иначе она
+    # закрывает ровно то, на что смотрят.
+    side = 170
+    corners = [(plane[0] + plane[2] - side - 8, plane[1] + 26),
+               (plane[0] + 8, plane[1] + 26),
+               (plane[0] + plane[2] - side - 8, plane[1] + plane[3] - side - 26),
+               (plane[0] + 8, plane[1] + plane[3] - side - 26)]
+    pts_all = np.array([to(p) for p in np.vstack([X[::20], Xh[k:k + 1]])
+                        if np.all(np.isfinite(p))])
+
+    def crowd(cx, cy):
+        if pts_all.size == 0:
+            return 0
+        inside = ((pts_all[:, 0] > cx - 10) & (pts_all[:, 0] < cx + side + 10)
+                  & (pts_all[:, 1] > cy - 10) & (pts_all[:, 1] < cy + side + 10))
+        return int(inside.sum())
+
+    lx0, ly0 = min(corners, key=lambda c: crowd(*c))
+    lens = (lx0, ly0, side, side)
+    pg.draw.rect(screen, PANEL, lens, border_radius=3)
+    pg.draw.rect(screen, ACCENT, lens, 1, border_radius=3)
+    err = X[k] - Xh[k]
+    # Оси лупы ЗАКРЕПЛЕНЫ на весь прогон (решение Глеба 01.10): полуширина --
+    # 1.5 sqrt(P) первого кадра.  Тогда видно, как эллипс сжимается со
+    # временем; истина за краем прижимается к рамке.
+    half = d["lens_half"]
+    err = np.clip(err, (-0.98 * half[0], -0.98 * half[1]), (0.98 * half[0], 0.98 * half[1]))
+    c = (lens[0] + side / 2, lens[1] + side / 2)
+    lsx, lsy = side / 2 / half[0], side / 2 / half[1]
+    pg.draw.line(screen, GRID_LINE, (lens[0], c[1]), (lens[0] + side, c[1]), 1)
+    pg.draw.line(screen, GRID_LINE, (c[0], lens[1]), (c[0], lens[1] + side), 1)
+    pg.draw.lines(screen, ESTIMATE, True, _ellipse_px(c, P2[k], lsx, lsy), 2)
+    pg.draw.circle(screen, ESTIMATE, (int(c[0]), int(c[1])), 3)
+    if np.all(np.isfinite(err)):
+        ex = (c[0] + err[0] * lsx, c[1] - err[1] * lsy)
+        pg.draw.circle(screen, ACCENT, (int(ex[0]), int(ex[1])), 4)
+    screen.blit(font.render("lens x1, fixed axes", True, ACCENT), (lens[0] + 4, lens[1] + 2))
+    screen.blit(font.render(f"+-{half[0]:.0e}", True, DIM),
+                (lens[0] + side - 4 - font.size(f"+-{half[0]:.0e}")[0], c[1] + 2))
+    screen.blit(font.render(f"+-{half[1]:.0e}", True, DIM), (c[0] + 4, lens[1] + side - 18))
+
+    # --- числа и графики sqrt(P), |e|
+    e = Xh - X
+    d2, flat = _mahalanobis2(e[:k + 1], P2[:k + 1])
+    by = plane[1] + plane[3] + 6
+    if flat[-1]:
+        # §17.1: при Q = 0 эллипс сплющивается в отрезок вдоль неустойчивого
+        # направления; d^2 тогда мерит округление, а не ошибку -- не печатаем.
+        second = ("P degenerate (Q = 0?): ellipse is a segment, d^2 not defined", ACCENT)
+    else:
+        ok = ~flat
+        inside = float(np.mean(d2[ok] <= 1.0)) if ok.any() else float("nan")
+        second = (f"truth inside 1 sigma: now d^2 = {d2[-1]:.2f}; so far {100 * inside:.0f} % "
+                  "(honest ~39 %)", ACCENT)
+    lines = [(f"sqrt(P): psi {s_psi[k]:.1e},  dpsi {s_dpsi[k]:.1e}", ESTIMATE), second]
+    for i, (line, color) in enumerate(lines):
+        screen.blit(font.render(line, True, color), (x + 12, by + i * 18))
+    gy = by + 40
+    gw = (w - 36) // 2
+    t = d["t"]
+    _series(screen, pg, font, (x + 12, gy, gw, y + h - 8 - gy), t,
+            [(s_psi, ESTIMATE, "sqrt(P)"), (np.abs(e[:, 0]), ACCENT, "|e|")],
+            "psi", t[k], log=True, clip_q=100)
+    _series(screen, pg, font, (x + 24 + gw, gy, gw, y + h - 8 - gy), t,
+            [(s_dpsi, ESTIMATE, "sqrt(P)"), (np.abs(e[:, 1]), ACCENT, "|e|")],
+            "dpsi", t[k], log=True, clip_q=100)
+
+
+VIEW_B_CHANNELS = (("a_x", "m/s^2"), ("a_z", "m/s^2"), ("omega", "rad/s"), ("enc", "rad"))
+
+
+def draw_view_b(app, screen, pg, font):
+    """Вид B: разности относительно чистого показания h(x, u) (§4):
+    y - h(x,u) -- смещение + шум датчика (не убывает);
+    h(x^-,u) - h(x,u) -- ошибка фильтра в показании (убывает);
+    коридор +-sqrt(S) вокруг предсказания: S = C P^- C^T + R."""
+    x, y, w, h = filter_view_rect()
+    d = app.diag
+    k = app.diag_frame()
+    t = d["t"]
+    m = d["y"].shape[1]
+    top = y + 34
+    row_h = (h - 44) // m
+    for i in range(m):
+        name, unit = VIEW_B_CHANNELS[i]
+        dy = d["y"][:, i] - d["y_clean"][:, i]
+        dp = d["y_pred"][:, i] - d["y_clean"][:, i]
+        sd = np.sqrt(d["S"][:, i])
+        # Разложение на «bias» и «state» (§13) рисовалось 01.10 и убрано по
+        # решению Глеба: график читался хуже.  Данные (b_prior, b_true) в
+        # self.diag остаются -- для тестов и анализа.
+        # Скользящее среднее серого облака (§17.3 а, решение Глеба 01.10):
+        # шум усредняется в sqrt(N) раз, и линия садится на уровень смещения.
+        _series(screen, pg, font, (x + 12, top + i * row_h, w - 24, row_h - 6), t,
+                [(dy, _shade(CURVE, 0.55), "y - h(x,u)"),
+                 (_running_mean(dy, MEAN_WINDOW_S / app.args.dt), ACCENT,
+                  f"mean {MEAN_WINDOW_S:g} s"),
+                 (dp, ESTIMATE, "h(x^-,u) - h(x,u)")],
+                f"{name} [{unit}]", t[k], band=(dp - sd, dp + sd, ESTIMATE))
+
+
+VIEW_C_CHANNELS = (("b_ax", "m/s^2"), ("b_az", "m/s^2"), ("b_g", "rad/s"))
+
+
+def draw_view_c(app, screen, pg, font):
+    """Вид C (§17.3 б): как фильтр справляется со смещениями.  По каналу:
+    |b^ - b| (ошибка оценки), sqrt(P_bb) (что фильтр о ней думает) и |b|
+    (само смещение -- для масштаба).  Ось log10, как у графиков вида A:
+    ошибка падает на порядки, в линейной оси её конец не виден."""
+    x, y, w, h = filter_view_rect()
+    d = app.diag
+    k = app.diag_frame()
+    t = d["t"]
+    b_hat, b_true = d["b_hat"], d["b_true"]
+    P = d["P"]
+    nb = P.shape[1]
+    top = y + 34
+    row_h = (h - 44) // 4
+    for i, (name, unit) in enumerate(VIEW_C_CHANNELS):
+        j = nb - 3 + i                     # смещения -- последние три в состоянии
+        err = np.abs(b_hat[:, i] - b_true[:, i])
+        sp = np.sqrt(np.maximum(P[:, j, j], 0.0))
+        # Числа текущего кадра -- в подписях кривых: заголовок короткий,
+        # иначе он наезжает на метки оси справа.
+        _series(screen, pg, font, (x + 12, top + i * row_h, w - 24, row_h - 6), t,
+                [(np.abs(b_true[:, i]), DIM, f"|b| {abs(b_true[k, i]):.1e}"),
+                 (sp, ESTIMATE, f"sqrt(P) {sp[k]:.1e}"),
+                 (err, ACCENT, f"|b^-b| {err[k]:.1e}")],
+                name, t[k], log=True, clip_q=100)
+
+    # Честность по ансамблю (kalman_speed §6.2): одна клетка не говорит,
+    # честна ли P, а все клетки карты в один момент -- говорят.
+    rect = (x + 12, top + 3 * row_h, w - 24, row_h - 6)
+    nees = app.nees
+    if nees is None or not len(nees["t"]):
+        pg.draw.rect(screen, BG, rect, border_radius=3)
+        pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=3)
+        screen.blit(font.render("NEES over the map: needs the map computed with kalman+enc",
+                                True, DIM), (rect[0] + 6, rect[1] + 3))
+        return
+    tn, mean, cnt, wild = nees["t"], nees["mean"], nees["count"], nees["wild"]
+    lo, hi = _chi2_mean_band(3, cnt)
+    j = int(np.clip(np.searchsorted(tn, t[k]), 0, len(tn) - 1))
+    _series(screen, pg, font, rect, tn,
+            [(np.full(len(tn), 3.0), DIM, f"3 ({lo[j]:.2f}..{hi[j]:.2f})"),
+             (mean, ACCENT, f"mean {mean[j]:.3g}"),
+             (np.full(len(tn), np.nan), CURVE, f"wild {int(wild[j])}/{int(cnt[j])}")],
+            "NEES(b), map", t[k], band=(lo, hi, ESTIMATE), log=True, clip_q=100)
+
+
+def draw_view(app, screen, pg, font):
+    if app.view is None:
+        return
+    rect = filter_view_rect()
+    pg.draw.rect(screen, PANEL, rect, border_radius=6)
+    pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=6)
+    title = {"A": "VIEW A  --  phase plane (psi, dpsi), 1-sigma ellipse of P",
+             "B": "VIEW B  --  y and h(x^-,u) minus clean h(x,u);  band +-sqrt(S)",
+             "C": "VIEW C  --  biases: estimate error |b^ - b| vs sqrt(P_bb)"}
+    screen.blit(font.render(title[app.view], True, TEXT), (rect[0] + 12, rect[1] + 10))
+    if app.diag is None:
+        screen.blit(font.render(app.diag_note or "select a cell", True, ACCENT),
+                    (rect[0] + 12, rect[1] + 40))
+        return
+    {"A": draw_view_a, "B": draw_view_b, "C": draw_view_c}[app.view](app, screen, pg, font)
+
+
+# --- кнопки мира, модели и фильтра (ER-025) ----------------------------------
+#  Правый конец ряда слайдеров датчика: там свободно, а ряд и так про датчик.
+
+
+def world_buttons(app, font):
+    """[(key, label, rect)] справа налево: kalman, model, world."""
+    out, right = [], W - 24
+    for key, label in (("kalman", "kalman"), ("model", "model"),
+                       ("world", "world: " + ("wind" if app.phys["wind"] else "clean"))):
+        w = font.size(label)[0] + 18
+        right -= w
+        out.append((key, label, (right, NOISE_Y - 3, w, 22)))
+        right -= 10
+    return out
+
+
+def draw_world_buttons(app, screen, pg, font):
+    on = {"kalman": app.kf_open, "model": app.model_open, "world": app.phys["wind"]}
+    for key, label, rect in world_buttons(app, font):
+        pg.draw.rect(screen, BTN_ON if on[key] else BTN, rect, border_radius=4)
+        pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=4)
+        screen.blit(font.render(label, True, BG if on[key] else TEXT),
+                    (rect[0] + 9, rect[1] + 3))
+
+
+def world_buttons_click(app, pos, font) -> bool:
+    for key, _, (rx, ry, rw, rh) in world_buttons(app, font):
+        if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
+            {"kalman": app.open_kf, "model": app.open_model,
+             "world": app.toggle_world}[key]()
+            return True
+    return False
+
+
+def plot_toggle_rect(font):
+    """Переключатель нижнего графика u | w -- в строке заголовка TRAJECTORY."""
+    label = "[P] u | w"
+    w = font.size(label)[0] + 14
+    return (PLOT[0] + PLOT[2] - w, PLOT[1] - 22, w, 20)
+
+
+# --- общие части модальных панелей --------------------------------------------
+
+
+def _draw_field(screen, pg, font, rect, text, focused, enabled=True):
+    pg.draw.rect(screen, BG, rect, border_radius=3)
+    pg.draw.rect(screen, ACCENT if focused else GRID_LINE, rect, 1, border_radius=3)
+    screen.blit(font.render(text + ("_" if focused else ""), True,
+                            TEXT if enabled else GRID_LINE), (rect[0] + 6, rect[1] + 4))
+
+
+def _draw_button(screen, pg, font, rect, label, primary=False):
+    pg.draw.rect(screen, BTN_ON if primary else BTN, rect, border_radius=4)
+    screen.blit(font.render(label, True, BG if primary else TEXT), (rect[0] + 12, rect[1] + 5))
+
+
+def _draw_veil(screen, pg, rect, title, subtitle, font):
+    veil = pg.Surface((W, H), pg.SRCALPHA)
+    veil.fill(BG + (150,))
+    screen.blit(veil, (0, 0))
+    x, y, _, _ = rect
+    pg.draw.rect(screen, PANEL, rect, border_radius=6)
+    pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=6)
+    screen.blit(font.render(title, True, TEXT), (x + 24, y + 16))
+    screen.blit(font.render(subtitle, True, DIM), (x + 24, y + 38))
+
+
+def _bottom_buttons(font, rect):
+    x, y, w, h = rect
+    out, bx = [], x + 24
+    for key in ("apply", "defaults", "close"):
+        bw = font.size(key)[0] + 24
+        out.append(("button", key, (bx, y + h - 44, bw, 26)))
+        bx += bw + 10
+    return out
+
+
+def _type_into(text_map, focus, event, pg, chars=SETTINGS_CHARS):
+    text = text_map.get(focus, "")
+    if event.key == pg.K_BACKSPACE:
+        text_map[focus] = text[:-1]
+    elif event.unicode and event.unicode in chars:
+        text_map[focus] = text + event.unicode
+
+
+# --- панель model --------------------------------------------------------------
+
+
+def model_layout(font):
+    """[(kind, key, rect)]: поля физики мира и номинала, ветра и кнопки."""
+    x, y, w, h = MODEL_PANEL
+    out = []
+    for i, k in enumerate(PHYS_KEYS):
+        out.append(("field", f"world.{k}", (x + 170, y + 104 + i * 30, 140, 24)))
+        out.append(("field", f"nominal.{k}", (x + 335, y + 104 + i * 30, 140, 24)))
+    out.append(("toggle", "same", (x + 490, y + 104, 180, 24)))
+    out.append(("toggle", "wind", (x + 170, y + 250, 140, 24)))
+    for i, k in enumerate(DEFAULT_WIND):
+        out.append(("field", f"wind.{k}", (x + 170, y + 284 + i * 30, 140, 24)))
+    return out + _bottom_buttons(font, MODEL_PANEL)
+
+
+def draw_model_panel(app, screen, pg, font):
+    if not app.model_open:
+        return
+    x, y, w, h = MODEL_PANEL
+    _draw_veil(screen, pg, MODEL_PANEL, "MODEL  --  world (what happens) and nominal "
+               "(what controller and filter know)",
+               "nominal = world: one machine;  otherwise the controller and the filter "
+               "work with a wrong model", font)
+    screen.blit(font.render("world", True, TEXT), (x + 170, y + 80))
+    screen.blit(font.render("nominal", True, TEXT), (x + 335, y + 80))
+    units = {"mb": "m_b, kg", "mw": "m_w, kg", "l": "l, m", "r": "r, m"}
+    for i, k in enumerate(PHYS_KEYS):
+        screen.blit(font.render(units[k], True, DIM), (x + 24, y + 108 + i * 30))
+    screen.blit(font.render("WIND", True, TEXT), (x + 24, y + 254))
+    wl = {"sigma_psi": "sigma_psi, N*m", "sigma_theta": "sigma_theta, N*m",
+          "tau_w": "tau_w, s", "seed": "seed"}
+    for i, k in enumerate(DEFAULT_WIND):
+        screen.blit(font.render(wl[k], True, DIM), (x + 24, y + 288 + i * 30))
+    same = app.model_text.get("same") == "yes"
+    wind = app.model_text.get("wind") == "on"
+    for kind, key, rect in model_layout(font):
+        if kind == "field":
+            enabled = not (same and key.startswith("nominal.")) and \
+                (wind or not key.startswith("wind."))
+            text = app.model_text.get(key, "")
+            if same and key.startswith("nominal."):
+                text = app.model_text.get("world." + key.split(".")[1], "")
+            _draw_field(screen, pg, font, rect, text, key == app.model_focus, enabled)
+        elif kind == "toggle":
+            label = {"same": f"nominal = world: {'yes' if same else 'no'}",
+                     "wind": f"wind: {'on' if wind else 'off'}"}[key]
+            _draw_button(screen, pg, font, rect, label, primary=(same if key == "same" else wind))
+        else:
+            _draw_button(screen, pg, font, rect, key, primary=key == "apply")
+    growth = app.mismatch_growth()
+    lines = []
+    if growth is not None:
+        lines.append(f"now: nominal != world,  max Re eig(A_w - B_w K_n) = {growth:+.3f}"
+                     + ("  (UNSTABLE)" if growth >= 0 else ""))
+        lines.append("certificate c* and relay curve are the NOMINAL model's")
+    if app.phys["wind"]:
+        lines.append("recoverable limit on the map is the no-wind one")
+    for i, line in enumerate(lines):
+        screen.blit(font.render(line, True, DIM), (x + 24, y + 410 + i * 20))
+    if app.model_error:
+        screen.blit(font.render(app.model_error, True, (235, 110, 90)), (x + 24, y + h - 78))
+    hint = "Enter apply   Tab next   Esc close"
+    screen.blit(font.render(hint, True, DIM), (x + w - 24 - font.size(hint)[0], y + h - 39))
+
+
+def model_click(app, pos, font):
+    for kind, key, (rx, ry, rw, rh) in model_layout(font):
+        if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
+            if kind == "field":
+                app.model_focus = key
+            elif key == "same":
+                app.model_text["same"] = "no" if app.model_text.get("same") == "yes" else "yes"
+            elif key == "wind":
+                app.model_text["wind"] = "off" if app.model_text.get("wind") == "on" else "on"
+            elif key == "apply":
+                model_submit(app)
+            elif key == "defaults":
+                for k in PHYS_KEYS:
+                    app.model_text[f"world.{k}"] = f"{DEFAULT_PHYS[k]:g}"
+                    app.model_text[f"nominal.{k}"] = f"{DEFAULT_PHYS[k]:g}"
+                for k, v in DEFAULT_WIND.items():
+                    app.model_text[f"wind.{k}"] = f"{v:g}"
+                app.model_text["same"] = "yes"
+            elif key == "close":
+                app.model_open = False
+            return
+
+
+def model_submit(app):
+    error = app.apply_model(dict(app.model_text))
+    app.model_error = error or ""
+    if error is None:
+        app.model_open = False
+
+
+def model_key(app, event, pg):
+    if event.key == pg.K_ESCAPE:
+        app.model_open = False
+    elif event.key in (pg.K_RETURN, pg.K_KP_ENTER):
+        model_submit(app)
+    elif event.key in (pg.K_TAB, pg.K_DOWN, pg.K_UP):
+        step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
+        i = MODEL_KEYS.index(app.model_focus) if app.model_focus else -1
+        app.model_focus = MODEL_KEYS[(i + step) % len(MODEL_KEYS)]
+    elif app.model_focus is not None:
+        _type_into(app.model_text, app.model_focus, event, pg)
+    return True
+
+
+# --- панель kalman --------------------------------------------------------------
+
+
+def kf_layout(font):
+    x, y, w, h = KF_PANEL
+    out = []
+    for i, key in enumerate(KF_CHOICES):
+        out.append(("choice", key, (x + 150, y + 84 + i * 30, 150, 24)))
+    for i, key in enumerate(KF_FIELDS):
+        out.append(("field", key, (x + 520, y + 84 + i * 30, 130, 24)))
+    return out + _bottom_buttons(font, KF_PANEL)
+
+
+def draw_kf_panel(app, screen, pg, font):
+    if not app.kf_open:
+        return
+    x, y, w, h = KF_PANEL
+    _draw_veil(screen, pg, KF_PANEL, "KALMAN  --  chip, bias prior, disturbance model",
+               "chip is the world's: it changes the IMU of EVERY estimator", font)
+    cl = {"chip": "chip", "prior": "bias prior", "drift": "bias drift",
+          "w_model": "w in filter"}
+    for i, key in enumerate(KF_CHOICES):
+        screen.blit(font.render(cl[key], True, DIM), (x + 24, y + 88 + i * 30))
+    for i, key in enumerate(KF_FIELDS):
+        screen.blit(font.render(KF_LABELS[key], True, DIM), (x + 330, y + 88 + i * 30))
+    for kind, key, rect in kf_layout(font):
+        if kind == "choice":
+            _draw_button(screen, pg, font, rect, app.kf_text.get(key, ""),
+                         primary=app.kf_text.get(key) not in (DEFAULT_KF[key],))
+        elif kind == "field":
+            enabled = not key.startswith(("sigma_psi", "sigma_theta", "tau_w")) or \
+                app.kf_text.get("w_model") == "own"
+            if key in ("T_c", "sigma_jig"):
+                enabled = app.kf_text.get("prior") == "calibrate"
+            _draw_field(screen, pg, font, rect, app.kf_text.get(key, ""),
+                        key == app.kf_focus, enabled)
+        else:
+            _draw_button(screen, pg, font, rect, key, primary=key == "apply")
+    notes = ["raw = MPU-6050 turn-on bias, tolerance/sqrt(3): gyro 0.20 rad/s, accel 0.28 m/s^2",
+             "calibrate = stand for T_c before the run (docs/accel_kalman.md §4.3)",
+             "matched = the world's wind parameters;  own = the fields on the right"]
+    if app.est_key != "kalman" and app.est_cmp_key != "kalman":
+        notes.append("kalman+enc is not selected: only the chip changes the map now")
+    for i, line in enumerate(notes):
+        screen.blit(font.render(line, True, DIM), (x + 24, y + 310 + i * 20))
+    if app.kf_error:
+        screen.blit(font.render(app.kf_error, True, (235, 110, 90)), (x + 24, y + h - 78))
+    hint = "Enter apply   Tab next   Esc close"
+    screen.blit(font.render(hint, True, DIM), (x + w - 24 - font.size(hint)[0], y + h - 39))
+
+
+def kf_click(app, pos, font):
+    for kind, key, (rx, ry, rw, rh) in kf_layout(font):
+        if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
+            if kind == "field":
+                app.kf_focus = key
+            elif kind == "choice":
+                opts = KF_CHOICES[key]
+                cur = app.kf_text.get(key, opts[0])
+                app.kf_text[key] = opts[(opts.index(cur) + 1) % len(opts)]
+            elif key == "apply":
+                kf_submit(app)
+            elif key == "defaults":
+                app.kf_text = {k: (v if isinstance(v, str) else f"{v:g}")
+                               for k, v in DEFAULT_KF.items()}
+            elif key == "close":
+                app.kf_open = False
+            return
+
+
+def kf_submit(app):
+    error = app.apply_kf(dict(app.kf_text))
+    app.kf_error = error or ""
+    if error is None:
+        app.kf_open = False
+
+
+def kf_key(app, event, pg):
+    if event.key == pg.K_ESCAPE:
+        app.kf_open = False
+    elif event.key in (pg.K_RETURN, pg.K_KP_ENTER):
+        kf_submit(app)
+    elif event.key in (pg.K_TAB, pg.K_DOWN, pg.K_UP):
+        step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
+        i = KF_FIELDS.index(app.kf_focus) if app.kf_focus in KF_FIELDS else -1
+        app.kf_focus = KF_FIELDS[(i + step) % len(KF_FIELDS)]
+    elif app.kf_focus is not None:
+        _type_into(app.kf_text, app.kf_focus, event, pg)
+    return True
+
+
 def draw_picker(app, screen, pg, font):
+    # Кнопки рисуются шрифтом кнопок: он мельче ровно настолько, насколько
+    # нужно, чтобы ряд влез. Кэш -- на окне, а не в модуле (picker_font_size).
+    font = app.pick_font(pg)
     for row, name in enumerate(PICK_ROWS):
         screen.blit(font.render(name, True, DIM),
                     (PICK[0], PICK[1] + row * PICK_ROW + 3))
@@ -2257,53 +3986,101 @@ def draw_picker(app, screen, pg, font):
 
     draw_slider(app, screen, pg, font)
     draw_noise(app, screen, pg, font)
+    draw_world_buttons(app, screen, pg, font)
+
+
+def _legend_row(screen, pg, font, x, y, items):
+    """Строка легенды: [(вид, цвет, подпись), ...] -> следующий свободный x.
+
+    Вид -- "box" (цвет клетки карты), "line" (кривая), "dash" (пунктир) или
+    "ring" (рамка маркера): расшифровка рисуется тем же значком и тем же
+    цветом, каким нарисована сама вещь. Легенда, разошедшаяся с рисунком,
+    хуже, чем её отсутствие, поэтому других цветов тут не заводят.
+    """
+    for kind, color, text in items:
+        if x + 20 + font.size(text)[0] > W - 24:
+            break                       # обрезанная подпись врёт
+        if kind == "box":
+            pg.draw.rect(screen, color, (x, y + 2, 14, 12))
+        elif kind == "line":
+            pg.draw.line(screen, color, (x, y + 8), (x + 14, y + 8), 3)
+        elif kind == "dash":
+            for dx in (0, 6, 12):
+                pg.draw.line(screen, color, (x + dx, y + 8), (x + dx + 3, y + 8), 2)
+        else:
+            pg.draw.rect(screen, color, (x, y + 2, 14, 12), 2)
+        screen.blit(font.render(text, True, color), (x + 20, y))
+        x += 20 + font.size(text)[0] + 22
+    return x
 
 
 def draw_header(app, screen, pg, font, big):
-    screen.blit(big.render("wpend explorer  --  wheeled pendulum", True, TEXT), (24, 12))
+    # Заголовок короткий: справа в той же строке стоит строка режима, и на
+    # предупреждении о разошедшемся K ("(!) K ушло от константы") они
+    # наезжали друг на друга -- ровно в том случае, ради которого
+    # предупреждение и написано.
+    screen.blit(big.render("wpend explorer", True, TEXT), (24, 12))
     mode = "grid" if app.batch is not None else "on-demand"
     right = (f"horizon={app.args.horizon:g}s  "
              f"dt={app.args.dt:g}  stride={app.args.stride}  {mode}  "
-             f"[{app.compute_seconds:.2f}s]  {app.design_note}"
-             + ("" if app.c_tilt is None else f"  c*t={app.c_tilt:.3g}"))
+             f"[{app.compute_seconds:.2f}s]  {app.design_note}")
     screen.blit(font.render(right, True, ACCENT if app.design_hint else DIM),
                 (W - 24 - font.size(right)[0], 16))
     draw_picker(app, screen, pg, font)
 
-    legend = [("held", HELD), ("fell forward", FELL_FORWARD), ("fell backward", FELL_BACKWARD)]
-    lx = MAP[0] - 32
-    for text, code in legend:
-        pg.draw.rect(screen, OUTCOME_COLOR[code], (lx, H - 52, 14, 14))
-        screen.blit(font.render(text, True, DIM), (lx + 20, H - 52))
-        lx += 40 + font.size(text)[0]
+    # Легенда карты -- двумя строками под ней. Верхняя принадлежит ЗАДАЧЕ и не
+    # меняется от нажатых кнопок: цвета исходов, граница восстановимости,
+    # горизонт корпуса. Нижняя принадлежит ВЫБОРУ и меняется целиком: какая
+    # кривая чей регулятор и чей оцениватель. Вопрос куратора «при сравнении
+    # двух регуляторов непонятно, что к чему» -- ровно про нижнюю (ER-015).
+    row = [("box", OUTCOME_COLOR[HELD], "held"),
+           ("box", OUTCOME_COLOR[FELL_FORWARD], "fell forward"),
+           ("box", OUTCOME_COLOR[FELL_BACKWARD], "fell backward")]
     if app.psi_eq is None:
         # Свотча нет сознательно: на карте нет цвета, который он объяснял бы.
-        lim_text = "no torque limit -- every state is recoverable"
-        screen.blit(font.render(lim_text, True, DIM), (lx, H - 52))
-        lx += 20 + font.size(lim_text)[0]
+        row.append(("line", DIM, "no torque limit -- everything recoverable"))
     else:
-        pg.draw.rect(screen, LIMIT, (lx, H - 52, 14, 14))
-        lim_text = f"recoverable limit (psi_eq = {app.psi_eq:.3f})"
-        screen.blit(font.render(lim_text, True, LIMIT), (lx + 20, H - 52))
-        lx += 40 + font.size(lim_text)[0]
+        row.append(("line", LIMIT,
+                    "recoverable limit (psi_eq = %.3f)" % app.psi_eq
+                    + (", no wind" if app.phys["wind"] else "")))
+    if app.show_switch and app.switch_up is not None:
+        row.append(("line", SWITCH, "relay switch sigma = 0"))
+    if app.spec.psi_max >= HORIZON_ANGLE:
+        row.append(("dash", DIM, "psi = pi/2"))
+    _legend_row(screen, pg, font, MAP[0] - 32, LEGEND_Y, row)
+
+    row = [("line", CURVE, "main: " + CONTROLLER_LABEL[app.main_key])]
+    if app.phys["wind"]:
+        row.append(("line", WIND, "wind %.2g/%.2g N*m, %.2g s" % (
+            app.phys["sigma_psi"], app.phys["sigma_theta"], app.phys["tau_w"])))
+    if not app.phys["same"]:
+        row.append(("line", (235, 110, 90), "nominal != world"))
     if app.cmp_key is not None:
-        pg.draw.rect(screen, GHOST, (lx, H - 52, 14, 14))
-        text = f"compare: {CONTROLLER_LABEL[app.cmp_key]}"
-        screen.blit(font.render(text, True, GHOST), (lx + 20, H - 52))
-        lx += 40 + font.size(text)[0]
+        row.append(("line", GHOST, "compare: " + CONTROLLER_LABEL[app.cmp_key]))
     if app.est_key != "ideal":
-        pg.draw.rect(screen, ESTIMATE, (lx, H - 52, 14, 14))
-        text = f"estimate: {ESTIMATOR_LABEL[app.est_key]}"
-        screen.blit(font.render(text, True, ESTIMATE), (lx + 20, H - 52))
-        lx += 40 + font.size(text)[0]
+        row.append(("line", ESTIMATE, "estimate: " + ESTIMATOR_LABEL[app.est_key]))
     if app.est_cmp_key is not None:
-        pg.draw.rect(screen, GHOST_EST, (lx, H - 52, 14, 14))
-        screen.blit(font.render(f"vs est: {ESTIMATOR_LABEL[app.est_cmp_key]}",
-                                True, GHOST_EST), (lx + 20, H - 52))
-    hint = ("click a cell  |  1-8 main, Shift+1-8 compare  |  "
-            "E / Shift+E estimator, T measure tau*  |  [ ] u_max, L no limit  |  "
-            "SPACE pause  R restart  ESC quit")
-    screen.blit(font.render(hint, True, GRID_LINE), (W - 24 - font.size(hint)[0], H - 26))
+        row.append(("line", GHOST_EST,
+                    "vs est: " + ESTIMATOR_LABEL[app.est_cmp_key]))
+    row.append(("ring", ACCENT, "selected cell"))
+    # Ключ к дорожке фаз (ER-016) -- в ту же строку «выбора»: фаза
+    # принадлежит выбранному регулятору, а не задаче, и в строке графика u
+    # подписи уже не помещались -- легенда обрывалась на «+1», то есть врала
+    # ровно про то новое, ради чего дорожка и заведена.
+    if app.track is not None:
+        for code in sorted({int(c) for c in app.track["phases"]}):
+            row.append(("box", PHASE_COLOR[code], "phase " + PHASE_LABEL[code]))
+    _legend_row(screen, pg, font, MAP[0] - 32, LEGEND_Y + LEGEND_ROW, row)
+
+    # Цифр всего девять, а регуляторов может быть больше: подсказка считается
+    # по списку, а не написана числом -- иначе очередная запись в CONTROLLERS
+    # сделала бы её враньём. Кнопки без цифры доступны мышью.
+    n_digits = min(9, len(CONTROLLER_KEYS))
+    hint = ("click a cell  |  1-%d main, Shift+1-%d compare  |  E estimator  |  "
+            "[ ] u_max, L no limit  |  W M K P V H B  |  time: <- ->  |  "
+            "SPACE pause  R restart  ESC quit" % (n_digits, n_digits))
+    screen.blit(font.render(hint, True, GRID_LINE),
+                (W - 24 - font.size(hint)[0], H - 24))
 
 
 # Раскладка выше (W, H, MAP, ANIM, PLOT, SLIDER) задана в пикселях и подогнана
@@ -2406,8 +4183,26 @@ def run(app, max_frames=None, screenshot=None):
                 noise_key(app, event, pg)
             elif app.noise_open and event.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONUP):
                 continue
+            elif app.model_open and event.type == pg.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    model_click(app, canvas_pos(event.pos, view), font)
+            elif app.model_open and event.type == pg.KEYDOWN:
+                model_key(app, event, pg)
+            elif app.model_open and event.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONUP):
+                continue
+            elif app.kf_open and event.type == pg.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    kf_click(app, canvas_pos(event.pos, view), font)
+            elif app.kf_open and event.type == pg.KEYDOWN:
+                kf_key(app, event, pg)
+            elif app.kf_open and event.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONUP):
+                continue
             elif event.type == pg.MOUSEMOTION:
                 mx, my = canvas_pos(event.pos, view)
+                if app.time_drag:
+                    # Пересчёта нет ни на пиксель: кадр уже посчитан.
+                    app.scrub(time_from_px(app, mx))
+                    continue
                 if app.dragging:
                     app.preview_u_max(u_max_from_px(mx))
                     continue
@@ -2434,9 +4229,25 @@ def run(app, max_frames=None, screenshot=None):
                 if nx <= pos[0] < nx + nw and ny <= pos[1] < ny + nh:
                     app.open_noise()
                     continue
+                wx, wy, ww, wh = switch_button_rect(font)
+                if wx <= pos[0] < wx + ww and wy <= pos[1] < wy + wh:
+                    app.show_switch = not app.show_switch
+                    continue
+                if world_buttons_click(app, pos, font):
+                    continue
+                if view_buttons_click(app, pos, font):
+                    continue
+                px_, py_, pw_, ph_ = plot_toggle_rect(font)
+                if px_ <= pos[0] < px_ + pw_ and py_ <= pos[1] < py_ + ph_:
+                    app.toggle_plot_w()
+                    continue
                 if slider_hit(pos):
                     app.dragging = True
                     app.preview_u_max(u_max_from_px(pos[0]))
+                    continue
+                if app.traj is not None and time_hit(pos):
+                    app.time_drag = True
+                    app.scrub(time_from_px(app, pos[0]))
                     continue
                 if app.est_key != "ideal":
                     hit = next((sp for sp, _, tr, _ in noise_layout(font)
@@ -2447,7 +4258,9 @@ def run(app, max_frames=None, screenshot=None):
                         app.noise_drag = hit[0]
                         app.preview_noise(hit[0], noise_from_px(hit, pos[0], track))
                         continue
-                for rect, row, key in picker_layout(app, font):
+                # Тем же шрифтом, каким кнопки нарисованы (picker_font):
+                # иначе мышь ловится не там, где кнопка видна.
+                for rect, row, key in picker_layout(app, app.pick_font(pg)):
                     rx, ry, rw, rh = rect
                     if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
                         if row == 2 and shift:
@@ -2465,7 +4278,12 @@ def run(app, max_frames=None, screenshot=None):
                 # Пересчёт ровно здесь: на отпускании, а не на каждом пикселе.
                 # 0.8 с на сертификат плюс секунда-две на сетку -- это не
                 # частота кадров, и тащить слайдер стало бы нельзя.
-                if app.dragging:
+                if app.time_drag:
+                    # У дорожки времени пересчитывать нечего, и отпускание НЕ
+                    # запускает воспроизведение: кадр держится до ПРОБЕЛА
+                    # (решение Глеба 21.09).
+                    app.time_drag = False
+                elif app.dragging:
                     app.dragging = False
                     app.commit_u_max()
                 elif app.noise_drag is not None:
@@ -2488,6 +4306,22 @@ def run(app, max_frames=None, screenshot=None):
                     app.open_settings()
                 elif event.key == pg.K_n:
                     app.open_noise()
+                elif event.key == pg.K_c:
+                    app.show_switch = not app.show_switch
+                elif event.key == pg.K_w:
+                    app.toggle_world()
+                elif event.key == pg.K_m:
+                    app.open_model()
+                elif event.key == pg.K_k:
+                    app.open_kf()
+                elif event.key == pg.K_p:
+                    app.toggle_plot_w()
+                elif event.key == pg.K_v:
+                    app.toggle_view("A")
+                elif event.key == pg.K_h:
+                    app.toggle_view("B")
+                elif event.key == pg.K_b:
+                    app.toggle_view("C")
                 elif event.key == pg.K_t:
                     # Дорого (секунды), поэтому по явной просьбе, а не на
                     # каждом движении слайдера.
@@ -2503,9 +4337,15 @@ def run(app, max_frames=None, screenshot=None):
                         nxt = keys[(i + 1) % len(keys)]
                         app.est_cmp_key = nxt
                         app._update_estimator_compare()
+                        app._update_tracks()
                     else:
                         i = ESTIMATOR_KEYS.index(app.est_key)
                         app.set_estimator(ESTIMATOR_KEYS[(i + 1) % len(ESTIMATOR_KEYS)])
+                elif event.key in (pg.K_LEFT, pg.K_RIGHT):
+                    # Шаг кадра, а не времени: стрелка обязана всегда сдвигать
+                    # картинку ровно на один посчитанный кадр.
+                    step = 10 if shift else 1
+                    app.step_frame(step if event.key == pg.K_RIGHT else -step)
                 elif event.key in (pg.K_LEFTBRACKET, pg.K_RIGHTBRACKET):
                     # Шаг при выключенном пределе возвращает его: иначе
                     # клавиша молча ничего не делает.
@@ -2515,7 +4355,7 @@ def run(app, max_frames=None, screenshot=None):
                     app.commit_u_max()
                 elif shift and digit == 0:
                     app.set_compare(None)
-                elif 1 <= digit <= len(CONTROLLER_KEYS):
+                elif 1 <= digit <= min(9, len(CONTROLLER_KEYS)):
                     key = CONTROLLER_KEYS[digit - 1]
                     (app.set_compare if shift else app.set_main)(key)
 
@@ -2526,8 +4366,12 @@ def run(app, max_frames=None, screenshot=None):
         draw_map(app, screen, pg, font)
         draw_robot(app, screen, pg, font)
         draw_plots(app, screen, pg, font)
+        draw_view(app, screen, pg, font)
+        draw_view_buttons(app, screen, pg, font)
         draw_settings(app, screen, pg, font)
         draw_noise_panel(app, screen, pg, font)
+        draw_model_panel(app, screen, pg, font)
+        draw_kf_panel(app, screen, pg, font)
         if view.size == (W, H):
             # Масштаб 1 -- кладём как есть: пересемплировать нечего, и текст
             # остаётся ровно тем, что нарисовал шрифт.
@@ -2557,20 +4401,26 @@ def build_parser():
     p.add_argument("--no-precompute", dest="precompute", action="store_false",
                    help="не считать заранее: клетка считается по клику")
     p.set_defaults(precompute=True)
-    p.add_argument("--main", choices=CONTROLLER_KEYS, default="lqr",
+    # Умолчания запуска -- решение Глеба 01.10 (kalman_views §17.5): реле с
+    # накачкой энергии и фильтр Калмана.  Без scipy окно само откатит реле на lqr.
+    p.add_argument("--main", choices=CONTROLLER_KEYS, default="bang-energy-ell",
                    help="основной регулятор: он красит карту")
     p.add_argument("--compare", choices=CONTROLLER_KEYS, default=None,
                    help="регулятор сравнения: рисуется полупрозрачным поверх")
-    p.add_argument("--estimator", choices=ESTIMATOR_KEYS, default="ideal",
-                   help="что видит регулятор: ideal -- истину, остальные -- "
-                        "показания ИДУ и энкодера через комплементарный фильтр")
+    p.add_argument("--estimator", choices=ESTIMATOR_KEYS, default="kalman",
+                   help="что видит регулятор: ideal -- истину; comp, gyro, acc -- "
+                        "показания ИДУ и энкодера через комплементарный фильтр; "
+                        "kalman -- через фильтр Калмана (по умолчанию)")
     p.add_argument("--estimator-compare", choices=ESTIMATOR_KEYS, default=None,
                    help="второй оцениватель: считается для выбранной клетки и "
                         "накладывается полупрозрачным")
-    p.add_argument("--sigma-g", type=float, default=1e-4,
-                   help="плотность шума гироскопа, рад/с/sqrt(Гц)")
-    p.add_argument("--sigma-a", type=float, default=1e-3,
-                   help="плотность шума акселерометра, м/с^2/sqrt(Гц)")
+    # Плотности -- по паспорту MPU-6050 (решение Глеба 01.10, kalman_views
+    # §17.4 R1): 0.005 °/с/sqrt(Гц) и 400 мкg/sqrt(Гц).  Прежние 1e-4 и 1e-3
+    # были мягче паспорта по акселерометру в 3.9 раза.
+    p.add_argument("--sigma-g", type=float, default=8.7e-5,
+                   help="плотность шума гироскопа, рад/с/sqrt(Гц) (MPU-6050)")
+    p.add_argument("--sigma-a", type=float, default=3.9e-3,
+                   help="плотность шума акселерометра, м/с^2/sqrt(Гц) (MPU-6050)")
     p.add_argument("--b0-g", type=float, default=1e-2,
                    help="СКО смещения включения гироскопа, рад/с")
     p.add_argument("--tau", type=float, default=0.30,
@@ -2579,8 +4429,41 @@ def build_parser():
                    help="меток на оборот у моторного энкодера (он во всех вариантах, кроме ideal)")
     p.add_argument("--seed", type=int, default=0,
                    help="зерно шума датчика (при --estimator, отличном от ideal)")
+    # --- мир, номинал, фильтр Калмана (ER-025, docs/explorer_kalman.md §7) ---
+    p.add_argument("--world", choices=["clean", "wind"], default="clean",
+                   help="мир: чистый или с ветром (DisturbedWheeledPendulum); клавиша W")
+    p.add_argument("--sigma-w", type=float, nargs=2, default=None,
+                   metavar=("PSI", "THETA"), help="СКО ветра по каналам, Н*м (0.3 0.3)")
+    p.add_argument("--tau-w", type=float, default=None, help="время корреляции ветра, с (0.2)")
+    p.add_argument("--wind-seed", type=int, default=None, help="зерно ветра (7)")
+    p.add_argument("--world-params", default=None,
+                   help="физика мира, например mb=10,mw=1,l=1,r=0.3")
+    p.add_argument("--nominal-params", default=None,
+                   help="физика номинала (что знают регулятор и фильтр); по умолчанию = мир")
+    p.add_argument("--chip", choices=list(KF_CHOICES["chip"]), default=None,
+                   help="чип ИДУ: calibrated (слайдер b0_g) или raw (MPU-6050)")
+    p.add_argument("--bias-prior", choices=list(KF_CHOICES["prior"]), default=None,
+                   help="априор смещений фильтра: code или calibrate (стоянка)")
+    p.add_argument("--calib-time", type=float, default=None, help="длительность стоянки, с")
+    p.add_argument("--sigma-jig", type=float, default=None, help="неточность подставки, рад")
+    p.add_argument("--kf-w", choices=list(KF_CHOICES["w_model"]), default=None,
+                   help="возмущение в фильтре: off, matched (как у мира), own")
+    p.add_argument("--kf-q-acc", type=float, default=None, help="q_acc фильтра")
+    p.add_argument("--kf-iter", type=int, default=None, help="итерации (1 -- EKF)")
+    p.add_argument("--kf-drift", action="store_true", help="уход смещения в модели фильтра")
     p.add_argument("--eps", type=float, default=0.05,
                    help="bang-eps: реле отдаёт управление ЛКР, когда |psi| < eps, рад")
+    p.add_argument("--energy", choices=["tilt", "total"], default="tilt",
+                   help="bang-energy: какую энергию качать. tilt -- энергию "
+                        "приведённой динамики наклона (dE/dt = u b(psi) dpsi / gamma, "
+                        "скорости колеса нет); total -- полную энергию машины "
+                        "(dE/dt = u (dpsi - dtheta)). Замер 22.09: tilt 9/55/153, "
+                        "total 1/3/11 клеток при 1.5/3/10 Н*м")
+    p.add_argument("--eps-e", type=float, default=0.5,
+                   help="energy-eps: накачка отдаёт управление, когда |E - E*| < eps_e "
+                        "И |psi| < eps. Масштаб: D(1 - cos d) -- энергия, которой не "
+                        "хватает корпусу, отклонённому на d; при D = 98 и d = 0.1 рад "
+                        "это 0.49")
     p.add_argument("--u-max", type=float, default=3.0,
                    help="предел момента, Н*м -- начальное положение слайдера "
                         f"(диапазон {U_MIN:g}..{U_MAX:g}); inf -- запустить "

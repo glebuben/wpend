@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -34,6 +35,14 @@ class Estimator(ABC):
 
     def reset(self, y0: np.ndarray | None = None) -> None:
         """Инициализировать состояние фильтра перед прогоном."""
+
+    @property
+    def aux(self) -> dict:
+        """То, что оцениватель знает сверх x_hat (оценки смещений,
+        возмущения).  По умолчанию пусто.  rollout при record_estimate
+        записывает aux["w_hat"], если он есть, в Trajectory.w_hat
+        (ER-025, решение Глеба 30.09)."""
+        return {}
 
 
 class PassthroughEstimator(Estimator):
@@ -316,7 +325,7 @@ class ComplementaryEstimator(Estimator):
 
         dt = float(t) - self._t_prev
         if dt > 0:
-            if not np.isclose(dt, self.dt, rtol=1e-6, atol=0.0):
+            if not abs(dt - self.dt) <= 1e-6 * abs(self.dt):   # = np.isclose(rtol=1e-6, atol=0), но без его накладных расходов (kalman_speed §5)
                 raise ValueError(
                     f"ComplementaryEstimator: шаг {dt!r} не совпадает с dt={self.dt!r}. "
                     "От шага зависят и a = tau/(tau+dt), и оба интегрирования."
@@ -485,3 +494,848 @@ def optimal_tau(*, sigma_g=0.0, sigma_a=0.0, b=0.0, g=9.8):
     real = [float(r.real) for r in roots
             if abs(r.imag) < 1e-9 * max(1.0, abs(r.real)) and r.real > 0]
     return min(real) if real else None
+
+
+# ---------------------------------------------------------------------------
+#  ER-025: фильтр Калмана с уравнениями акселерометра и калибровка на подставке
+# ---------------------------------------------------------------------------
+#  Выкладки -- docs/accel_kalman.md.  Решения Глеба 30.09: a_x, a_z двумя
+#  каналами напрямую; смещения ИДУ в состоянии; момент известен точно;
+#  энкодер (только угол) в том же фильтре; возмущение -- по флагу.
+
+
+def calibrate_on_stand(model, imu_params: dict, *, b_init, T_c: float = 1.0,
+                       sigma_jig: float = 1e-2, psi_jig=None,
+                       seed: int | None = None):
+    """Калибровка ИДУ на подставке: вернуть (b_hat, P_bb) для фильтра.
+
+    Функция, а не слой -- как tilt_error_model и optimal_tau: считает числа
+    ДО прогона (docs/accel_kalman.md §4.3).  Вынесена из rollout по решению
+    Глеба 30.09.
+
+    Что происходит.  Машина жёстко стоит на подставке (StandFixture) в
+    наклоне psi_jig -- номинально 0, на деле с ошибкой ~ N(0, sigma_jig^2),
+    неизвестной фильтру.  Датчик того же чипа (b_init -- то же смещение, что
+    будет в прогоне) пишет T_c секунд со СВОИМ шумом (свой seed).
+    Показания усредняются в предположении psi = 0:
+
+        b_g  = mean(omega),   b_ax = mean(a_x),
+        b_az = mean(a_z) - g E[cos psi_jig] = mean(a_z) - g exp(-sigma_jig^2/2).
+
+    Поправка exp(-sigma^2/2) снимает среднее смещение g psi^2/2 от наклона
+    подставки -- остаётся только его разброс.
+
+    Остаточная ошибка (P_bb, диагональ) -- §4.3:
+
+        var b_g  = sigma_g^2/T_c + sigma_bg^2 T_c/3
+        var b_ax = sigma_a^2/T_c + g^2 sigma_jig^2 + sigma_ba^2 T_c/3
+        var b_az = sigma_a^2/T_c + g^2 Var(cos psi_jig) + sigma_ba^2 T_c/3,
+                   Var(cos) = (1 - e^{-s^2})^2/2 ~ sigma_jig^4/2
+
+    Первое слагаемое -- усреднённый белый шум, sigma^2 T_c/3 -- разность
+    между смещением в конце стоянки и его средним (блуждание).  Член
+    g^2 sigma_jig^2 у b_ax -- главный урок: неподвижный акселерометр не
+    отличает наклон подставки от смещения, и калибровка b_ax почти ничего не
+    даёт, пока подставка не точнее ~0.06 градуса.  У b_az наклон входит во
+    втором порядке, g(1 - cos) ~ g psi^2/2: его среднее вычтено, дисперсия
+    ~ g^2 sigma^4/2.  Корреляции каналов (corr_w) в P_bb не
+    переносятся: диагональ -- сознательное упрощение.
+
+    Параметры
+    ---------
+    model : WheeledPendulum
+        Номинальная машина: подставка берёт её параметры.
+    imu_params : dict
+        Аргументы IMUSensor без system, mode, seed, b_init (dt, sigma_*,
+        tau_*, d, corr_w, ...) -- ТЕ ЖЕ, что у датчика прогона.
+    b_init : (3,) | (M, 3)
+        Смещение включения чипа (draw_turn_on_bias).  У пачки -- своё на
+        каждую строку, и калибровка тоже построчная.
+    T_c : float
+        Длительность стоянки [с].
+    sigma_jig : float
+        СКО неточности подставки [рад].
+    psi_jig : массив | None
+        Наклон подставки явно (для тестов); None -- розыгрыш N(0, sigma_jig^2).
+    seed : int | None
+        Зерно стоянки: наклон подставки и шум датчика на ней.
+
+    Возвращает
+    ----------
+    b_hat : (3,) | (M, 3)
+    P_bb : (3, 3)
+    """
+    from .models.disturbed import StandFixture
+    from .sensor import IMUSensor
+
+    if T_c <= 0:
+        raise ValueError("T_c должно быть положительным")
+    b_init = np.asarray(b_init, dtype=float)
+    prefix = b_init.shape[:-1]
+    rng = np.random.default_rng(seed)
+    if psi_jig is None:
+        psi_jig = sigma_jig * rng.standard_normal(prefix)
+    sensor_seed = int(rng.integers(2 ** 63 - 1))
+    sensor = IMUSensor(StandFixture(model), mode="imu", b_init=b_init,
+                       seed=sensor_seed, **imu_params)
+    n = max(1, int(round(T_c / sensor.dt)))
+    x = np.zeros(prefix + (4,))
+    x[..., 0] = psi_jig
+    u = np.zeros(prefix + (1,))
+    acc = np.zeros(prefix + (3,))
+    for k in range(n):
+        acc += sensor.measure(k * sensor.dt, x, u)
+    mean = acc / n
+    g = float(model.p.g)
+    s2 = sigma_jig ** 2
+    b_hat = np.stack([mean[..., 0], mean[..., 1] - g * np.exp(-s2 / 2.0), mean[..., 2]],
+                     axis=-1)
+
+    T = n * sensor.dt
+    sa, sg = sensor.sigma_w[0], sensor.sigma_w[2]
+    sba, sbg = sensor.sigma_b[0], sensor.sigma_b[2]
+    P_bb = np.diag([
+        sa ** 2 / T + g ** 2 * sigma_jig ** 2 + sba ** 2 * T / 3.0,
+        sa ** 2 / T + g ** 2 * 0.5 * (-np.expm1(-s2)) ** 2 + sba ** 2 * T / 3.0,
+        sg ** 2 / T + sbg ** 2 * T / 3.0,
+    ])
+    return b_hat, P_bb
+
+
+class KalmanEstimator(Estimator):
+    """Расширенный фильтр Калмана (EKF/IEKF) с уравнениями акселерометра.
+
+    ЧТО ЧИТАЕТ.  y = (a_x, a_z, omega[, e, de]) -- IMUSensor(mode="imu"),
+    при желании StackedSensor(imu, EncoderSensor).  Акселерометр входит
+    ДВУМЯ каналами как есть, а не углом atan2: модель наблюдения -- сама
+    удельная сила (docs/accel_kalman.md §3),
+
+        a_x = -g s + d ddpsi + r c ddtheta + b_ax,
+        a_z =  g c - d dpsi^2 + r s ddtheta + b_az,
+        omega = dpsi + b_g,        e = theta - psi.
+
+    Кажущаяся вертикаль здесь не помеха, а часть h(x, u): «оценка зависит от
+    себя» из A31 -- это просто линеаризация h в текущей оценке.  Шаг Ньютона
+    A31 -- частный случай этого фильтра (§9).  Скорость энкодера de НЕ
+    используется: это разность того же угла, двойной счёт (§7.3).
+
+    СОСТОЯНИЕ ФИЛЬТРА.  z = (psi, theta, dpsi, dtheta, [w_psi, w_theta,]
+    b_ax, b_az, b_g).  Регулятору отдаются первые четыре.
+      * Смещения ИДУ -- постоянные неизвестные (Q_b = 0); уход -- флаг
+        bias_drift (только если есть кривая Аллана своего датчика, §4.2).
+      * Начальная неуверенность смещений -- флаг bias_prior: None --
+        режим «code» (P_bb = diag(b0_a, b0_a, b0_g)^2, ровно распределение
+        датчика), (b_hat, P_bb) -- режим «calibrate» (calibrate_on_stand).
+      * Возмущение w -- флаг disturbance (Гаусс--Марков, §6.2, §7.4).  При
+        включённом флаге фильтр оценивает толчок, оценка -- aux["w_hat"].
+
+    ШАГ (§8).  Прогноз: RK4 по номинальной модели с w, держащимся на шаге;
+    ковариация -- F = I + J dt + J^2 dt^2/2, J -- аналитический якобиан
+    (WheeledPendulum.jacobian, вариант А решения Глеба).  Коррекция: h и C по
+    specific_force и specific_force_jacobian, форма Джозефа.  iterations > 1
+    -- итерированный фильтр (IEKF, метод Гаусса--Ньютона).
+
+    Момент известен точно (решение Глеба 3): D_u входит только в
+    предсказание h, в ковариацию -- нет.
+
+    ПОДГЛЯДЫВАНИЕ ЗАПРЕЩЕНО.  Модели с возмущением (DisturbedWheeledPendulum)
+    фильтр не принимает: она знает погоду прогона заранее.
+
+    Параметры
+    ---------
+    system : WheeledPendulum
+        НОМИНАЛЬНАЯ модель.
+    dt : float
+        Шаг [с]; сверяется с разностью времён.
+    d : float
+        Вынос акселерометра [м] -- как у датчика.
+    sigma_a, sigma_g, corr_w
+        Плотности белого шума и корреляция каналов [a_x, a_z, gyro] -- как у
+        датчика; R = D corr_w D, D = diag(sigma)/sqrt(dt) (§7.1).
+    counts_per_rev : int | None
+        Метки энкодера; дисперсия угла q^2/12, q = 2 pi / N.
+    b0_a, b0_g : float
+        Для режима «code»: СКО смещения включения, как у датчика.
+    bias_prior : (b_hat, P_bb) | None
+        Режим «calibrate»: результат calibrate_on_stand.
+    bias_drift : dict(sigma_ba=, sigma_bg=) | None
+        Уход смещения как блуждание: Q_b = diag(sigma^2) dt.
+    disturbance : dict(sigma_w=, tau_w=) | None
+        Модель возмущения в фильтре.  Согласованный фильтр -- те же числа,
+        что у DisturbedWheeledPendulum.
+    q_acc : float
+        Настроечная неуверенность в ускорениях (белый шум на ddpsi, ddtheta)
+        [рад/с^2/sqrt(Гц)].  0 -- модели верим полностью.
+    psi0_std, dtheta0_std : float
+        Начальная неуверенность наклона сверх ошибки смещения (статический
+        atan2 врёт при движении) и скорости колеса (энкодер не знает её до
+        второго отсчёта).
+    iterations : int
+        1 -- EKF, больше -- IEKF.
+    diagnostics : bool
+        Отдавать в aux ещё и P, y, y_pred = h(x^-, u) и диагональ S (виды окна
+        исследователя, docs/kalman_views.md).  Выключено по умолчанию: P на
+        каждом шаге -- это копия (M, n, n), и для карты она не нужна.
+    backend : "auto" | "numpy" | "numba"
+        Чем считать шаг (docs/kalman_speed.md §7).  "numba" -- скомпилированное
+        ядро wpend/_kf_kernel.py, для одной клетки и для пачки (с потоками).
+        Нужны пакет numba (extra `fast`), модель -- WheeledPendulum, а
+        iterations == 1.  "numpy" -- прежние пути: батч и скалярный (S1).
+        "auto" -- numba, если она есть и условия выполнены, иначе numpy.
+        Результат один и тот же до округления.
+    """
+
+    def __init__(self, system, *, dt: float, d: float = 0.20,
+                 sigma_a: float = 1e-3, sigma_g: float = 1e-4, corr_w=None,
+                 counts_per_rev: int | None = 2048,
+                 b0_a: float = 1e-1, b0_g: float = 1e-2, bias_prior=None,
+                 bias_drift: dict | None = None, disturbance: dict | None = None,
+                 q_acc: float = 0.0, psi0_std: float = 0.1,
+                 dtheta0_std: float = 1.0, iterations: int = 1,
+                 diagnostics: bool = False, backend: str = "auto"):
+        from .models.disturbed import DisturbedWheeledPendulum
+        from .sensor import _cholesky, _correlation_matrix
+
+        if isinstance(system, DisturbedWheeledPendulum):
+            raise ValueError(
+                "KalmanEstimator получил DisturbedWheeledPendulum: так фильтр "
+                "знал бы погоду прогона заранее.  Отдайте ему номинальную "
+                "WheeledPendulum с теми же параметрами (WheeledPendulum(model.p))."
+            )
+        for need in ("jacobian", "specific_force_jacobian", "mass_matrix_inverse"):
+            if not hasattr(system, need):
+                raise ValueError(f"{type(system).__name__} не умеет {need}")
+        if tuple(system.state_names) != ("psi", "theta", "dpsi", "dtheta"):
+            raise ValueError(f"ожидалось состояние (psi, theta, dpsi, dtheta), "
+                             f"получено {system.state_names}")
+        if dt <= 0:
+            raise ValueError("dt должен быть положительным")
+        if iterations < 1:
+            raise ValueError("iterations >= 1")
+        self.system = system
+        self.dt = float(dt)
+        self.d = float(d)
+        self.iterations = int(iterations)
+        self.diagnostics = bool(diagnostics)
+        self._diag_rec = None
+        self.q_acc = float(q_acc)
+        self.psi0_std = float(psi0_std)
+        self.dtheta0_std = float(dtheta0_std)
+
+        Rw = _correlation_matrix(corr_w, "corr_w", 3)
+        D = np.diag([sigma_a, sigma_a, sigma_g]) / np.sqrt(self.dt)
+        _cholesky(Rw, "corr_w")                       # проверка допустимости
+        self.R_imu = D @ Rw @ D
+        q = 0.0 if not counts_per_rev else 2.0 * np.pi / counts_per_rev
+        # q = 0 (без квантования) даёт вырожденную R -- оставляем крошечную
+        # дисперсию, чтобы S оставалась обратимой
+        self.R_enc = max(q ** 2 / 12.0, 1e-14)
+        self.sigma_g = float(sigma_g)
+
+        if bias_prior is None:
+            self._b_hat0 = np.zeros(3)
+            self._P_bb0 = np.diag([b0_a ** 2, b0_a ** 2, b0_g ** 2])
+        else:
+            b_hat, P_bb = bias_prior
+            self._b_hat0 = np.asarray(b_hat, dtype=float)
+            self._P_bb0 = np.asarray(P_bb, dtype=float)
+            if self._P_bb0.shape != (3, 3):
+                raise ValueError(f"P_bb должна быть 3x3, получено {self._P_bb0.shape}")
+
+        self.bias_drift = bias_drift
+        self._Q_b = np.zeros(3) if bias_drift is None else self.dt * np.array([
+            bias_drift["sigma_ba"] ** 2, bias_drift["sigma_ba"] ** 2,
+            bias_drift["sigma_bg"] ** 2])
+
+        self.has_w = disturbance is not None
+        if self.has_w:
+            self.sigma_w = np.broadcast_to(np.asarray(disturbance["sigma_w"], float), (2,)).copy()
+            self.tau_w = np.broadcast_to(np.asarray(disturbance["tau_w"], float), (2,)).copy()
+            self._phi_w = np.exp(-self.dt / self.tau_w)
+            self._Q_w = self.sigma_w ** 2 * (-np.expm1(-2.0 * self.dt / self.tau_w))
+        # раскладка состояния
+        self.i_w = slice(4, 6) if self.has_w else slice(4, 4)
+        self.i_b = slice(6, 9) if self.has_w else slice(4, 7)
+        self.n = 9 if self.has_w else 7
+        self._ib = np.arange(self.n)[self.i_b]
+        Qd = np.zeros(self.n)
+        Qd[2] = Qd[3] = self.q_acc ** 2 * self.dt
+        if self.has_w:
+            Qd[self.i_w] = self._Q_w
+        Qd[self.i_b] = self._Q_b
+        self._diag = np.flatnonzero(Qd)
+        self._Q_diag = Qd[self._diag]
+        self._R3 = self.R_imu.copy()
+        self._L_inv = np.linalg.inv(np.linalg.cholesky(self.R_imu))
+        self._E_cols = np.array([0, 2, 3, 4, 5] if self.has_w else [0, 2, 3])
+        self._R4 = np.zeros((4, 4))
+        self._R4[:3, :3] = self.R_imu
+        self._R4[3, 3] = self.R_enc
+
+        self._z = None           # (M, n)
+        self._P = None           # (M, n, n)
+        self._prefix = None
+        self._enc = None
+        self._t_prev = None
+
+        # Скалярный путь одной клетки (docs/kalman_speed.md §3, S1): та же
+        # математика, но на float и плотных 7x7 вместо батч-индексации.  Только
+        # для «настоящей» WheeledPendulum: подкласс с другой f считался бы не
+        # по своей модели.
+        from .models.wheeled_pendulum import WheeledPendulum
+        cls = type(system)
+        self._scalar_ok = (self.iterations == 1 and all(
+            getattr(cls, name) is getattr(WheeledPendulum, name)
+            for name in ("f", "jacobian", "specific_force_with_jacobian")))
+        pp = system.p
+        self._pp = (float(pp.alpha), float(pp.beta), float(pp.gamma), float(pp.D),
+                    float(pp.g), float(pp.r))
+        Qfull = np.zeros(self.n)
+        Qfull[self._diag] = self._Q_diag
+        self._Q_full = Qfull
+        self._inv_tau = (1.0 / self.tau_w) if self.has_w else None
+        self._dg = np.diag_indices(self.n)
+        self._ib_list = [int(i) for i in self._ib]
+        self._R_diag = np.diag(self._R4)
+
+        from . import _kf_kernel as kk
+        if backend not in ("auto", "numpy", "numba"):
+            raise ValueError(f"backend: auto, numpy или numba, получено {backend!r}")
+        if backend == "numba":
+            if not kk.HAVE_NUMBA:
+                raise ValueError("backend='numba': пакет numba не установлен "
+                                 "(uv sync --extra fast)")
+            if not self._scalar_ok:
+                raise ValueError("backend='numba': ядро умеет только WheeledPendulum "
+                                 "и iterations == 1")
+        self.backend = ("numba" if backend != "numpy" and kk.HAVE_NUMBA and self._scalar_ok
+                        else "numpy")
+        self._kk = kk
+        # Аргументы ядра, которые не меняются от шага к шагу.
+        self._k_pp = np.array(self._pp)
+        self._k_phi = (np.ascontiguousarray(self._phi_w, float) if self.has_w
+                       else np.zeros(2))
+        self._k_itau = (np.ascontiguousarray(self._inv_tau, float) if self.has_w
+                        else np.zeros(2))
+        self._k_Linv = np.ascontiguousarray(self._L_inv)
+        self._k_Rdiag = np.ascontiguousarray(self._R_diag)
+
+    # --- наружу --------------------------------------------------------------
+
+    @property
+    def aux(self) -> dict:
+        """Что фильтр знает сверх x_hat: оценки смещений и возмущения.
+        rollout кладёт aux["w_hat"] в Trajectory.w_hat."""
+        if self._z is None:
+            return {}
+        out = {"b_hat": self._z[:, self.i_b].reshape(self._prefix + (3,))}
+        if self.has_w:
+            out["w_hat"] = self._z[:, self.i_w].reshape(self._prefix + (2,))
+        if self.diagnostics and self._diag_rec is not None:
+            m = self._diag_rec["y"].shape[-1]
+            out["P"] = self._P.reshape(self._prefix + (self.n, self.n)).copy()
+            for key in ("y", "y_pred", "S_diag"):
+                out[key] = self._diag_rec[key].reshape(self._prefix + (m,))
+        return out
+
+    @property
+    def state(self) -> np.ndarray:
+        """Полное состояние фильтра z формы prefix + (n,)."""
+        return self._z.reshape(self._prefix + (self.n,))
+
+    @property
+    def covariance(self) -> np.ndarray:
+        """Ковариация P формы prefix + (n, n) -- для NEES и графиков."""
+        return self._P.reshape(self._prefix + (self.n, self.n))
+
+    # --- жизненный цикл ------------------------------------------------------
+
+    def reset(self, y0: np.ndarray | None = None) -> None:
+        self._z = self._P = self._prefix = self._enc = self._t_prev = None
+        if y0 is not None:
+            self._init_from(np.asarray(y0, dtype=float))
+
+    def _init_from(self, y: np.ndarray) -> None:
+        """Начальная оценка по первому отсчёту и её ковариация.
+
+        Машина в t0 может стоять с наклоном и сразу падать: тогда статический
+        atan2 врёт на kappa_psi psi (кажущаяся вертикаль, §3.5).  Поэтому
+        наклон берётся как корень уравнения акселерометра по модели --
+        метод Гаусса--Ньютона по (a_x, a_z) при dpsi = omega - b_g, u = 0,
+        w = 0 (§9: это и есть шаг A31, только по обоим каналам):
+
+            psi <- psi + H^T r / H^T H,   r = y_acc - b - h(psi),  H = dh/dpsi.
+
+        Ковариация -- линейное отображение независимых источников ошибки
+        (ошибка смещений d_b, возмущения e_w, шум отсчёта v) в ошибку
+        состояния.  Из h(psi_hat) - h(psi) = -d_b_acc - C_w e_w + v_acc -
+        C_dpsi e_dpsi:
+
+            e_dpsi = -d_b_g + v_g,
+            e_psi  = H^T (-d_b_acc - C_w e_w + v_acc - C_dpsi e_dpsi) / H^T H,
+            e_theta = e_psi + v_e   (энкодер: theta = e + psi).
+
+        Сверх этого -- psi0_std (то, чего модель в t0 не знает) и
+        dtheta0_std (скорость колеса энкодер до второго отсчёта не знает).
+        """
+        if y.shape[-1] not in (3, 5):
+            raise ValueError(
+                "KalmanEstimator ждёт (a_x, a_z, omega) или (a_x, a_z, omega, e, de) "
+                f"-- IMUSensor(mode='imu') [+ EncoderSensor]; получено {y.shape}"
+            )
+        self._enc = y.shape[-1] == 5
+        self._prefix = y.shape[:-1]
+        Y = y.reshape(-1, y.shape[-1])
+        M, n = Y.shape[0], self.n
+        b = (np.broadcast_to(self._b_hat0, (M, 3)) if self._b_hat0.ndim == 1
+             else self._b_hat0.reshape(-1, 3))
+        u0 = np.zeros((M, 1))
+        x = np.zeros((M, 4))
+        x[:, 0] = np.arctan2(-(Y[:, 0] - b[:, 0]), Y[:, 1] - b[:, 1])
+        x[:, 2] = Y[:, 2] - b[:, 2]
+        acc = Y[:, :2] - b[:, :2]
+        for _ in range(8):
+            h = np.stack(self.system.specific_force(0.0, x, u0, self.d), axis=-1)
+            C, _, _ = self.system.specific_force_jacobian(0.0, x, u0, self.d)
+            H = C[:, :, 0]
+            HH = np.sum(H * H, axis=-1)
+            step = np.where(HH > 1e-12, np.sum(H * (acc - h), axis=-1) / np.maximum(HH, 1e-12), 0.0)
+            x[:, 0] += np.clip(step, -0.5, 0.5)
+        C, _, Cw = self.system.specific_force_jacobian(0.0, x, u0, self.d)
+        H = C[:, :, 0]
+        g_inv = H / np.sum(H * H, axis=-1, keepdims=True)          # H^T / H^T H, (M, 2)
+        C_dpsi = C[:, :, 2]
+
+        z = np.zeros((M, n))
+        z[:, :4] = x
+        z[:, 1] = Y[:, 3] + x[:, 0] if self._enc else 0.0
+        z[:, self.i_b] = b
+
+        # источники: d_b (3), v = (v_ax, v_az, v_g) (3), [e_w (2)]
+        n_src = 6 + (2 if self.has_w else 0)
+        Sig = np.zeros((n_src, n_src))
+        Sig[:3, :3] = self._P_bb0
+        Sig[3:6, 3:6] = self.R_imu
+        T = np.zeros((M, n, n_src))
+        ib = np.arange(n)[self.i_b]
+        T[:, ib, [0, 1, 2]] = 1.0                                     # b <- d_b
+        T[:, 2, 2] = -1.0                                             # dpsi <- d_b_g
+        T[:, 2, 5] = 1.0                                              # dpsi <- v_g
+        # psi <- через g_inv: (-d_b_acc + v_acc - C_dpsi e_dpsi - C_w e_w)
+        k_dpsi = np.sum(g_inv * C_dpsi, axis=-1)                      # (M,)
+        T[:, 0, 0] = -g_inv[:, 0]
+        T[:, 0, 1] = -g_inv[:, 1]
+        T[:, 0, 3] = g_inv[:, 0]
+        T[:, 0, 4] = g_inv[:, 1]
+        T[:, 0, :] -= k_dpsi[:, None] * T[:, 2, :]
+        if self.has_w:
+            Sig[6:, 6:] = np.diag(self.sigma_w ** 2)
+            T[:, 0, 6:] = -np.einsum("mi,mij->mj", g_inv, Cw)
+            T[:, self.i_w, 6:] = np.eye(2)
+        if self._enc:
+            T[:, 1, :] = T[:, 0, :]
+        P = T @ Sig @ np.swapaxes(T, -1, -2)
+        P[:, 0, 0] += self.psi0_std ** 2
+        if self._enc:
+            P[:, 0, 1] += self.psi0_std ** 2
+            P[:, 1, 0] += self.psi0_std ** 2
+            P[:, 1, 1] += self.psi0_std ** 2 + self.R_enc
+        else:
+            P[:, 1, 1] += 1.0                         # колесо без энкодера не видно
+        P[:, 3, 3] += self.dtheta0_std ** 2
+        self._z = z
+        self._P = 0.5 * (P + np.swapaxes(P, -1, -2))
+
+    # --- модель фильтра ------------------------------------------------------
+
+    def _w(self, z):
+        return z[:, self.i_w] if self.has_w else None
+
+    def _field(self, t, x, u, w):
+        dx = self.system.f(t, x, u)
+        if w is None:
+            return dx
+        dx = dx.copy()
+        dx[:, 2:] += self.system.accel_from_force(x[:, 0], w)
+        return dx
+
+    # Ускорение (docs/explorer_kalman.md §10.1).  Математика прежняя, но в
+    # F и C почти всё -- нули и единицы, а батч-произведения маленьких
+    # матриц в numpy стоят ~70 мкс независимо от размера (замер: M = 441,
+    # 7x7).  Поэтому произведения собраны из столбцов, где они ненулевые, а
+    # коррекция идёт по одному скалярному измерению (§«_update»).  Оракул --
+    # совпадение с прежней плотной реализацией до округления и NEES-тест.
+
+    def _predict(self, t_prev, u):
+        """Прогноз: RK4 по номинальной модели, P <- F P F^T + Q.
+
+        F = I + E, E = J dt + J^2 dt^2/2.  У E ненулевые только строки
+        (psi, theta, dpsi, dtheta[, w]) -- у смещений Q_b-блуждание, F = I, --
+        и только столбцы (psi, dpsi, dtheta[, w]): J[0] = e_dpsi, J[1] =
+        e_dtheta, строки ускорений зависят лишь от psi, dpsi и w (§1.4).
+        Поэтому
+
+            F P F^T = P + E P + (E P)^T + E P E^T,
+
+        и каждое произведение -- сумма по 3..5 ненулевым столбцам E.
+        """
+        z, P, dt = self._z, self._P, self.dt
+        M, n = z.shape
+        x = z[:, :4]
+        w = None
+        if self.has_w:
+            w = self._phi_w * z[:, self.i_w]
+        h = dt
+        k1 = self._field(t_prev, x, u, w)
+        k2 = self._field(t_prev + h / 2, x + h / 2 * k1, u, w)
+        k3 = self._field(t_prev + h / 2, x + h / 2 * k2, u, w)
+        k4 = self._field(t_prev + h, x + h * k3, u, w)
+        x_new = x + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        A, _, G = self.system.jacobian(t_prev, x, u, w)
+        rows = 6 if self.has_w else 4
+        J = np.zeros((M, rows, n))
+        J[:, :4, :4] = A
+        if self.has_w:
+            J[:, :4, 4:6] = G
+            J[:, 4, 4] = -1.0 / self.tau_w[0]
+            J[:, 5, 5] = -1.0 / self.tau_w[1]
+        cols = self._E_cols
+        # J^2 по строкам, из структуры J: J[0] = e_dpsi, J[1] = e_dtheta, у
+        # строк ускорений ненулевые столбцы -- psi, dpsi и w, у строк w --
+        # только диагональ -1/tau.  Поэтому
+        #   (J^2)[0] = J[2],  (J^2)[1] = J[3],
+        #   (J^2)[i] = J[i,0] e_dpsi + J[i,2] J[2] + sum_w J[i,w] J[w]  (i = 2, 3),
+        #   (J^2)[w] = J[w,w]^2 e_w.
+        J2 = np.zeros_like(J)
+        J2[:, 0] = J[:, 2]
+        J2[:, 1] = J[:, 3]
+        for i in (2, 3):
+            J2[:, i] = J[:, i, 2, None] * J[:, 2]
+            J2[:, i, 2] += J[:, i, 0]
+            if self.has_w:
+                J2[:, i, 4] += J[:, i, 4] * J[:, 4, 4]
+                J2[:, i, 5] += J[:, i, 5] * J[:, 5, 5]
+        if self.has_w:
+            J2[:, 4, 4] = J[:, 4, 4] ** 2
+            J2[:, 5, 5] = J[:, 5, 5] ** 2
+        E = J * dt + J2 * (dt * dt / 2.0)
+        Ec = E[:, :, cols]                                              # (M, rows, |cols|)
+        EP = Ec @ P[:, cols, :]                                         # (M, rows, n)
+        EPE = EP[:, :, cols] @ np.swapaxes(Ec, -1, -2)                  # (M, rows, rows)
+        P = P.copy()
+        P[:, :rows, :] += EP
+        P[:, :, :rows] += np.swapaxes(EP, -1, -2)
+        P[:, :rows, :rows] += EPE
+        P[:, self._diag, self._diag] += self._Q_diag
+        z = z.copy()
+        z[:, :4] = x_new
+        if self.has_w:
+            z[:, self.i_w] = w
+        self._z, self._P = z, P
+
+    def _h_and_C(self, t, z, u):
+        """Предсказанное измерение и его якобиан по полному состоянию."""
+        M, n = z.shape
+        x, w = z[:, :4], self._w(z)
+        b = z[:, self.i_b]
+        a_x, a_z, Cx, _, Cw = self.system.specific_force_with_jacobian(t, x, u, self.d, w)
+        m = 4 if self._enc else 3
+        h = np.empty((M, m))
+        h[:, 0] = a_x + b[:, 0]
+        h[:, 1] = a_z + b[:, 1]
+        h[:, 2] = x[:, 2] + b[:, 2]
+        C = np.zeros((M, m, n))
+        C[:, :2, :4] = Cx
+        if self.has_w:
+            C[:, :2, self.i_w] = Cw
+        ib = self._ib
+        C[:, 0, ib[0]] = C[:, 1, ib[1]] = C[:, 2, ib[2]] = 1.0
+        C[:, 2, 2] = 1.0
+        if self._enc:
+            h[:, 3] = x[:, 1] - x[:, 0]
+            C[:, 3, 0], C[:, 3, 1] = -1.0, 1.0
+        return h, C
+
+    def _record_diag(self, Y, h, C, P):
+        """Для видов окна: показание, предсказание h(x^-, u) по ПРОГНОЗУ (до
+        коррекции) и диагональ S = C P^- C^T + R -- в исходных каналах
+        (a_x, a_z, omega[, e]), а не в «обелённых»."""
+        m = Y.shape[1]
+        R = self._R4 if self._enc else self._R3
+        S = np.einsum("mik,mkl,mil->mi", C, P, C) + np.diag(R)[:m]
+        self._diag_rec = {"y": Y.copy(), "y_pred": h.copy(), "S_diag": S}
+
+    def _update(self, t, y, u):
+        """Коррекция.
+
+        EKF (iterations = 1) -- ПОСЛЕДОВАТЕЛЬНО по скалярным измерениям
+        (Simon, Optimal State Estimation, §6.1): каналы ИДУ сначала
+        «обеляются» -- y' = L^-1 y, C' = L^-1 C, L L^T = R_imu, -- после
+        чего шумы независимы с единичной дисперсией, и обработка по одному
+        каналу при линеаризации в ОДНОЙ точке (априорной) даёт ровно тот же
+        результат, что общий шаг с матрицей S^-1.  Зато вместо обращения
+        S 4x4 и батч-произведений -- векторные операции над (M, n):
+
+            Pc = P c,   s = c^T P c + r,   K = Pc / s,
+            z <- z + K (y_k - h_k - c^T (z - z_prior)),   P <- P - K Pc^T.
+
+        IEKF (iterations > 1) -- общий шаг с перелинеаризацией:
+        P+ = P- - K (C P-), что при оптимальном K равно форме Джозефа.
+        """
+        Y = y.reshape(-1, y.shape[-1])[:, : (4 if self._enc else 3)]
+        z_prior, P = self._z, self._P
+        if self.iterations == 1:
+            h, C = self._h_and_C(t, z_prior, u)
+            if self.diagnostics:
+                self._record_diag(Y, h, C, P)
+            innov = Y - h
+            Li = self._L_inv
+            Cw = [sum(Li[i, j] * C[:, j] for j in range(i + 1)) for i in range(3)]
+            nw = [sum(Li[i, j] * innov[:, j] for j in range(i + 1)) for i in range(3)]
+            r = [1.0, 1.0, 1.0]
+            if self._enc:
+                Cw.append(C[:, 3])
+                nw.append(innov[:, 3])
+                r.append(self.R_enc)
+            z = z_prior.copy()
+            P = P.copy()
+            for c, v, rk in zip(Cw, nw, r):
+                # c разрежена: у гироскопа и энкодера два ненулевых столбца,
+                # у акселерометра -- пять-семь; P c -- сумма этих столбцов P
+                nz = np.flatnonzero(np.any(c != 0.0, axis=0))
+                Pc = sum(P[:, :, k] * c[:, k, None] for k in nz)   # (M, n)
+                s = sum(c[:, k] * Pc[:, k] for k in nz) + rk
+                K = Pc / s[:, None]
+                dz = z - z_prior
+                resid = v - sum(c[:, k] * dz[:, k] for k in nz)
+                z = z + K * resid[:, None]
+                P = P - K[:, :, None] * Pc[:, None, :]
+            self._P = 0.5 * (P + np.swapaxes(P, -1, -2))
+            self._z = z
+            return
+
+        m = Y.shape[1]
+        R = self._R4 if self._enc else self._R3
+        z_i = z_prior
+        for it in range(self.iterations):
+            h, C = self._h_and_C(t, z_i, u)
+            if self.diagnostics and it == 0:
+                self._record_diag(Y, h, C, P)
+            CP = C @ P
+            S = CP @ np.swapaxes(C, -1, -2) + R
+            K = np.swapaxes(np.linalg.solve(S, CP), -1, -2)      # P C^T S^-1
+            innov = Y - h - np.einsum("mij,mj->mi", C, z_prior - z_i)
+            z_i = z_prior + np.einsum("mij,mj->mi", K, innov)
+        P = P - K @ CP
+        self._P = 0.5 * (P + np.swapaxes(P, -1, -2))
+        self._z = z_i
+
+    def estimate(self, t: float, y: np.ndarray, u_prev: np.ndarray) -> np.ndarray:
+        y = np.asarray(y, dtype=float)
+        if self._z is None or y.shape[:-1] != self._prefix:
+            self._init_from(y)
+        if self.backend == "numba":
+            return self._estimate_jit(t, y, u_prev)
+        if self._prefix == () and self._scalar_ok:
+            return self._estimate1(t, y, u_prev)
+        M = self._z.shape[0]
+        u = (np.zeros((M, 1)) if u_prev is None
+             else np.broadcast_to(np.asarray(u_prev, dtype=float).reshape(-1, 1), (M, 1)))
+        if self._t_prev is not None:
+            dt = float(t) - self._t_prev
+            if dt > 0:
+                if abs(dt - self.dt) > 1e-6 * self.dt:
+                    raise ValueError(
+                        f"KalmanEstimator: шаг {dt!r} не совпадает с dt={self.dt!r}"
+                    )
+                self._predict(self._t_prev, u)
+        self._update(float(t), y, u)
+        self._t_prev = float(t)
+        return self._z[:, :4].reshape(self._prefix + (4,))
+
+    # --- скалярный путь одной клетки (docs/kalman_speed.md §3, S1) ------------
+    #
+    # Одна клетка (виды окна A/B/C, одиночный пересчёт) упиралась не в
+    # арифметику, а в накладные расходы Python: батч-путь делает ~800 мелких
+    # вызовов numpy на шаг над массивами формы (1, ...).  Здесь та же
+    # математика (прогноз RK4 + F P F^T + Q, последовательная скалярная
+    # коррекция с «обелением»), но модель считается на float через math, а
+    # матрицы -- плотные n x n.  Оракул: совпадение с батч-путём до
+    # округления на одной и той же последовательности измерений
+    # (tests/test_accel_kalman.py).
+
+    def _terms1(self, psi, dpsi, u, w_psi, w_th):
+        """Ускорения и их производные в точке, на float (Key_Formulas §2).
+
+        Возвращает (ddpsi, ddth, A20, A22, A30, A32, Mi00, Mi01, Mi11): то же,
+        что строки 3-4 WheeledPendulum.jacobian и M^-1, но без массивов."""
+        al, be, ga, D, _, _ = self._pp
+        s, c = math.sin(psi), math.cos(psi)
+        s2, c2 = 2.0 * s * c, c * c - s * s                 # sin 2psi, cos 2psi
+        dp2 = dpsi * dpsi
+        N = (ga + be * c) * u + ga * D * s - be * be * s * c * dp2 + ga * w_psi - be * c * w_th
+        R = al * be * s * dp2 - be * D * s * c - (al + be * c) * u - be * c * w_psi + al * w_th
+        N_psi = -be * s * u + ga * D * c - be * be * c2 * dp2 + be * s * w_th
+        R_psi = al * be * c * dp2 - be * D * c2 + be * s * u + be * s * w_psi
+        De = al * ga - be * be * c * c
+        dDe = be * be * s2
+        De2 = De * De
+        return (N / De, R / De,
+                (N_psi * De - N * dDe) / De2, -2.0 * be * be * s * c * dpsi / De,
+                (R_psi * De - R * dDe) / De2, 2.0 * al * be * s * dpsi / De,
+                ga / De, -be * c / De, al / De)
+
+    def _field1(self, x0, x2, x3, u, w_psi, w_th):
+        al, be, ga, D, _, _ = self._pp
+        s, c = math.sin(x0), math.cos(x0)
+        De = al * ga - be * be * c * c
+        dp2 = x2 * x2
+        ddpsi = ((ga + be * c) * u + ga * D * s - be * be * s * c * dp2) / De
+        ddth = (al * be * s * dp2 - be * D * s * c - (al + be * c) * u) / De
+        if w_psi or w_th:
+            ddpsi += (ga * w_psi - be * c * w_th) / De
+            ddth += (al * w_th - be * c * w_psi) / De
+        return x2, x3, ddpsi, ddth
+
+    def _predict1(self, u):
+        z, P, dt = self._z[0], self._P[0], self.dt
+        n = self.n
+        w_psi = w_th = 0.0
+        if self.has_w:
+            w_psi = float(self._phi_w[0] * z[4])
+            w_th = float(self._phi_w[1] * z[5])
+        x0, x1, x2, x3 = (float(v) for v in z[:4])
+        h, h2 = dt, dt / 2.0
+        k1 = self._field1(x0, x2, x3, u, w_psi, w_th)
+        k2 = self._field1(x0 + h2 * k1[0], x2 + h2 * k1[2], x3 + h2 * k1[3], u, w_psi, w_th)
+        k3 = self._field1(x0 + h2 * k2[0], x2 + h2 * k2[2], x3 + h2 * k2[3], u, w_psi, w_th)
+        k4 = self._field1(x0 + h * k3[0], x2 + h * k3[2], x3 + h * k3[3], u, w_psi, w_th)
+        x_new = [xi + h / 6.0 * (a + 2.0 * b + 2.0 * c + d)
+                 for xi, a, b, c, d in zip((x0, x1, x2, x3), k1, k2, k3, k4)]
+
+        # Якобиан в начале шага, как у батч-пути: F = I + J dt + J^2 dt^2/2.
+        _, _, A20, A22, A30, A32, Mi00, Mi01, Mi11 = self._terms1(x0, x2, u, w_psi, w_th)
+        J = np.zeros((n, n))
+        J[0, 2] = 1.0
+        J[1, 3] = 1.0
+        J[2, 0], J[2, 2], J[3, 0], J[3, 2] = A20, A22, A30, A32
+        if self.has_w:
+            J[2, 4], J[2, 5], J[3, 4], J[3, 5] = Mi00, Mi01, Mi01, Mi11
+            J[4, 4] = -self._inv_tau[0]
+            J[5, 5] = -self._inv_tau[1]
+        F = J * dt + (J @ J) * (dt * dt / 2.0)
+        F[self._dg] += 1.0
+        P = F @ P @ F.T
+        P[self._dg] += self._Q_full
+        z = z.copy()
+        z[:4] = x_new
+        if self.has_w:
+            z[4], z[5] = w_psi, w_th
+        self._z[0] = z
+        self._P[0] = P
+
+    def _update1(self, y, u):
+        z_prior, P = self._z[0].copy(), self._P[0].copy()
+        n, d = self.n, self.d
+        _, _, _, _, g, r = self._pp
+        zl = z_prior.tolist()                     # float, а не скаляры numpy
+        x0, x1, x2 = zl[0], zl[1], zl[2]
+        w_psi = zl[4] if self.has_w else 0.0
+        w_th = zl[5] if self.has_w else 0.0
+        ib = self._ib_list
+        b = [zl[i] for i in ib]
+        ddpsi, ddth, A20, A22, A30, A32, Mi00, Mi01, Mi11 = self._terms1(x0, x2, u, w_psi, w_th)
+        s, c = math.sin(x0), math.cos(x0)
+        m = 4 if self._enc else 3
+        h = np.empty(m)
+        h[0] = -g * s + d * ddpsi + r * c * ddth + b[0]
+        h[1] = g * c - d * x2 * x2 + r * s * ddth + b[1]
+        h[2] = x2 + b[2]
+        C = np.zeros((m, n))
+        C[0, 0] = -g * c + d * A20 - r * s * ddth + r * c * A30
+        C[0, 2] = d * A22 + r * c * A32
+        C[1, 0] = -g * s + r * c * ddth + r * s * A30
+        C[1, 2] = -2.0 * d * x2 + r * s * A32
+        if self.has_w:
+            C[0, 4], C[0, 5] = d * Mi00 + r * c * Mi01, d * Mi01 + r * c * Mi11
+            C[1, 4], C[1, 5] = r * s * Mi01, r * s * Mi11
+        C[0, ib[0]] = C[1, ib[1]] = C[2, ib[2]] = 1.0
+        C[2, 2] = 1.0
+        if self._enc:
+            h[3] = x1 - x0
+            C[3, 0], C[3, 1] = -1.0, 1.0
+        Y = y[:m]
+        if self.diagnostics:
+            S = np.einsum("ik,kl,il->i", C, P, C) + self._R_diag[:m]
+            self._diag_rec = {"y": Y[None].copy(), "y_pred": h[None].copy(), "S_diag": S[None]}
+        innov = Y - h
+        Cw = np.empty((m, n))
+        nw = np.empty(m)
+        Cw[:3] = self._L_inv @ C[:3]
+        nw[:3] = self._L_inv @ innov[:3]
+        rr = [1.0, 1.0, 1.0]
+        if self._enc:
+            Cw[3], nw[3] = C[3], innov[3]
+            rr.append(self.R_enc)
+        z = z_prior.copy()
+        for k in range(m):
+            ck = Cw[k]
+            Pc = P @ ck
+            sk = float(ck @ Pc) + rr[k]
+            K = Pc / sk
+            resid = float(nw[k]) - float(ck @ (z - z_prior))
+            z += K * resid
+            P -= K[:, None] * Pc
+        self._P[0] = 0.5 * (P + P.T)
+        self._z[0] = z
+
+    def _estimate1(self, t, y, u_prev):
+        u = 0.0 if u_prev is None else float(np.asarray(u_prev, dtype=float).reshape(-1)[0])
+        if self._t_prev is not None:
+            dt = float(t) - self._t_prev
+            if dt > 0:
+                if abs(dt - self.dt) > 1e-6 * self.dt:
+                    raise ValueError(
+                        f"KalmanEstimator: шаг {dt!r} не совпадает с dt={self.dt!r}"
+                    )
+                self._predict1(u)
+        self._update1(y.reshape(-1), u)
+        self._t_prev = float(t)
+        return self._z[0, :4].copy()
+
+    # --- numba-ядро (docs/kalman_speed.md §7, S3) ------------------------------
+
+    def _estimate_jit(self, t, y, u_prev):
+        """Шаг через wpend/_kf_kernel.py: то же, что _estimate1 / _predict +
+        _update, но скомпилированное; пачка -- по потокам, если она большая.
+        Z и P меняются на месте."""
+        kk = self._kk
+        M = self._z.shape[0]
+        m = 4 if self._enc else 3
+        Y = np.ascontiguousarray(y.reshape(-1, y.shape[-1])[:, :m], dtype=float)
+        if u_prev is None:
+            U = np.zeros(M)
+        else:
+            U = np.ascontiguousarray(np.broadcast_to(
+                np.asarray(u_prev, dtype=float).reshape(-1), (M,)))
+        predict = False
+        if self._t_prev is not None:
+            dt = float(t) - self._t_prev
+            if dt > 0:
+                if abs(dt - self.dt) > 1e-6 * self.dt:
+                    raise ValueError(
+                        f"KalmanEstimator: шаг {dt!r} не совпадает с dt={self.dt!r}"
+                    )
+                predict = True
+        out_h = np.empty((M, m))
+        out_S = np.empty((M, m))
+        step = kk.step_parallel if M >= kk.PARALLEL_FROM else kk.step_serial
+        step(self._z, self._P, Y, U, predict, self._k_pp, self.dt, self.d, self.has_w,
+             self._k_phi, self._k_itau, self._Q_full, int(self._ib[0]), bool(self._enc),
+             self._k_Linv, float(self.R_enc), self._k_Rdiag, bool(self.diagnostics),
+             out_h, out_S)
+        if self.diagnostics:
+            self._diag_rec = {"y": Y.copy(), "y_pred": out_h, "S_diag": out_S}
+        self._t_prev = float(t)
+        return self._z[:, :4].reshape(self._prefix + (4,)).copy()

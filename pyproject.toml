@@ -21,7 +21,10 @@ viz = ["pygame>=2.5"]
 # Синтез ЛКР (wpend/lqr.py): уравнение Риккати через scipy. Ядро scipy не
 # импортирует -- import происходит внутри функции lqr().
 design = ["scipy>=1.10"]
-dev = ["pytest>=8.0", "pygame>=2.5", "scipy>=1.10"]
+# Ускорение фильтра Калмана (wpend/_kf_kernel.py, docs/kalman_speed.md §7):
+# необязательно -- без numba тот же результат по numpy-пути, только медленнее.
+fast = ["numba>=0.60"]
+dev = ["pytest>=8.0", "pygame>=2.5", "scipy>=1.10", "numba>=0.60"]
 
 [tool.setuptools.packages.find]
 include = ["wpend*"]

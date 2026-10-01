@@ -28,6 +28,14 @@ class Trajectory:
     x : (N+1, n_x)      ИСТИННЫЕ состояния в эти моменты
     u : (N, n_u)        управления, реально приложенные на интервалах [t_k, t_{k+1})
     x_hat : (N, n_x) | None   ОЦЕНКИ состояния, по которым выбирались управления
+    aux : dict | None         всё, что оцениватель отдал в Estimator.aux, по
+                              шагам: aux[key][k] -- после оценки на шаге k.
+                              Пишется только при record_aux=True (виды окна:
+                              P, y, y_pred, S_diag фильтра Калмана).
+    w_hat : (N, 2) | None     оценка внешней силы (w_psi, w_theta), если
+                              оцениватель её ведёт (Estimator.aux["w_hat"],
+                              ER-025).  Истина -- model.disturbance(t) у
+                              DisturbedWheeledPendulum.
 
     Управлений на одно меньше, чем состояний, и это не небрежность: u_k -- это
     то, что действовало НА ИНТЕРВАЛЕ между x_k и x_{k+1}.  У последнего
@@ -55,6 +63,8 @@ class Trajectory:
     x: np.ndarray
     u: np.ndarray
     x_hat: np.ndarray | None = None
+    w_hat: np.ndarray | None = None
+    aux: dict | None = None
 
     @property
     def n_steps(self) -> int:
@@ -79,6 +89,7 @@ def rollout(
     estimator: Estimator | None = None,
     t0: float = 0.0,
     record_estimate: bool = True,
+    record_aux: bool = False,
 ) -> Trajectory:
     """Прогнать замкнутый контур n_steps шагов и вернуть Trajectory.
 
@@ -127,6 +138,8 @@ def rollout(
     xs = np.empty((n_steps + 1, system.n_state), dtype=float)
     us = np.empty((n_steps, system.n_action), dtype=float)
     xhs = np.empty((n_steps, system.n_state), dtype=float) if record_estimate else None
+    whs = None      # заводится на первом шаге, если оцениватель ведёт w_hat
+    auxs = None     # record_aux: {ключ: (n_steps, ...)}
 
     t = float(t0)
     u_prev = np.zeros(system.n_action)
@@ -147,6 +160,19 @@ def rollout(
                     "record_estimate=False."
                 )
             xhs[k] = x_hat_arr
+            w_hat = estimator.aux.get("w_hat")
+            if w_hat is not None:
+                if whs is None:
+                    whs = np.full((n_steps, 2), np.nan)
+                whs[k] = w_hat
+        if record_aux:
+            aux = estimator.aux
+            if auxs is None:
+                auxs = {key: np.full((n_steps,) + np.shape(v), np.nan)
+                        for key, v in aux.items()}
+            for key, v in aux.items():
+                if key in auxs:
+                    auxs[key][k] = v
         u = system.clip_action(controller.act(t, x_hat))
 
         x = integrator.step(system.f, t, x, u, dt)
@@ -157,7 +183,7 @@ def rollout(
         xs[k + 1] = x
         u_prev = u
 
-    return Trajectory(t=ts, x=xs, u=us, x_hat=xhs)
+    return Trajectory(t=ts, x=xs, u=us, x_hat=xhs, w_hat=whs, aux=auxs)
 
 
 @dataclass(frozen=True)
@@ -170,6 +196,7 @@ class TrajectoryBatch:
     x : (M, S, n_x)              истинные состояния
     u : (M, S-1, n_u)            управления в начале каждого сохранённого интервала
     x_hat : (M, S-1, n_x) | None оценки, по которым эти управления выбраны
+    w_hat : (M, S-1, 2) | None   оценка внешней силы (см. Trajectory.w_hat)
 
     S -- число СОХРАНЁННЫХ кадров, а не шагов интегрирования: при stride > 1
     считается каждый шаг dt, а записывается каждый stride-й.  Точность счёта
@@ -189,13 +216,15 @@ class TrajectoryBatch:
     x: np.ndarray
     u: np.ndarray
     x_hat: np.ndarray | None = None
+    w_hat: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.x.shape[0])
 
     def __getitem__(self, m: int) -> Trajectory:
         return Trajectory(t=self.t, x=self.x[m], u=self.u[m],
-                          x_hat=None if self.x_hat is None else self.x_hat[m])
+                          x_hat=None if self.x_hat is None else self.x_hat[m],
+                          w_hat=None if self.w_hat is None else self.w_hat[m])
 
     @property
     def n_trajectories(self) -> int:
@@ -204,6 +233,7 @@ class TrajectoryBatch:
     @property
     def nbytes(self) -> int:
         extra = 0 if self.x_hat is None else self.x_hat.nbytes
+        extra += 0 if self.w_hat is None else self.w_hat.nbytes
         return int(self.x.nbytes + self.u.nbytes + self.t.nbytes + extra)
 
 
@@ -268,6 +298,7 @@ def rollout_many(
     # ВЫКЛЮЧЕНО по умолчанию: +80 % памяти (см. докстринг TrajectoryBatch)
     xhs = (np.empty((M, n_frames - 1, system.n_state), dtype=float)
            if record_estimate else None)
+    whs = None
 
     t = float(t0)
     U_prev = np.zeros((M, system.n_action))
@@ -284,6 +315,11 @@ def rollout_many(
             us[:, j] = U
             if xhs is not None:
                 xhs[:, j] = X_hat
+                W_hat = estimator.aux.get("w_hat")
+                if W_hat is not None:
+                    if whs is None:
+                        whs = np.full((M, n_frames - 1, 2), np.nan)
+                    whs[:, j] = W_hat
 
         X = integrator.step(system.f, t, X, U, dt)
         t = t0 + (k + 1) * dt
@@ -291,4 +327,4 @@ def rollout_many(
 
     ts[-1] = t
     xs[:, -1] = X
-    return TrajectoryBatch(t=ts, x=xs, u=us, x_hat=xhs)
+    return TrajectoryBatch(t=ts, x=xs, u=us, x_hat=xhs, w_hat=whs)

@@ -60,7 +60,7 @@ def test_two_controllers_render_together(tmp_path):
 
     args = build_parser().parse_args(
         ["--grid", "7", "--horizon", "2.0", "--stride", "20",
-         "--main", "bang", "--compare", "lqr", "--frames", "2"]
+         "--main", "bang-eps-ell", "--compare", "lqr", "--frames", "2"]
     )
     app = Explorer(args)
     assert app.traj is not None and app.traj_cmp is not None
@@ -87,10 +87,10 @@ def test_switching_controllers_recomputes_the_map():
     outcome_lqr = app.outcome.copy()
     assert app.traj_cmp is None
 
-    app.set_main("bang")
+    app.set_main("bang-eps-ell")
     assert not np.array_equal(app.outcome, outcome_lqr)
 
-    app.set_compare("bang-map")               # использует маску чистого ЛКР
+    app.set_compare("bang-energy-ell")        # вторая схема -- один прогон
     assert app.traj_cmp is not None
     app.set_compare(None)
     assert app.traj_cmp is None
@@ -103,11 +103,15 @@ def test_picker_buttons_cover_every_controller():
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     import pygame as pg
 
-    from wpend.viz.explorer import (CONTROLLER_KEYS, build_parser, Explorer,
-                                    picker_layout)
+    from wpend.viz.explorer import (CONTROLLER_KEYS, PICK, PICK_FONT_NAME,
+                                    PICK_FONT_SIZES, PICK_MARGIN, W,
+                                    build_parser, Explorer, pick_label,
+                                    picker_font, picker_layout)
 
     pg.init()
-    font = pg.font.SysFont("consolas,dejavusansmono,monospace", 15)
+    # Шрифт берётся тот же, каким кнопки рисуются: раскладка, посчитанная
+    # другим, ловила бы мышь не там, где кнопка видна.
+    font = picker_font(pg)
     args = build_parser().parse_args(["--grid", "5", "--horizon", "1.0",
                                       "--stride", "20", "--no-precompute"])
     app = Explorer(args)
@@ -116,6 +120,20 @@ def test_picker_buttons_cover_every_controller():
         == CONTROLLER_KEYS
     assert [k for _, row, k in layout if row == 1] == CONTROLLER_KEYS + [None]
     assert all(x + w <= 1280 for (x, _, w, _), _, _ in layout)   # влезает в окно
+
+    # ...и влезает НЕ ЗА СЧЁТ запаса: выбран самый крупный из допустимых
+    # размеров. Без этой половины оракула picker_font мог бы вернуть минимум
+    # всегда, и кнопки стали бы нечитаемыми молча.
+    rows = (CONTROLLER_KEYS, CONTROLLER_KEYS + [None],
+            [k for _, row, k in layout if row == 2])
+    chosen = PICK_FONT_SIZES.index(
+        next(s for s in PICK_FONT_SIZES
+             if pg.font.SysFont(PICK_FONT_NAME, s).get_height() == font.get_height()))
+    if chosen > 0:
+        bigger = pg.font.SysFont(PICK_FONT_NAME, PICK_FONT_SIZES[chosen - 1])
+        ends = [PICK[0] + 108 + sum(bigger.size(pick_label(r, k))[0] + 24 for k in keys) - 6
+                for r, keys in enumerate(rows)]
+        assert max(ends) > W - PICK_MARGIN, "шрифт можно было взять крупнее"
     pg.quit()
 
 
@@ -128,18 +146,22 @@ def test_unavailable_controller_is_refused_and_explained(tmp_path):
     from wpend.viz.explorer import build_parser, run, Explorer
 
     args = build_parser().parse_args(
-        ["--grid", "7", "--horizon", "1.0", "--stride", "20", "--frames", "2"]
+        ["--grid", "7", "--horizon", "1.0", "--stride", "20", "--frames", "2",
+         "--main", "lqr"]    # с 01.10 умолчание -- реле; здесь важно стартовать с lqr
     )
     app = Explorer(args)
     app.P = None                          # как будто scipy не установлен
     app.design_hint = "ellipsoid needs scipy:  uv sync --extra dev"
 
-    assert not app.available("bang-ell")
-    assert app.available("lqr") and app.available("bang-map")
+    # Без scipy обе трёхфазные схемы отпадают: третья фаза -- эллипсоид по P,
+    # вторая -- мягкий ЛКР, а его тоже синтезирует Риккати.
+    assert not app.available("bang-eps-ell")
+    assert not app.available("bang-energy-ell")
+    assert app.available("lqr")
 
-    app.set_main("bang-ell")
+    app.set_main("bang-eps-ell")
     assert app.main_key == "lqr"           # выбор отклонён, а не применён молча
-    app.set_compare("bang-ell")
+    app.set_compare("bang-energy-ell")
     assert app.cmp_key is None
 
     shot = tmp_path / "disabled.png"       # и подсказка рисуется без исключений
@@ -194,7 +216,8 @@ def test_estimator_cycles_and_every_variant_carries_the_encoder():
     from wpend.viz.explorer import build_parser, Explorer, ESTIMATOR_KEYS, IMU_D
 
     args = build_parser().parse_args(
-        ["--grid", "7", "--horizon", "1.0", "--stride", "20", "--main", "lqr"]
+        ["--grid", "7", "--horizon", "1.0", "--stride", "20", "--main", "lqr",
+         "--estimator", "ideal"]    # с 01.10 умолчание -- kalman
     )
     app = Explorer(args)
     assert app.est_key == "ideal" and app.design_hint == ""
@@ -207,6 +230,13 @@ def test_estimator_cycles_and_every_variant_carries_the_encoder():
         sensor, est = app._sensor(), app._estimator()
         assert isinstance(sensor, StackedSensor)
         assert [type(s) for s in sensor.sensors] == [IMUSensor, EncoderSensor]
+        if key == "kalman":
+            # ER-025: фильтр Калмана читает (a_x, a_z, omega, e, de) того же
+            # датчика; вынос у датчика и в модели наблюдения -- одно число
+            from wpend.estimator import KalmanEstimator
+            assert isinstance(est, KalmanEstimator)
+            assert sensor.sensors[0].d == est.d == IMU_D
+            continue
         assert isinstance(est, ComplementaryEstimator) and est.wheel == "encoder"
         # вынос у датчика и у компенсации -- одно число, иначе вычитается не то
         assert sensor.sensors[0].d == est.accel_offset == IMU_D
@@ -306,8 +336,9 @@ def test_measured_optimum_differs_from_the_analytic_one():
     from wpend.viz.explorer import build_parser, Explorer
 
     args = build_parser().parse_args(
-        ["--grid", "7", "--horizon", "2.0", "--stride", "20", "--estimator", "comp"]
-    )
+        ["--grid", "7", "--horizon", "2.0", "--stride", "20", "--estimator", "comp",
+         "--main", "lqr", "--sigma-g", "1e-4", "--sigma-a", "1e-3"]
+    )   # плотности -- прежние умолчания: тест о сдвиге оптимума, а не о паспорте
     app = Explorer(args)
     app.measure_tau_star(n_points=5)
     assert app.tau_star_measured is not None

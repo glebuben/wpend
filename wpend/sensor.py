@@ -269,6 +269,15 @@ class IMUSensor(Sensor):
     seed : int | None
         Зерно.  reset() возвращает генератор в начало, поэтому два прогона с
         одним seed дают одинаковое смещение включения и одинаковый шум.
+    b_init : массив (3,) | (M, 3) | None
+        Смещение включения [b_ax, b_az, b_g], заданное СНАРУЖИ, вместо
+        розыгрыша по b0_a, b0_g (ER-025, docs/accel_kalman.md §4.3).  Нужно,
+        когда два датчика -- это один и тот же чип в разные моменты:
+        калибровка на подставке и прогон делят смещение, но не белый шум
+        (разные seed).  С общим seed совпал бы и весь шум, и ошибка
+        калибровки оказалась бы коррелирована с шумом прогона -- артефакт,
+        которого в железе нет.  None -- как раньше, розыгрыш по b0_*.
+        Разыграть такое смещение -- draw_turn_on_bias.
     """
 
     _N_BIAS = 3   # [b_ax, b_az, b_g] -- одно состояние ошибки на оба режима
@@ -292,6 +301,7 @@ class IMUSensor(Sensor):
         corr_b=None,
         corr_b0=None,
         seed: int | None = None,
+        b_init=None,
     ):
         if mode not in ("state", "imu"):
             raise ValueError(f"mode должен быть 'state' или 'imu', получено {mode!r}")
@@ -305,6 +315,12 @@ class IMUSensor(Sensor):
         self.dt = float(dt)
         self.d = float(d)
         self.seed = seed
+        self.b_init = None if b_init is None else np.asarray(b_init, dtype=float)
+        if self.b_init is not None and self.b_init.shape[-1:] != (self._N_BIAS,):
+            raise ValueError(
+                f"b_init должен иметь последнюю ось 3 ([b_ax, b_az, b_g]), "
+                f"получено {self.b_init.shape}"
+            )
 
         # порядок компонент состояния ошибки: [a_x, a_z, gyro]
         self.sigma_w = np.array([sigma_a, sigma_a, sigma_g], dtype=float)
@@ -356,6 +372,15 @@ class IMUSensor(Sensor):
 
     # --- медленное состояние ошибки ---------------------------------------
 
+    @property
+    def bias(self):
+        """Текущее смещение [b_ax, b_az, b_g] (копия) или None до первого
+        отсчёта.  Только для симуляции: на железе этой величины нет; её читают
+        виды окна исследователя, чтобы разложить ошибку фильтра на «смещение»
+        и «состояние» (docs/kalman_views.md §13)."""
+        return None if self._b is None else self._b.copy()
+
+
     def _advance_bias(self, prefix: tuple[int, ...], t: float) -> np.ndarray:
         """Продвинуть смещение до момента t и вернуть его.
 
@@ -366,14 +391,19 @@ class IMUSensor(Sensor):
         """
         shape = prefix + (self._N_BIAS,)
         if self._b is None or self._b.shape != shape:
-            self._b = self._rng.standard_normal(shape) @ self._L_b0.T
+            if self.b_init is not None:
+                # смещение этого чипа задано снаружи; ГСЧ не трогаем, шум
+                # остаётся своим
+                self._b = np.broadcast_to(self.b_init, shape).copy()
+            else:
+                self._b = self._rng.standard_normal(shape) @ self._L_b0.T
             self._t_prev = t
             return self._b
 
         dt = t - self._t_prev
         if dt <= 0:                      # повторный вызов в тот же момент
             return self._b
-        if not np.isclose(dt, self.dt, rtol=1e-6, atol=0.0):
+        if not abs(dt - self.dt) <= 1e-6 * abs(self.dt):   # = np.isclose(rtol=1e-6, atol=0), но без его накладных расходов (kalman_speed §5)
             raise ValueError(
                 f"IMUSensor: шаг по времени {dt!r} не совпадает с dt={self.dt!r}, "
                 "заданным датчику.  И шум (1/sqrt(dt)), и уход (sqrt(dt)) зависят "
@@ -411,6 +441,36 @@ class IMUSensor(Sensor):
             [f_x + e[..., 0], f_z + e[..., 1], x[..., self.i_dpsi] + e[..., 2]],
             axis=-1,
         )
+
+
+# Смещение включения «сырого» чипа, без калибровки: допуск нуля из даташита
+# MPU-6000/MPU-6050 Product Specification rev. 3.4 (гироскоп ±20 °/с,
+# акселерометр ±50 mg по X и Y), переведённый в СКО как допуск/sqrt(3) --
+# равномерное распределение на интервале, самая широкая из трактовок: для
+# фильтра завысить начальную неуверенность безопасно, занизить -- опасно
+# (docs/accel_kalman.md §4.4).  Решение Глеба 30.09: в режиме калибровки
+# разыгрывать смещение сырого чипа.
+MPU6050_RAW_B0 = dict(
+    b0_a=0.050 * 9.80665 / np.sqrt(3.0),        # 0.283 м/с^2
+    b0_g=np.deg2rad(20.0) / np.sqrt(3.0),       # 0.2015 рад/с
+)
+
+
+def draw_turn_on_bias(*, b0_a: float, b0_g: float, shape=(), corr_b0=None,
+                      seed: int | None = None) -> np.ndarray:
+    """Разыграть смещение включения [b_ax, b_az, b_g] формы shape + (3,).
+
+    Та же формула, что внутри IMUSensor: b = D C z, D = diag(b0_a, b0_a, b0_g),
+    C C^T = corr_b0.  Отдельная функция нужна, чтобы «этот чип сегодня» был
+    ОДИН для калибровки и для прогона (IMUSensor(b_init=...)).  Сырой чип --
+    draw_turn_on_bias(**MPU6050_RAW_B0, seed=...).
+    """
+    b0 = np.array([b0_a, b0_a, b0_g], dtype=float)
+    R = _correlation_matrix(corr_b0, "corr_b0", 3)
+    L = b0[:, None] * _cholesky(R, "corr_b0")
+    shape = (int(shape),) if np.isscalar(shape) else tuple(shape)
+    z = np.random.default_rng(seed).standard_normal(shape + (3,))
+    return z @ L.T
 
 
 class EncoderSensor(Sensor):
@@ -524,7 +584,7 @@ class EncoderSensor(Sensor):
             if dt <= 0:
                 # Повторный вызов в тот же момент: счётчик не двигался.
                 return np.stack([angle, np.zeros_like(angle)], axis=-1)
-            if not np.isclose(dt, self.dt, rtol=1e-6, atol=0.0):
+            if not abs(dt - self.dt) <= 1e-6 * abs(self.dt):   # = np.isclose(rtol=1e-6, atol=0), но без его накладных расходов (kalman_speed §5)
                 raise ValueError(
                     f"EncoderSensor: шаг {dt!r} не совпадает с dt={self.dt!r}. "
                     "Скорость считается разностью счётчика, делённой на шаг, "
