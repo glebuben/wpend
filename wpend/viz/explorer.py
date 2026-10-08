@@ -13,7 +13,8 @@
 Управление: клик по клетке -- проиграть её траекторию; кнопки сверху либо
 1..8 (основной) и Shift+1..8 (сравнение, Shift+0 -- выключить); слайдер u_max
 или клавиши [ и ]; кнопка settings или S -- панель цен ЛКР (Q, R), eps и
-горизонта; кнопка noise или N -- панель корреляций каналов ИДУ; кнопка switch
+горизонта; кнопка noise или N -- панель шума (три страницы: ИДУ, уход и
+энкодер, корреляции; docs/noise_panel.md §2); кнопка switch
 или C -- показать / спрятать кривую переключения реле sigma = 0 на карте
 (линия уровня первого интеграла через (0, 0)); ПРОБЕЛ -- пауза; R -- сначала;
 Esc -- выход.
@@ -21,8 +22,9 @@ Esc -- выход.
 Мир, модель и фильтр Калмана (ER-025, docs/explorer_kalman.md): W или кнопка
 `world` -- чистый мир / ветер (DisturbedWheeledPendulum); M или `model` --
 физика мира и номинала (что знают регулятор и фильтр) и параметры ветра;
-K или `kalman` -- чип (калиброванный / сырой MPU-6050), априор смещений
-(code / калибровка на подставке), модель толчка в фильтре; P или `[P] u | w`
+K или `filter` -- панель оценивателя (docs/estimator_panel.md): что Калман
+учитывает (смещения, энкодер, уход, толчок), как настроен и стартует (чип,
+априор смещений, стоянка), компенсация вертикали у комплементарных; P или `[P] u | w`
 -- нижний график: момент или толчок (истина против оценки kalman+enc).
 Виды фильтра (docs/kalman_views.md): V или `[V] P ellipse` -- ошибка
 (psi, dpsi) и эллипс 1 sigma по P; H или `[H] y vs h(x,u)` -- показания и
@@ -129,9 +131,12 @@ NOISE_SPECS = [
     ("sigma_g", "sig_g", 1e-6, 1e-2, True, "{:.1e}"),
     ("sigma_a", "sig_a", 1e-5, 1e-1, True, "{:.1e}"),
     ("b0_g", "b0_g", 1e-4, 1e-1, True, "{:.1e}"),
-    ("tau", "tau", 1e-2, 3.0, True, "{:.3f}"),
+    # tau -- ручка ФИЛЬТРА (комплементарного), не датчика: подпись говорит
+    # это прямо (ER-019.1), остальные три -- датчик.
+    ("tau", "comp tau", 1e-2, 3.0, True, "{:.3f}"),
 ]
-NOISE_TRACK = 104                   # длина дорожки одного слайдера
+NOISE_TRACK = 88                    # длина дорожки одного слайдера (88, а не 104: подпись
+#                                     `comp tau` длиннее `tau`, и значение наезжало на `world`)
 NOISE_STEP = 96                     # x-шаг между блоками сверх дорожки
 
 # Диапазон слайдера. Сверху 10 Н*м: там седло уже за psi_fall, и карта
@@ -261,7 +266,7 @@ SETTINGS = (300, 190, 680, 520)     # панель настроек: x, y, w, h
 #: Символы, которые принимает поле ввода: число в любой записи Python.
 SETTINGS_CHARS = set("0123456789.eE-+")
 
-#: Панель шума (кнопка `noise`, клавиша N): корреляции каналов ИДУ
+#: Страница 3 панели шума (кнопка `noise`, клавиша N): корреляции каналов ИДУ
 #: [a_x, a_z, gyro] -- по матрице на компоненту, как в IMUSensor
 #: (PROPOSALS.md A29).  Матрица 3x3 с единицами на диагонали задаётся тремя
 #: числами над диагональю; остальное -- симметрия, поэтому несимметричную
@@ -273,8 +278,125 @@ CORR_PAIRS = ((0, 1, "a_x - a_z"), (0, 2, "a_x - gyro"), (1, 2, "a_z - gyro"))
 #: Старт -- каналы независимы, ровно прежняя модель.
 DEFAULT_CORR = {m: (0.0, 0.0, 0.0) for m, _, _ in CORR_MATRICES}
 #: Порядок обхода по Tab: матрица за матрицей (столбец за столбцом панели).
-NOISE_KEYS = [f"{m}.{i}" for m, _, _ in CORR_MATRICES for i in range(len(CORR_PAIRS))]
-NOISE_PANEL = (300, 190, 680, 400)  # панель шума: x, y, w, h
+CORR_KEYS = [f"{m}.{i}" for m, _, _ in CORR_MATRICES for i in range(len(CORR_PAIRS))]
+
+#: Панель шума -- три страницы (решение Глеба 06.10, docs/noise_panel.md §2.2):
+#: всё на одной не помещается и читалось бы плохо.  Поля всех страниц живут в
+#: одном app.noise_text и принимаются ОДНОЙ транзакцией (apply_noise): иначе
+#: можно было бы принять страницу 1 с картой, посчитанной под старую страницу 2.
+NOISE_PAGES = (("imu", "1 IMU"), ("slow", "2 drift, encoder"), ("corr", "3 correlation"))
+#: Поля датчика: ключ app.noise, подпись, единицы, страница, что это такое.
+#: Всё, что IMUSensor и EncoderSensor умеют, -- кроме корреляций (страница 3).
+#: Числа по умолчанию -- паспорт MPU-6050 (docs/noise_panel.md §1, таблица).
+SENSOR_FIELDS = (
+    ("sigma_g", "sig_g", "rad/s/rtHz", "imu", "gyro white noise density"),
+    ("sigma_a", "sig_a", "m/s2/rtHz", "imu", "accel white noise density, both a_x and a_z"),
+    ("b0_g", "b0_g", "rad/s", "imu", "gyro turn-on bias: constant per run, random over runs"),
+    ("b0_a", "b0_a", "m/s2", "imu", "accel turn-on bias: the filter has to learn it first"),
+    ("sigma_bg", "sig_bg", "rad/s2/rtHz", "slow", "gyro bias drift intensity"),
+    ("sigma_ba", "sig_ba", "m/s3/rtHz", "slow", "accel bias drift intensity"),
+    ("tau_g", "tau_g", "s", "slow", "gyro drift correlation time; inf = random walk"),
+    ("tau_a", "tau_a", "s", "slow", "accel drift correlation time; inf = random walk"),
+    ("counts", "counts", "per rev", "slow", "encoder marks per revolution; 0 = no quantization"),
+)
+SENSOR_KEYS = [k for k, *_ in SENSOR_FIELDS]
+SENSOR_SPEC = {k: (label, unit, page, what) for k, label, unit, page, what in SENSOR_FIELDS}
+#: Порядок строк на странице: заголовок группы или поле.  Одна таблица и для
+#: раскладки, и для отрисовки (noise_page_rows) -- как picker_layout.
+NOISE_PAGE_ROWS = {
+    "imu": (("head", "IMU white noise"), ("field", "sigma_g"), ("field", "sigma_a"),
+            ("head", "IMU turn-on bias (constant per run, random over runs)"),
+            ("field", "b0_g"), ("field", "b0_a"), ("chip", None)),
+    "slow": (("head", "IMU bias drift (Gauss-Markov; random walk if tau = inf)"),
+             ("field", "sigma_bg"), ("field", "sigma_ba"), ("field", "tau_g"),
+             ("field", "tau_a"),
+             ("head", "Encoder (body-wheel angle; quantization, not noise)"),
+             ("field", "counts")),
+    "corr": (),
+}
+NOISE_PAGE_KEYS = {"imu": [k for k in SENSOR_KEYS if SENSOR_SPEC[k][2] == "imu"],
+                   "slow": [k for k in SENSOR_KEYS if SENSOR_SPEC[k][2] == "slow"],
+                   "corr": list(CORR_KEYS)}
+#: Порядок обхода по Tab -- страница за страницей; Tab ходит внутри страницы.
+NOISE_KEYS = SENSOR_KEYS + CORR_KEYS
+NOISE_PANEL = (120, 70, 1040, 700)  # панель шума: x, y, w, h
+#: В полях шума, кроме числа, допустимо слово inf (tau ухода).
+NOISE_CHARS = SETTINGS_CHARS | set("inf")
+NOISE_ROW = 52                      # шаг строки поля: поле + строка пояснения
+#: Пресеты (docs/noise_panel.md §2.5) заполняют ПОЛЯ, но не применяют их --
+#: как defaults.  `off` полей не трогает: на apply переключает оцениватель на
+#: ideal (решение Глеба 06.10) -- нули фильтр не переварит, R = 0.
+_MPU = dict(sigma_g=8.7e-5, sigma_a=3.9e-3, b0_g=1e-2, b0_a=9.8e-2, sigma_bg=1e-5,
+            sigma_ba=1e-4, tau_g=np.inf, tau_a=np.inf, counts=2048)
+NOISE_PRESETS = {
+    # Порядки из docs/imu_noise.md §6; b0, уход и N -- допущение.
+    "tactical": dict(_MPU, sigma_g=2e-5, sigma_a=6e-4, b0_g=1e-3, b0_a=1e-2,
+                     sigma_bg=1e-6, sigma_ba=1e-5, counts=4096),
+    "MPU-6050": dict(_MPU),
+    "MPU raw": dict(_MPU, b0_g=float(MPU6050_RAW_B0["b0_g"]),
+                    b0_a=float(MPU6050_RAW_B0["b0_a"])),
+}
+NOISE_PRESET_KEYS = ("off", "tactical", "MPU-6050", "MPU raw")
+#: Что множит общий множитель `x k` (скан «все шумы x k», docs/noise_panel.md §3.3):
+#: плотности и смещения -- на k, метки энкодера -- делятся на k.
+NOISE_SCALED = ("sigma_g", "sigma_a", "b0_g", "b0_a", "sigma_bg", "sigma_ba")
+
+
+def noise_text_of(key, value) -> str:
+    """Число поля -> текст поля: counts целым, бесконечность словом inf."""
+    if key == "counts":
+        return str(int(value))
+    # 10 знаков: пресет «MPU raw» (0.2015332627 рад/с) не должен терять точность.
+    return "inf" if np.isinf(value) else f"{value:.10g}"
+
+
+def scaled_noise(k: float) -> dict:
+    """Паспорт MPU-6050 x k: плотности и смещения на k, метки энкодера / k."""
+    out = dict(_MPU)
+    for key in NOISE_SCALED:
+        out[key] = _MPU[key] * k
+    out["counts"] = max(int(round(_MPU["counts"] / k)), 1)
+    return out
+
+
+def noise_live(key: str, values: dict, dt: float, T: float, g: float) -> str:
+    """Живое число строки: как выглядит этот шум в ОДНОМ отсчёте или за
+    горизонт.  Формулы -- docs/noise_panel.md §2.3; по ним видно, что поле
+    делает то, что написано, и сразу виден масштаб.
+
+    values -- числа полей (могут быть ещё не применены: число обновляется
+    по мере ввода).  Неразборчивое поле -- пустая строка.
+    """
+    v = values.get(key)
+    if v is None or not np.isfinite(v) and key not in ("tau_g", "tau_a"):
+        return ""
+    if key == "sigma_g":
+        return f"{v / np.sqrt(dt):.2e} rad/s per sample"
+    if key == "sigma_a":
+        s = v / np.sqrt(dt)
+        # Статическая линеаризация psi_acc = atan2(-f_x, f_z): d psi = -d f_x / g.
+        return f"{s:.2e} m/s2 = {np.degrees(s / g):.2f} deg tilt-equivalent per sample"
+    if key == "b0_g":
+        return f"unestimated over {T:g} s: {np.degrees(v * T):.1f} deg of tilt"
+    if key == "b0_a":
+        return f"false vertical b/g = {np.degrees(v / g):.2f} deg"
+    if key in ("sigma_bg", "sigma_ba"):
+        tau = values.get("tau_g" if key == "sigma_bg" else "tau_a", np.inf)
+        if tau is None or not tau > 0:
+            return ""
+        # Std b(T) марковского процесса из нуля: sigma sqrt(tau/2 (1 - e^{-2T/tau}));
+        # tau = inf -- блуждание, sigma sqrt(T).
+        var = T if np.isinf(tau) else tau / 2 * -np.expm1(-2 * T / tau)
+        unit = "rad/s" if key == "sigma_bg" else "m/s2"
+        return f"std of bias after {T:g} s: {v * np.sqrt(var):.1e} {unit}"
+    if key in ("tau_g", "tau_a"):
+        return "random walk (Allan slope +1/2)" if np.isinf(v) else "Gauss-Markov (Allan plateau)"
+    if key == "counts":
+        if v == 0:
+            return "ideal encoder"
+        q = 2 * np.pi / v
+        return f"q = {q:.2e} rad;  rate step q/dt = {q / dt:.2f} rad/s"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -295,24 +417,83 @@ DEFAULT_WIND = {"sigma_psi": 0.3, "sigma_theta": 0.3, "tau_w": 0.2, "seed": 7.0}
 #: стоянка, уход, модель возмущения в фильтре, q_acc, итерации.
 #: q_acc = 1e-4 рад/с^2/sqrt(Гц), а не 0 (решение Глеба 01.10, kalman_views §17.1):
 #: при Q = 0 блок P по (psi, dpsi) вырождается в отрезок и фильтр самоуверен.
+#: Панель оценивателя (06.10, docs/estimator_panel.md) добавила: что фильтр
+#: УЧИТЫВАЕТ -- смещения в состоянии (bias_state), энкодер (encoder); как он
+#: настроен -- R_scale, P0_scale (во сколько раз фильтр считает шум и
+#: смещения больше настоящих), psi0_std, dtheta0_std (неуверенность старта);
+#: и у комплементарных -- компенсацию кажущейся вертикали (accel_comp, A31).
+#: Умолчания -- прежнее поведение, окно бит в бит.
 DEFAULT_KF = {"chip": "calibrated", "prior": "code", "T_c": 1.0, "sigma_jig": 1e-2,
               "drift": "off", "w_model": "matched", "sigma_psi": 0.3,
-              "sigma_theta": 0.3, "tau_w": 0.2, "q_acc": 1e-4, "iterations": 1.0}
+              "sigma_theta": 0.3, "tau_w": 0.2, "q_acc": 1e-4, "iterations": 1.0,
+              "bias_state": "on", "encoder": "on", "accel_comp": "on",
+              "R_scale": 1.0, "P0_scale": 1.0, "psi0_std": 0.1, "dtheta0_std": 1.0}
 KF_CHOICES = {"chip": ("calibrated", "raw"), "prior": ("code", "calibrate"),
-              "drift": ("off", "on"), "w_model": ("off", "matched", "own")}
+              "drift": ("off", "on"), "w_model": ("off", "matched", "own"),
+              "bias_state": ("on", "off"), "encoder": ("on", "off"),
+              "accel_comp": ("on", "off")}
 #: Цвет истинного толчка на графике `w`.
 WIND = (200, 200, 120)
 #: Панель model (клавиша M): поля в порядке обхода по Tab.
 MODEL_KEYS = ([f"world.{k}" for k in PHYS_KEYS] + [f"nominal.{k}" for k in PHYS_KEYS]
               + [f"wind.{k}" for k in DEFAULT_WIND])
 MODEL_PANEL = (300, 170, 680, 540)
-#: Панель kalman (клавиша K): числовые поля; выборы -- кнопками.
+#: Панель оценивателя (кнопка `filter`, клавиша K): числовые поля; выборы --
+#: кнопками.  Три страницы, как у панели шума: одна транзакция apply_kf.
 KF_FIELDS = ("T_c", "sigma_jig", "sigma_psi", "sigma_theta", "tau_w", "q_acc",
-             "iterations")
+             "iterations", "R_scale", "P0_scale", "psi0_std", "dtheta0_std")
 KF_LABELS = {"T_c": "stand T_c, s", "sigma_jig": "stand sigma_jig, rad",
              "sigma_psi": "own w: sigma_psi", "sigma_theta": "own w: sigma_theta",
-             "tau_w": "own w: tau_w, s", "q_acc": "q_acc", "iterations": "iterations"}
-KF_PANEL = (300, 170, 680, 460)
+             "tau_w": "own w: tau_w, s", "q_acc": "q_acc", "iterations": "iterations",
+             "R_scale": "R scale", "P0_scale": "P0 bias scale",
+             "psi0_std": "psi0_std, rad", "dtheta0_std": "dtheta0_std, rad/s",
+             "bias_state": "biases in state", "drift": "bias drift (Q_b)",
+             "w_model": "push w in state", "encoder": "encoder",
+             "prior": "bias prior", "chip": "chip (world)",
+             "accel_comp": "accel compensation"}
+#: Что строка значит -- пояснение справа от неё (docs/estimator_panel.md §1).
+KF_HELP = {
+    "bias_state": "on: b_ax, b_az, b_g estimated;  off: assumed zero",
+    "drift": "on: biases wander (Q_b, noise page 2);  off: const",
+    "w_model": "off: no push;  matched: the world's;  own: fields below",
+    "sigma_psi": "push on the body the filter expects, N*m",
+    "sigma_theta": "push on the wheel the filter expects, N*m",
+    "tau_w": "push correlation time the filter expects",
+    "encoder": "off: IMU only -- the wheel becomes unobservable",
+    "q_acc": "process noise on accelerations, rad/s^2/rtHz",
+    "iterations": "1 = EKF;  2..5 = iterated EKF (slower)",
+    "R_scale": "IMU white noise the filter believes = world x k",
+    "P0_scale": "prior bias std the filter believes = b0 x k",
+    "psi0_std": "extra tilt uncertainty at start",
+    "dtheta0_std": "wheel speed uncertainty at start",
+    "prior": "code: b_hat0 = 0;  calibrate: stand still T_c first",
+    "T_c": "stand time before the run",
+    "sigma_jig": "stand tilt error the filter does not know",
+    "chip": "the world's IMU: changes EVERY estimator",
+    "accel_comp": "on: subtract the inertial part (A31)",
+}
+#: Страницы панели оценивателя: заголовок группы, выбор, поле, справка.
+KF_PAGES = (("model", "1 kalman: what it models"), ("tune", "2 kalman: tuning, start"),
+            ("comp", "3 complementary"))
+KF_PAGE_ROWS = {
+    "model": (("head", "State x = (psi, theta, dpsi, dtheta) + what is switched on"),
+              ("choice", "bias_state"), ("choice", "drift"), ("choice", "w_model"),
+              ("field", "sigma_psi"), ("field", "sigma_theta"), ("field", "tau_w"),
+              ("head", "Measurements y = (a_x, a_z, omega) + ..."),
+              ("choice", "encoder")),
+    "tune": (("head", "Process and update"), ("field", "q_acc"), ("field", "iterations"),
+             ("head", "What the filter believes about the IMU"),
+             ("field", "R_scale"), ("field", "P0_scale"),
+             ("head", "Start"), ("field", "psi0_std"), ("field", "dtheta0_std"),
+             ("choice", "prior"), ("field", "T_c"), ("field", "sigma_jig"),
+             ("choice", "chip")),
+    "comp": (("head", "Complementary filter: comp+enc, gyro+enc, accel+enc"),
+             ("choice", "accel_comp"), ("tau", None)),
+}
+KF_PAGE_FIELDS = {pg: [k for kind, k in rows if kind == "field"]
+                  for pg, rows in KF_PAGE_ROWS.items()}
+KF_PANEL = (120, 70, 1040, 700)
+KF_ROW = 34
 
 
 def corr_matrix(rho):
@@ -462,7 +643,8 @@ class _BiasTap:
 
     def __init__(self, sensor):
         self.sensor = sensor
-        self.imu = sensor.sensors[0]
+        # ИДУ + энкодер -- первый в стопке; без энкодера датчик и есть ИДУ.
+        self.imu = sensor.sensors[0] if hasattr(sensor, "sensors") else sensor
         self.biases = []
 
     def reset(self):
@@ -549,9 +731,15 @@ def _imu_params(app) -> dict:
     """Параметры ИДУ окна -- ОДНИ для датчика прогона и для подставки
     калибровки (calibrate_on_stand): разойдясь, калибровка мерила бы другой
     датчик."""
+    n = app.noise
+    # Все параметры ошибки -- из панели шума.  До 06.10 уход брался из
+    # умолчаний IMUSensor (в окне не виден), а b0_a был прибит к 9.8 * b0_g;
+    # умолчания окна -- те же числа, так что карта бит в бит прежняя.
     return dict(dt=app.args.dt, d=IMU_D,
-                sigma_g=app.noise["sigma_g"], sigma_a=app.noise["sigma_a"],
-                b0_g=app.noise["b0_g"], b0_a=app.noise["b0_g"] * 9.8,
+                sigma_g=n["sigma_g"], sigma_a=n["sigma_a"],
+                sigma_bg=n["sigma_bg"], sigma_ba=n["sigma_ba"],
+                tau_g=n["tau_g"], tau_a=n["tau_a"],
+                b0_g=n["b0_g"], b0_a=n["b0_a"],
                 **{name: corr_matrix(app.corr[m]) for m, _, name in CORR_MATRICES})
 
 
@@ -570,7 +758,7 @@ def _imu_enc(app, rows=None):
     """ИДУ плюс моторный энкодер. Порядок -- часть контракта оценивателя."""
     return StackedSensor(_imu(app, rows),
                          EncoderSensor(app._world_for(rows), dt=app.args.dt,
-                                       counts_per_rev=app.args.counts))
+                                       counts_per_rev=int(app.noise["counts"])))
 
 
 def _comp(tau=None):
@@ -579,7 +767,9 @@ def _comp(tau=None):
     return lambda app, rows=None: ComplementaryEstimator(
         app.system, dt=app.args.dt,
         tau=app.noise["tau"] if tau is None else tau,
-        wheel="encoder", accel_offset=IMU_D)
+        wheel="encoder",
+        # Панель оценивателя, стр. 3: off -- голый atan2, без вычета инерции.
+        accel_offset=IMU_D if app.kf["accel_comp"] == "on" else None)
 
 
 def _kalman(app, rows=None, diagnostics=False):
@@ -590,27 +780,56 @@ def _kalman(app, rows=None, diagnostics=False):
     знает датчик точно.  Остальное -- из панели kalman (app.kf).
     """
     kf = app.kf
+    s = float(kf["P0_scale"])
     prior = None
-    if kf["prior"] == "calibrate":
+    if kf["bias_state"] == "off":
+        # Смещений в состоянии нет: нулевая априорная неуверенность и Q_b = 0.
+        # Тогда строки и столбцы b в P нулевые навсегда, усиление по b -- ноль,
+        # b_hat = 0: ровно фильтр по (psi, theta, dpsi, dtheta), считающий
+        # смещения нулевыми (docs/estimator_panel.md §2.1).
+        prior = (np.zeros(3), np.zeros((3, 3)))
+    elif kf["prior"] == "calibrate":
         b_hat, P_bb = app._calibration()
-        prior = (b_hat if rows is None else b_hat[rows], P_bb)
+        prior = (b_hat if rows is None else b_hat[rows], P_bb * s ** 2)
     drift = None
-    if kf["drift"] == "on":
-        s = IMUSensor(app.system, dt=app.args.dt, mode="imu")   # плотности ухода датчика
-        drift = dict(sigma_ba=float(s.sigma_b[0]), sigma_bg=float(s.sigma_b[2]))
+    if kf["drift"] == "on" and kf["bias_state"] == "on":
+        # Плотности ухода -- те же, что у датчика мира (панель шума, стр. 2).
+        drift = dict(sigma_ba=float(app.noise["sigma_ba"]),
+                     sigma_bg=float(app.noise["sigma_bg"]))
     dist = None
     if kf["w_model"] == "matched" and app.phys["wind"]:
         dist = dict(sigma_w=(app.phys["sigma_psi"], app.phys["sigma_theta"]),
                     tau_w=app.phys["tau_w"])
     elif kf["w_model"] == "own":
         dist = dict(sigma_w=(kf["sigma_psi"], kf["sigma_theta"]), tau_w=kf["tau_w"])
+    # R_scale, P0_scale -- вера фильтра в шум и смещения относительно мира
+    # (1 -- знает точно).  При 1 умножение на 1.0 точное: окно бит в бит.
+    k = float(kf["R_scale"])
     return KalmanEstimator(
         app.system, dt=app.args.dt, d=IMU_D,
-        sigma_a=app.noise["sigma_a"], sigma_g=app.noise["sigma_g"],
-        corr_w=corr_matrix(app.corr["w"]), counts_per_rev=app.args.counts,
-        b0_a=app.noise["b0_g"] * 9.8, b0_g=app.noise["b0_g"], bias_prior=prior,
+        sigma_a=app.noise["sigma_a"] * k, sigma_g=app.noise["sigma_g"] * k,
+        corr_w=corr_matrix(app.corr["w"]), counts_per_rev=int(app.noise["counts"]),
+        b0_a=app.noise["b0_a"] * s, b0_g=app.noise["b0_g"] * s, bias_prior=prior,
         bias_drift=drift, disturbance=dist, q_acc=kf["q_acc"],
-        iterations=int(kf["iterations"]), diagnostics=diagnostics)
+        iterations=int(kf["iterations"]), psi0_std=kf["psi0_std"],
+        dtheta0_std=kf["dtheta0_std"], diagnostics=diagnostics)
+
+
+def _kalman_sensor(app, rows=None):
+    """Датчик Калмана: ИДУ + энкодер или (encoder off) один ИДУ.  Без
+    энкодера колесо ненаблюдаемо (rank 2, test_encoder) -- это осознанный
+    опыт из панели, а не умолчание (решение 17.09: все варианты с энкодером)."""
+    return _imu_enc(app, rows) if app.kf["encoder"] == "on" else _imu(app, rows)
+
+
+def est_label(app, key) -> str:
+    """Подпись оценивателя с тем, что у него выключено: «kalman+enc» врал бы
+    при encoder off.  Кнопки выбора остаются со статической подписью."""
+    if key != "kalman":
+        return ESTIMATOR_LABEL[key]
+    kf = app.kf
+    return ("kalman" + ("+enc" if kf["encoder"] == "on" else "")
+            + (", no b" if kf["bias_state"] == "off" else ""))
 
 
 ESTIMATORS = [
@@ -622,7 +841,7 @@ ESTIMATORS = [
     ("gyro", "gyro+enc", _imu_enc, _comp(np.inf)),
     ("acc", "accel+enc", _imu_enc, _comp(0.0)),
     # ER-025: оба канала акселерометра как есть, смещения и толчок в состоянии.
-    ("kalman", "kalman+enc", _imu_enc, _kalman),
+    ("kalman", "kalman+enc", _kalman_sensor, _kalman),
 ]
 ESTIMATOR_KEYS = [key for key, _, _, _ in ESTIMATORS]
 ESTIMATOR_LABEL = {key: label for key, label, _, _ in ESTIMATORS}
@@ -662,7 +881,11 @@ def _kf_from_args(args) -> dict:
     kf = dict(DEFAULT_KF)
     for key, attr in (("chip", "chip"), ("prior", "bias_prior"), ("T_c", "calib_time"),
                       ("sigma_jig", "sigma_jig"), ("w_model", "kf_w"),
-                      ("q_acc", "kf_q_acc"), ("iterations", "kf_iter")):
+                      ("q_acc", "kf_q_acc"), ("iterations", "kf_iter"),
+                      ("bias_state", "kf_bias"), ("encoder", "kf_encoder"),
+                      ("accel_comp", "accel_comp"), ("R_scale", "kf_r_scale"),
+                      ("P0_scale", "kf_p0_scale"), ("psi0_std", "kf_psi0_std"),
+                      ("dtheta0_std", "kf_dtheta0_std")):
         value = getattr(args, attr, None)
         if value is not None:
             kf[key] = value if key in KF_CHOICES else float(value)
@@ -746,8 +969,17 @@ class Explorer:
         # ESTIMATORS, их же двигают слайдеры.  Дублировать значения в
         # аргументах командной строки И в объекте значило бы завести два
         # источника правды.
+        # Панель шума (docs/noise_panel.md §2) добавила сюда всё, что умеют
+        # IMUSensor и EncoderSensor.  b0_a по умолчанию -- 9.8 * b0_g, ровно
+        # прежняя связь, но дальше они независимы (ER-019.1).
         self.noise = {"sigma_g": args.sigma_g, "sigma_a": args.sigma_a,
-                      "b0_g": args.b0_g, "tau": args.tau}
+                      "b0_g": args.b0_g,
+                      "b0_a": args.b0_g * 9.8 if args.b0_a is None else args.b0_a,
+                      "sigma_bg": args.sigma_bg, "sigma_ba": args.sigma_ba,
+                      "tau_g": args.tau_g, "tau_a": args.tau_a,
+                      "counts": int(args.counts), "tau": args.tau}
+        # С чем окно запущено -- кнопка defaults панели шума возвращает это.
+        self._noise_start = {k: self.noise[k] for k in SENSOR_KEYS}
         self.noise_drag = None          # какой слайдер тащат
         # Панели model и kalman (ER-025) -- устроены как settings и noise.
         self.model_open = False
@@ -758,6 +990,7 @@ class Explorer:
         self.kf_text = {}
         self.kf_focus = None
         self.kf_error = ""
+        self.kf_page = "model"
         # Нижний график: момент u или толчок w (клавиша P).
         self.plot_w = False
         self.w_true = None              # истинный толчок выбранной клетки
@@ -781,6 +1014,10 @@ class Explorer:
         self.noise_text = {}
         self.noise_focus = None
         self.noise_error = ""
+        self.noise_page = "imu"
+        self._noise_shown = {}          # текст полей в момент open_noise
+        # Нажат пресет off: на apply оцениватель станет ideal (решение 06.10).
+        self.noise_off_pending = False
         self.tau_star_measured = None   # argmin замера; None -- ещё не мерили
         self.est_key = args.estimator
         # Оцениватель СРАВНЕНИЯ считается только для выбранной клетки -- ровно
@@ -869,8 +1106,8 @@ class Explorer:
             if kf["chip"] == "raw":
                 chip = draw_turn_on_bias(**MPU6050_RAW_B0, shape=n, seed=self.args.seed + 1)
             else:
-                b0 = self.noise["b0_g"]
-                chip = draw_turn_on_bias(b0_a=9.8 * b0, b0_g=b0, shape=n,
+                chip = draw_turn_on_bias(b0_a=self.noise["b0_a"], b0_g=self.noise["b0_g"],
+                                         shape=n,
                                          seed=self.args.seed + 1,
                                          corr_b0=corr_matrix(self.corr["b0"]))
             if kf["prior"] == "calibrate":
@@ -939,8 +1176,8 @@ class Explorer:
     # --- виды фильтра (docs/kalman_views.md) ---------------------------------
 
     def toggle_view(self, key):
-        """V -- вид A, H -- вид B, B -- вид C (смещения); повторное нажатие
-        закрывает."""
+        """V -- вид A, H -- вид B, B -- вид C (смещения), X -- вид D (ошибка
+        состояния); повторное нажатие закрывает."""
         self.view = None if self.view == key else key
         self._update_diag()
 
@@ -963,7 +1200,7 @@ class Explorer:
         m = self.spec.index(*self.selected)
         x0 = self.spec.initial_states(self.system.n_state, I_PSI, I_DPSI)[m]
         world = self._world_for(m)
-        tap = _BiasTap(_imu_enc(self, m))
+        tap = _BiasTap(_kalman_sensor(self, m))
         with self._errstate():
             traj = rollout(world, CONTROLLER_BUILD[self.main_key](self), self.integrator,
                            x0, self.args.dt, self.n_steps,
@@ -1080,10 +1317,23 @@ class Explorer:
     def open_kf(self):
         self.kf_text = {k: (v if isinstance(v, str) else f"{v:g}")
                         for k, v in self.kf_values().items()}
-        self.kf_focus = "q_acc"
+        self.kf_focus = self._kf_first_field()
         self.kf_error = ""
         self.kf_open = True
         self.settings_open = self.noise_open = self.model_open = False
+
+    def set_kf_page(self, page: str):
+        """Страница панели оценивателя; фокус -- на её первое поле."""
+        if page not in KF_PAGE_FIELDS:
+            return
+        self.kf_page = page
+        self.kf_focus = self._kf_first_field()
+
+    def _kf_first_field(self):
+        """Первое ДЕЙСТВУЮЩЕЕ поле страницы: фокус на погасшем поле сбивает."""
+        keys = KF_PAGE_FIELDS[self.kf_page]
+        live = [k for k in keys if kf_enabled(self.kf_text, k)]
+        return (live or keys or [None])[0]
 
     def apply_kf(self, values: dict):
         """Принять настройки фильтра Калмана и чипа.  None -- успех."""
@@ -1116,6 +1366,12 @@ class Explorer:
         it = merged["iterations"]
         if it != int(it) or not 1 <= it <= 5:
             return "iterations: integer 1..5"
+        if merged["R_scale"] <= 0:
+            return "R scale must be > 0 (the filter can not believe in zero noise)"
+        if merged["P0_scale"] < 0:
+            return "P0 bias scale must be >= 0"
+        if merged["psi0_std"] < 0 or merged["dtheta0_std"] < 0:
+            return "psi0_std, dtheta0_std must be >= 0"
         changed = merged != self.kf
         self.kf = merged
         self.kf_error = ""
@@ -1297,57 +1553,140 @@ class Explorer:
     # --- панель шума -------------------------------------------------------
 
     def noise_values(self) -> dict:
-        """Текущие корреляции под ключами полей панели шума."""
-        return {f"{m}.{i}": float(r)
-                for m, _, _ in CORR_MATRICES for i, r in enumerate(self.corr[m])}
+        """Числа под ключами полей панели шума: датчик (страницы 1, 2) и
+        корреляции (страница 3)."""
+        out = {k: float(self.noise[k]) for k in SENSOR_KEYS}
+        out.update({f"{m}.{i}": float(r)
+                    for m, _, _ in CORR_MATRICES for i, r in enumerate(self.corr[m])})
+        return out
 
     def open_noise(self):
         """Как open_settings: поля -- то, чем посчитана текущая карта."""
-        self.noise_text = {k: f"{v:g}" for k, v in self.noise_values().items()}
-        self.noise_focus = NOISE_KEYS[0]
+        self.noise_text = {k: noise_text_of(k, v) for k, v in self.noise_values().items()}
+        # Что показано при открытии: поле с этим же текстом значит «не трогали»,
+        # и apply берёт точное число, а не округлённое до 6 знаков (иначе
+        # 9.8 * 0.01 = 0.09800000000000001 превращалось бы в 0.098, и
+        # «ничего не менял» пересчитывало бы карту).
+        self._noise_shown = dict(self.noise_text)
+        self.noise_text["xk"] = "10"
+        self.noise_focus = NOISE_PAGE_KEYS[self.noise_page][0]
         self.noise_error = ""
+        self.noise_off_pending = False
         self.noise_open = True
         self.settings_open = False
         self.model_open = self.kf_open = False
 
-    def apply_noise(self, values: dict):
-        """Принять корреляции каналов ИДУ; None -- успех, строка -- отказ.
+    def set_noise_page(self, page: str):
+        """Сменить страницу панели: фокус -- на её первое поле.  Текст полей
+        не трогается: все страницы -- одна транзакция."""
+        if page not in NOISE_PAGE_KEYS:
+            return
+        self.noise_page = page
+        self.noise_focus = NOISE_PAGE_KEYS[page][0]
 
-        Допустимость матрицы проверяет сам IMUSensor (пробная сборка), а не
-        окно: правило одно и живёт в одном месте.  Каждая матрица пробуется
-        отдельно, чтобы в отказе назвать, какая именно невозможна.  При отказе
-        окно не меняется ни в чём.
+    def fill_noise_preset(self, name: str):
+        """Пресет заполняет поля ВСЕХ страниц, но не применяет (как defaults).
+        `off` полей не трогает, а взводит переключение на ideal при apply."""
+        if name == "off":
+            self.noise_off_pending = True
+            return
+        self.noise_off_pending = False
+        values = NOISE_PRESETS[name] if name in NOISE_PRESETS else None
+        if name == "x k":
+            try:
+                k = float(self.noise_text.get("xk", ""))
+            except ValueError:
+                self.noise_error = "x k: not a number"
+                return
+            if not (np.isfinite(k) and k > 0):
+                self.noise_error = "x k: need k > 0"
+                return
+            values = scaled_noise(k)
+        if values is None:
+            return
+        self.noise_error = ""
+        for key, v in values.items():
+            self.noise_text[key] = noise_text_of(key, v)
+
+    def noise_text_values(self) -> dict:
+        """Разобранные числа полей (для живых чисел); неразборчивое -- None."""
+        out = {}
+        for key in SENSOR_KEYS:
+            try:
+                out[key] = float(self.noise_text.get(key, ""))
+            except ValueError:
+                out[key] = None
+        return out
+
+    def apply_noise(self, values: dict):
+        """Принять поля панели шума -- все три страницы разом; None -- успех,
+        строка -- отказ.  При отказе окно не меняется ни в чём, а строка
+        называет страницу: `page 2: sig_bg must be >= 0`.
+
+        Допустимость матрицы корреляции проверяет сам IMUSensor (пробная
+        сборка), а не окно: правило одно и живёт в одном месте.  Каждая
+        матрица пробуется отдельно, чтобы в отказе назвать, какая именно
+        невозможна.
 
         Пересчёт -- как у слайдеров шума (commit_noise), но только если датчик
         сейчас кому-то нужен: при ideal у основного и без второго оценивателя
-        карта от корреляций не зависит, и платить за неё секунды незачем.
-        Фабрики датчиков читают app.corr при каждой сборке, поэтому
+        карта от шума не зависит, и платить за неё секунды незачем.
+        Фабрики датчиков читают app.noise и app.corr при каждой сборке, поэтому
         переключиться на comp позже -- уже с новыми числами.
+
+        Взведённый пресет off (noise_off_pending) переключает оцениватель на
+        ideal (решение Глеба 06.10): поля при этом остаются, и обратный выбор
+        kalman+enc вернёт тот же датчик.
         """
+        page_no = {key: i + 1 for i, (key, _) in enumerate(NOISE_PAGES)}
         merged = self.noise_values()
         try:
             for key, value in values.items():
+                if key == "xk":
+                    continue                     # поле множителя -- не параметр
                 if key not in merged:
                     return f"unknown field {key}"
+                if value == self._noise_shown.get(key):
+                    continue                     # не трогали -- точное прежнее число
                 merged[key] = float(value)
         except (TypeError, ValueError):
             return f"not a number: {key} = {value!r}"
-        if not all(np.isfinite(v) for v in merged.values()):
-            return "all values must be finite"
+
+        for key in SENSOR_KEYS:
+            label, _, page, _ = SENSOR_SPEC[key]
+            v, where = merged[key], f"page {page_no[page]}: {label}"
+            if key in ("tau_g", "tau_a"):
+                if not v > 0:                    # nan тоже сюда
+                    return f"{where} must be > 0 (inf = random walk)"
+            elif not np.isfinite(v) or v < 0:
+                return f"{where} must be finite and >= 0"
+            if key == "counts" and v != int(v):
+                return f"{where} must be a whole number"
+
+        corr_where = f"page {page_no['corr']}"
+        corr_vals = [merged[k] for k in CORR_KEYS]
+        if not all(np.isfinite(v) for v in corr_vals):
+            return f"{corr_where}: all values must be finite"
         corr = {m: tuple(merged[f"{m}.{i}"] for i in range(len(CORR_PAIRS)))
                 for m, _, _ in CORR_MATRICES}
         for m, label, name in CORR_MATRICES:
             if max(abs(r) for r in corr[m]) >= 1.0:
-                return f"{label}: need |rho| < 1"
+                return f"{corr_where}: {label}: need |rho| < 1"
             try:
                 IMUSensor(self.system, dt=self.args.dt, mode="imu",
                           **{name: corr_matrix(corr[m])})
             except ValueError:
-                return f"{label}: impossible correlations (not positive definite)"
+                return f"{corr_where}: {label}: impossible correlations (not positive definite)"
 
-        changed = corr != self.corr
+        sensor = {k: (int(merged[k]) if k == "counts" else merged[k]) for k in SENSOR_KEYS}
+        changed = (corr != self.corr
+                   or any(sensor[k] != self.noise[k] for k in SENSOR_KEYS))
         self.corr = corr
+        self.noise.update(sensor)
         self.noise_error = ""
+        if self.noise_off_pending:
+            self.noise_off_pending = False
+            self.set_estimator("ideal")
         if changed and (self.est_key != "ideal" or self.est_cmp_key is not None):
             self.commit_noise()
         return None
@@ -1744,9 +2083,11 @@ class Explorer:
         t0 = time.perf_counter()
         sensor, estimator = self._sensor(), self._estimator()
         self.nees = None
-        if self.est_key == "kalman":
+        if self.est_key == "kalman" and self.kf["bias_state"] == "on":
             # Честность фильтра по ансамблю клеток -- для вида C (§6.2).
-            estimator = _NeesTap(estimator, sensor.sensors[0], every=self.args.stride)
+            # Без смещений в состоянии P_bb = 0, и NEES смещений не определён.
+            imu = sensor.sensors[0] if hasattr(sensor, "sensors") else sensor
+            estimator = _NeesTap(estimator, imu, every=self.args.stride)
         with self._errstate():
             self.batch = rollout_many(self.world, self.controller, self.integrator,
                                       X0, self.args.dt, self.n_steps,
@@ -1764,7 +2105,7 @@ class Explorer:
         # ловит (psi пересекает psi_fall задолго до inf), но молчать об
         # этом нельзя -- иначе выглядит как «numpy что-то ругался».
         gone = int((~np.isfinite(self.batch.x).all(axis=(1, 2))).sum())
-        print(f"[{CONTROLLER_LABEL[self.main_key]} / {ESTIMATOR_LABEL[self.est_key]}] "
+        print(f"[{CONTROLLER_LABEL[self.main_key]} / {est_label(self, self.est_key)}] "
               f"сетка {self.spec.n}x{self.spec.n} "
               f"= {len(self.batch)} НУ, {self.n_steps} шагов: "
               f"{self.compute_seconds:.2f} с, "
@@ -2317,7 +2658,7 @@ def draw_robot(app, screen, pg, font):
         blocks.append(("compare", CONTROLLER_LABEL[app.cmp_key], app.traj_cmp,
                        GHOST, app.frame_of(app.traj_cmp)))
     if app.traj_est_cmp is not None:
-        blocks.append(("vs est ", ESTIMATOR_LABEL[app.est_cmp_key],
+        blocks.append(("vs est ", est_label(app, app.est_cmp_key),
                        app.traj_est_cmp, GHOST_EST,
                        app.frame_of(app.traj_est_cmp)))
     for name, label, traj, color, frame in blocks:
@@ -2467,7 +2808,7 @@ def _ghost_curves(app):
         out.append((app.traj_cmp, GHOST, CONTROLLER_LABEL[app.cmp_key]))
     if app.traj_est_cmp is not None:
         out.append((app.traj_est_cmp, GHOST_EST,
-                    "est " + ESTIMATOR_LABEL[app.est_cmp_key]))
+                    "est " + est_label(app, app.est_cmp_key)))
     return out
 
 
@@ -2485,7 +2826,7 @@ def _phase_rows(app):
         rows.append((app.track_cmp, GHOST, CONTROLLER_LABEL[app.cmp_key]))
     if app.track_est_cmp is not None:
         rows.append((app.track_est_cmp, GHOST_EST,
-                     "est " + ESTIMATOR_LABEL[app.est_cmp_key]))
+                     "est " + est_label(app, app.est_cmp_key)))
     return rows
 
 
@@ -2599,7 +2940,7 @@ def draw_plots(app, screen, pg, font):
     legend = [(CONTROLLER_LABEL[app.main_key], PSI_CURVE)]
     legend += [(name, color) for _, color, name in ghosts]
     if e_psi is not None:
-        legend.append(("x_hat " + ESTIMATOR_LABEL[app.est_key], ESTIMATE))
+        legend.append(("x_hat " + est_label(app, app.est_key), ESTIMATE))
     if app.psi_eq is not None:
         legend.append(("psi_eq", LIMIT))
     legend.append(("psi_fall", GUIDE))
@@ -2641,7 +2982,7 @@ def draw_plots(app, screen, pg, font):
             est = (tw_, app.traj.w_hat[:, 1])
         legend_w = [("w_theta true", WIND), ("w_psi true", _shade(WIND, 0.55))]
         if est is not None:
-            legend_w.append(("w_hat " + ESTIMATOR_LABEL[app.est_key], ESTIMATE))
+            legend_w.append(("w_hat " + est_label(app, app.est_key), ESTIMATE))
         to_px2 = _plot(screen, pg, rect_u, tw_, w_true[:, 1], WIND, "w (N*m)", font,
                        ghosts=[(tw_, w_true[:, 0], _shade(WIND, 0.55))]
                        + ([] if app.traj.w_hat is None
@@ -3160,13 +3501,65 @@ def settings_key(app, event, pg):
 #  клавиши.  Проверка и пересчёт -- в Explorer.apply_noise.
 
 
-def noise_panel_layout(font):
-    """Раскладка панели шума: [(kind, key, rect)], как settings_layout."""
+#: Вертикальная разметка панели шума от её верха: шапка, вкладки, пресеты,
+#: начало страницы.  Низ -- от нижнего края: строка мира, предупреждение,
+#: ошибка, кнопки.
+NOISE_TABS_DY, NOISE_PRESET_DY, NOISE_BODY_DY = 66, 102, 150
+NOISE_FIELD_X, NOISE_FIELD_W = 300, 120  # поле ввода: сдвиг от левого края, ширина
+WARN = (235, 110, 90)
+
+
+def noise_page_rows(page):
+    """Строки страницы с их y: [(kind, payload, y)].  Чистая функция: одна и
+    та же и для раскладки полей, и для отрисовки заголовков и пояснений."""
+    _, y0, _, _ = NOISE_PANEL
+    y = y0 + NOISE_BODY_DY
+    out = []
+    for kind, payload in NOISE_PAGE_ROWS[page]:
+        if kind == "head":
+            if out:
+                y += 8                   # воздух перед новой группой
+            out.append((kind, payload, y))
+            y += 26
+        else:
+            out.append((kind, payload, y))
+            y += NOISE_ROW if kind == "field" else 30
+    return out
+
+
+def noise_panel_layout(font, page=None):
+    """Раскладка панели шума: [(kind, key, rect)], как settings_layout.
+
+    kind: "tab" (страница), "preset", "xk" (поле множителя), "field" (поле
+    параметра текущей страницы), "button" (apply / defaults / close).
+    page=None -- первая страница (для тестов раскладки без окна).
+    """
+    page = page or NOISE_PAGES[0][0]
     x, y, w, h = NOISE_PANEL
     out = []
-    for c, (m, _, _) in enumerate(CORR_MATRICES):
-        for i in range(len(CORR_PAIRS)):
-            out.append(("field", f"{m}.{i}", (x + 170 + c * 165, y + 110 + i * 30, 140, 24)))
+    tx = x + 24
+    for key, label in NOISE_PAGES:
+        tw = font.size(label)[0] + 24
+        out.append(("tab", key, (tx, y + NOISE_TABS_DY, tw, 26)))
+        tx += tw + 8
+    px = x + 24 + font.size("preset:")[0] + 12
+    for key in NOISE_PRESET_KEYS:
+        bw = font.size(key)[0] + 20
+        out.append(("preset", key, (px, y + NOISE_PRESET_DY, bw, 24)))
+        px += bw + 8
+    px += 16 + font.size("x k:")[0] + 8
+    out.append(("xk", "xk", (px, y + NOISE_PRESET_DY, 60, 24)))
+    px += 60 + 8
+    out.append(("preset", "x k", (px, y + NOISE_PRESET_DY, font.size("x k")[0] + 20, 24)))
+    if page == "corr":
+        for c, (m, _, _) in enumerate(CORR_MATRICES):
+            for i in range(len(CORR_PAIRS)):
+                out.append(("field", f"{m}.{i}",
+                            (x + 170 + c * 165, y + NOISE_BODY_DY + 74 + i * 30, 140, 24)))
+    else:
+        for kind, key, ry in noise_page_rows(page):
+            if kind == "field":
+                out.append(("field", key, (x + NOISE_FIELD_X, ry, NOISE_FIELD_W, 24)))
     bx = x + 24
     for key in ("apply", "defaults", "close"):
         bw = font.size(key)[0] + 24
@@ -3175,8 +3568,33 @@ def noise_panel_layout(font):
     return out
 
 
+def _noise_world_line(app):
+    """Строка низа: что о мире и фильтре знает остальное окно.  Здесь только
+    показывается -- меняется в панелях M и K (одно свойство -- одно место)."""
+    ph, kf = app.phys, app.kf
+    wind = (f"on {ph['sigma_psi']:g}/{ph['sigma_theta']:g} N*m" if ph["wind"] else "off")
+    return (f"world: wind {wind} (M)   w in filter: {kf['w_model']}   "
+            f"chip: {kf['chip']}, prior: {kf['prior']} (K)   "
+            f"estimator: {est_label(app, app.est_key)}")
+
+
+def _noise_warnings(app):
+    """Красные строки низа: то, что ломает карту молча (docs/noise_panel.md §3.5)."""
+    out = []
+    if app.noise_off_pending:
+        out.append("off: on apply the estimator becomes ideal (true state to the controller);"
+                   " fields are kept")
+    elif app.phys["wind"] and app.kf["w_model"] == "off":
+        out.append("wind is on, but w in filter = off: the filter does not model the push"
+                   " (2.5-5x lower limit, noise_panel.md 3.5)")
+    elif app.est_key == "ideal" and app.est_cmp_key is None:
+        out.append("estimator ideal: the map does not use these numbers")
+    return out
+
+
 def draw_noise_panel(app, screen, pg, font):
-    """Панель шума поверх окна: корреляции каналов ИДУ, три матрицы."""
+    """Панель шума поверх окна: три страницы, общая шапка и низ
+    (docs/noise_panel.md §2.2)."""
     if not app.noise_open:
         return
     veil = pg.Surface((W, H), pg.SRCALPHA)
@@ -3185,60 +3603,105 @@ def draw_noise_panel(app, screen, pg, font):
     x, y, w, h = NOISE_PANEL
     pg.draw.rect(screen, PANEL, NOISE_PANEL, border_radius=6)
     pg.draw.rect(screen, GRID_LINE, NOISE_PANEL, 1, border_radius=6)
-    screen.blit(font.render("NOISE  --  IMU channel correlation  Sigma = D R D",
-                            True, TEXT), (x + 24, y + 16))
-    screen.blit(font.render("R: 3x3, ones on the diagonal, symmetric -- enter the upper triangle",
-                            True, DIM), (x + 24, y + 38))
-    screen.blit(font.render("rho", True, DIM), (x + 24, y + 86))
-    for c, (_, label, _) in enumerate(CORR_MATRICES):
-        screen.blit(font.render(label, True, TEXT), (x + 170 + c * 165, y + 86))
-    for i, (_, _, label) in enumerate(CORR_PAIRS):
-        screen.blit(font.render(label, True, DIM), (x + 24, y + 114 + i * 30))
+    screen.blit(font.render("NOISE  --  what the world does to the robot", True, TEXT),
+                (x + 24, y + 16))
+    note = "filter: R, P0 = these fields (kalman+enc reads the same numbers)"
+    screen.blit(font.render(note, True, DIM), (x + w - 24 - font.size(note)[0], y + 16))
+    screen.blit(font.render("PgUp / PgDn: page", True, DIM), (x + 24, y + 40))
+    screen.blit(font.render("preset:", True, DIM), (x + 24, y + NOISE_PRESET_DY + 4))
+    xk_label_x = None
 
-    for kind, key, rect in noise_panel_layout(font):
-        if kind == "field":
+    page = app.noise_page
+    for kind, key, rect in noise_panel_layout(font, page):
+        if kind == "tab":
+            on = key == page
+            pg.draw.rect(screen, BTN_ON if on else BTN, rect, border_radius=4)
+            label = dict(NOISE_PAGES)[key]
+            screen.blit(font.render(label, True, BG if on else TEXT), (rect[0] + 12, rect[1] + 5))
+        elif kind == "preset":
+            on = key == "off" and app.noise_off_pending
+            pg.draw.rect(screen, BTN_ON if on else BTN, rect, border_radius=4)
+            screen.blit(font.render(key, True, BG if on else TEXT), (rect[0] + 10, rect[1] + 4))
+        elif kind in ("field", "xk"):
+            if kind == "xk":
+                xk_label_x = rect[0] - 8 - font.size("x k:")[0]
             focused = key == app.noise_focus
+            dead = (kind == "field" and key in ("b0_g", "b0_a") and app.kf["chip"] == "raw")
             pg.draw.rect(screen, BG, rect, border_radius=3)
             pg.draw.rect(screen, ACCENT if focused else GRID_LINE, rect, 1, border_radius=3)
             text = app.noise_text.get(key, "")
-            screen.blit(font.render(text + ("_" if focused else ""), True, TEXT),
-                        (rect[0] + 6, rect[1] + 4))
+            screen.blit(font.render(text + ("_" if focused else ""), True,
+                                    GRID_LINE if dead else TEXT), (rect[0] + 6, rect[1] + 4))
         else:
             fill = BTN_ON if key == "apply" else BTN
             pg.draw.rect(screen, fill, rect, border_radius=4)
             screen.blit(font.render(key, True, BG if key == "apply" else TEXT),
                         (rect[0] + 12, rect[1] + 5))
+    if xk_label_x is not None:
+        screen.blit(font.render("x k:", True, DIM), (xk_label_x, y + NOISE_PRESET_DY + 4))
 
-    # Чем датчик окна посчитан сейчас: у ухода окно не задаёт sigma, берутся
-    # значения IMUSensor по умолчанию -- и на горизонте в секунды уход мал,
-    # так что корреляция drift почти не видна.  Лучше сказать это прямо, чем
-    # оставить гадать, почему столбец ничего не меняет.
-    s = IMUSensor(app.system, dt=app.args.dt, mode="imu")
-    lines = [
-        f"white:   sig_a {app.noise['sigma_a']:.1e}, sig_g {app.noise['sigma_g']:.1e}  (sliders)",
-        f"drift:   sig_ba {s.sigma_b[0]:.0e}, sig_bg {s.sigma_b[2]:.0e}, tau inf  (sensor defaults)",
-        f"turn-on: b0_g {app.noise['b0_g']:.1e}, b0_a = 9.8 * b0_g  (slider)",
-    ]
-    if app.est_key == "ideal" and app.est_cmp_key is None:
-        lines.append("estimator ideal: the map does not use the IMU")
-    for i, line in enumerate(lines):
-        screen.blit(font.render(line, True, DIM), (x + 24, y + 220 + i * 20))
+    if page == "corr":
+        by = y + NOISE_BODY_DY
+        screen.blit(font.render("IMU channel correlation  Sigma = D R D", True, TEXT), (x + 24, by))
+        screen.blit(font.render("R: 3x3, ones on the diagonal, symmetric -- enter the upper"
+                                " triangle; one matrix per error component", True, DIM),
+                    (x + 24, by + 22))
+        screen.blit(font.render("rho", True, DIM), (x + 24, by + 52))
+        for c, (_, label, _) in enumerate(CORR_MATRICES):
+            screen.blit(font.render(label, True, TEXT), (x + 170 + c * 165, by + 52))
+        for i, (_, _, label) in enumerate(CORR_PAIRS):
+            screen.blit(font.render(label, True, DIM), (x + 24, by + 78 + i * 30))
+        screen.blit(font.render("filter: knows white n (R); drift and turn-on correlations"
+                                " are the world's only", True, DIM), (x + 24, by + 180))
+    else:
+        live = app.noise_text_values()
+        g = float(app.system.p.g)
+        for kind, key, ry in noise_page_rows(page):
+            if kind == "head":
+                screen.blit(font.render(key, True, ACCENT), (x + 24, ry))
+            elif kind == "chip":
+                chip = app.kf["chip"]
+                text = (f"chip: {chip}  (kalman panel, K)" + (
+                        "   raw = MPU-6050 tolerance/sqrt(3): 0.20 rad/s, 0.28 m/s2"
+                        " -- b0 fields ignored" if chip == "raw" else ""))
+                screen.blit(font.render(text, True, DIM), (x + 40, ry + 4))
+            else:
+                label, unit, _, what = SENSOR_SPEC[key]
+                screen.blit(font.render(label, True, TEXT), (x + 40, ry + 4))
+                screen.blit(font.render(unit, True, DIM), (x + 130, ry + 4))
+                txt = noise_live(key, live, app.args.dt, app.args.horizon, g)
+                if key in ("b0_g", "b0_a") and app.kf["chip"] == "raw":
+                    txt = "ignored: chip raw"
+                screen.blit(font.render(txt, True, TEXT),
+                            (x + NOISE_FIELD_X + NOISE_FIELD_W + 16, ry + 4))
+                screen.blit(font.render(what, True, DIM), (x + 130, ry + 26))
+
+    screen.blit(font.render(_noise_world_line(app), True, DIM), (x + 24, y + h - 120))
+    for i, line in enumerate(_noise_warnings(app)):
+        screen.blit(font.render(line, True, WARN), (x + 24, y + h - 98 + 20 * i))
     if app.noise_error:
-        screen.blit(font.render(app.noise_error, True, (235, 110, 90)),
-                    (x + 24, y + h - 78))
+        screen.blit(font.render(app.noise_error, True, WARN), (x + 24, y + h - 72))
     hint = "Enter apply   Tab next   Esc close"
     screen.blit(font.render(hint, True, DIM), (x + w - 24 - font.size(hint)[0], y + h - 39))
 
 
 def noise_click(app, pos, font):
     """Клик при открытой панели шума. Вне панели -- ничего (модальная)."""
-    for kind, key, (rx, ry, rw, rh) in noise_panel_layout(font):
+    for kind, key, (rx, ry, rw, rh) in noise_panel_layout(font, app.noise_page):
         if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
-            if kind == "field":
+            if kind == "tab":
+                app.set_noise_page(key)
+            elif kind == "preset":
+                app.fill_noise_preset(key)
+            elif kind in ("field", "xk"):
                 app.noise_focus = key
             elif key == "apply":
                 noise_submit(app)
             elif key == "defaults":
+                # С чем окно запущено, и каналы независимы; не применяет.
+                app.noise_off_pending = False
+                for k, v in app._noise_start.items():
+                    app.noise_text[k] = noise_text_of(k, v)
                 for m, _, _ in CORR_MATRICES:
                     for i, v in enumerate(DEFAULT_CORR[m]):
                         app.noise_text[f"{m}.{i}"] = f"{v:g}"
@@ -3256,20 +3719,27 @@ def noise_submit(app):
 
 
 def noise_key(app, event, pg):
-    """Клавиша при открытой панели шума; то же поведение, что settings_key."""
+    """Клавиша при открытой панели шума; то же поведение, что settings_key,
+    плюс PgUp / PgDn -- страница.  Цифры под страницы не годятся: они нужны
+    для ввода чисел."""
+    pages = [key for key, _ in NOISE_PAGES]
     if event.key == pg.K_ESCAPE:
         app.noise_open = False
     elif event.key in (pg.K_RETURN, pg.K_KP_ENTER):
         noise_submit(app)
+    elif event.key in (pg.K_PAGEDOWN, pg.K_PAGEUP):
+        step = 1 if event.key == pg.K_PAGEDOWN else -1
+        app.set_noise_page(pages[(pages.index(app.noise_page) + step) % len(pages)])
     elif event.key in (pg.K_TAB, pg.K_DOWN, pg.K_UP):
+        keys = NOISE_PAGE_KEYS[app.noise_page]
         step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
-        i = NOISE_KEYS.index(app.noise_focus) if app.noise_focus else -1
-        app.noise_focus = NOISE_KEYS[(i + step) % len(NOISE_KEYS)]
+        i = keys.index(app.noise_focus) if app.noise_focus in keys else -1
+        app.noise_focus = keys[(i + step) % len(keys)]
     elif app.noise_focus is not None:
         text = app.noise_text.get(app.noise_focus, "")
         if event.key == pg.K_BACKSPACE:
             app.noise_text[app.noise_focus] = text[:-1]
-        elif event.unicode and event.unicode in SETTINGS_CHARS:
+        elif event.unicode and event.unicode in NOISE_CHARS:
             app.noise_text[app.noise_focus] = text + event.unicode
     return True
 
@@ -3288,7 +3758,8 @@ def filter_view_rect():
 def view_buttons(app, font):
     """[(key, label, rect)] в строке заголовка PLANT, справа."""
     out, right = [], ANIM[0] + ANIM[2]
-    for key, label in (("C", "[B] biases"), ("B", "[H] y vs h(x,u)"), ("A", "[V] P ellipse")):
+    for key, label in (("D", "[X] x^-x"), ("C", "[B] biases"), ("B", "[H] y vs h(x,u)"),
+                       ("A", "[V] P ellipse")):
         w = font.size(label)[0] + 14
         right -= w
         out.append((key, label, (right, ANIM[1] - 22, w, 20)))
@@ -3635,6 +4106,42 @@ def draw_view_c(app, screen, pg, font):
             "NEES(b), map", t[k], band=(lo, hi, ESTIMATE), log=True, clip_q=100)
 
 
+VIEW_D_CHANNELS = ((I_PSI, "psi", "rad"), (I_THETA, "theta", "rad"),
+                   (I_DPSI, "dpsi", "rad/s"), (I_DTHETA, "dtheta", "rad/s"))
+
+
+def draw_view_d(app, screen, pg, font):
+    """Вид D (kalman_views §20, решение Глеба 01.10, вариант б): ошибка
+    оценки e = x^ - x по каждой компоненте состояния.  x^ -- ровно то, что
+    на этом шаге получил регулятор (Trajectory.x_hat диагностического
+    пересчёта); коридор +-sqrt(P_ii) -- что фильтр думает о своей ошибке.
+    Ось линейная: ошибка состояния живёт около постоянного уровня, и важен
+    её знак.  Подписи: e сейчас, СКО за прогон и доля времени внутри
+    коридора (у честного фильтра ~68 %)."""
+    x, y, w, h = filter_view_rect()
+    d = app.diag
+    k = app.diag_frame()
+    t = d["t"]
+    n = min(len(t), len(d["x_hat"]))
+    t = t[:n]
+    E = d["x_hat"][:n] - d["x"][:n]
+    P = d["P"][:n]
+    top = y + 34
+    row_h = (h - 44) // 4
+    k = min(k, n - 1)
+    for r, (i, name, unit) in enumerate(VIEW_D_CHANNELS):
+        e = E[:, i]
+        sp = np.sqrt(np.maximum(P[:, i, i], 0.0))
+        ok = np.isfinite(e) & np.isfinite(sp)
+        rms = float(np.sqrt(np.mean(e[ok] ** 2))) if ok.any() else float("nan")
+        inside = float(np.mean(np.abs(e[ok]) <= sp[ok])) if ok.any() else float("nan")
+        _series(screen, pg, font, (x + 12, top + r * row_h, w - 24, row_h - 6), t,
+                [(e, ACCENT, f"e {e[k]:+.1e}"),
+                 (np.full(n, np.nan), ESTIMATE, f"sqrtP {sp[k]:.1e}"),
+                 (np.full(n, np.nan), DIM, f"rms {rms:.1e}  {100 * inside:.0f}% in")],
+                name, t[k], band=(-sp, sp, ESTIMATE))
+
+
 def draw_view(app, screen, pg, font):
     if app.view is None:
         return
@@ -3643,13 +4150,15 @@ def draw_view(app, screen, pg, font):
     pg.draw.rect(screen, GRID_LINE, rect, 1, border_radius=6)
     title = {"A": "VIEW A  --  phase plane (psi, dpsi), 1-sigma ellipse of P",
              "B": "VIEW B  --  y and h(x^-,u) minus clean h(x,u);  band +-sqrt(S)",
-             "C": "VIEW C  --  biases: estimate error |b^ - b| vs sqrt(P_bb)"}
+             "C": "VIEW C  --  biases: estimate error |b^ - b| vs sqrt(P_bb)",
+             "D": "VIEW D  --  x^ - x, the estimate the controller got;  band +-sqrt(P)"}
     screen.blit(font.render(title[app.view], True, TEXT), (rect[0] + 12, rect[1] + 10))
     if app.diag is None:
         screen.blit(font.render(app.diag_note or "select a cell", True, ACCENT),
                     (rect[0] + 12, rect[1] + 40))
         return
-    {"A": draw_view_a, "B": draw_view_b, "C": draw_view_c}[app.view](app, screen, pg, font)
+    {"A": draw_view_a, "B": draw_view_b, "C": draw_view_c,
+     "D": draw_view_d}[app.view](app, screen, pg, font)
 
 
 # --- кнопки мира, модели и фильтра (ER-025) ----------------------------------
@@ -3659,7 +4168,9 @@ def draw_view(app, screen, pg, font):
 def world_buttons(app, font):
     """[(key, label, rect)] справа налево: kalman, model, world."""
     out, right = [], W - 24
-    for key, label in (("kalman", "kalman"), ("model", "model"),
+    # «filter», а не «kalman»: панель настраивает и комплементарные
+    # оцениватели (страница 3), а ширина та же -- ряд не сдвигается.
+    for key, label in (("kalman", "filter"), ("model", "model"),
                        ("world", "world: " + ("wind" if app.phys["wind"] else "clean"))):
         w = font.size(label)[0] + 18
         right -= w
@@ -3851,60 +4362,122 @@ def model_key(app, event, pg):
 # --- панель kalman --------------------------------------------------------------
 
 
-def kf_layout(font):
+KF_TABS_DY, KF_BODY_DY = 66, 110
+KF_CTRL_X, KF_HELP_X = 250, 420         # сдвиг выбора/поля и справки от края панели
+
+
+def kf_page_rows(page):
+    """Строки страницы панели оценивателя с их y: [(kind, key, y)].  Одна
+    таблица и для раскладки, и для отрисовки (как noise_page_rows)."""
+    _, y0, _, _ = KF_PANEL
+    y = y0 + KF_BODY_DY
+    out = []
+    for kind, key in KF_PAGE_ROWS[page]:
+        if kind == "head":
+            if out:
+                y += 8
+            out.append((kind, key, y))
+            y += 26
+        else:
+            out.append((kind, key, y))
+            y += KF_ROW
+    return out
+
+
+def kf_layout(font, page=None):
+    """Раскладка панели оценивателя: [(kind, key, rect)] -- вкладки, выборы и
+    поля текущей страницы, кнопки низа.  page=None -- первая страница."""
+    page = page or KF_PAGES[0][0]
     x, y, w, h = KF_PANEL
     out = []
-    for i, key in enumerate(KF_CHOICES):
-        out.append(("choice", key, (x + 150, y + 84 + i * 30, 150, 24)))
-    for i, key in enumerate(KF_FIELDS):
-        out.append(("field", key, (x + 520, y + 84 + i * 30, 130, 24)))
+    tx = x + 24
+    for key, label in KF_PAGES:
+        tw = font.size(label)[0] + 24
+        out.append(("tab", key, (tx, y + KF_TABS_DY, tw, 26)))
+        tx += tw + 8
+    for kind, key, ry in kf_page_rows(page):
+        if kind == "choice":
+            out.append(("choice", key, (x + KF_CTRL_X, ry, 150, 24)))
+        elif kind == "field":
+            out.append(("field", key, (x + KF_CTRL_X, ry, 130, 24)))
     return out + _bottom_buttons(font, KF_PANEL)
+
+
+def kf_enabled(text: dict, key: str) -> bool:
+    """Действует ли строка при текущих выборах -- иначе она гаснет."""
+    if key in ("sigma_psi", "sigma_theta", "tau_w"):
+        return text.get("w_model") == "own"
+    if key in ("T_c", "sigma_jig"):
+        return text.get("prior") == "calibrate" and text.get("bias_state") == "on"
+    if key in ("drift", "prior", "P0_scale"):
+        return text.get("bias_state") == "on"
+    return True
 
 
 def draw_kf_panel(app, screen, pg, font):
     if not app.kf_open:
         return
     x, y, w, h = KF_PANEL
-    _draw_veil(screen, pg, KF_PANEL, "KALMAN  --  chip, bias prior, disturbance model",
-               "chip is the world's: it changes the IMU of EVERY estimator", font)
-    cl = {"chip": "chip", "prior": "bias prior", "drift": "bias drift",
-          "w_model": "w in filter"}
-    for i, key in enumerate(KF_CHOICES):
-        screen.blit(font.render(cl[key], True, DIM), (x + 24, y + 88 + i * 30))
-    for i, key in enumerate(KF_FIELDS):
-        screen.blit(font.render(KF_LABELS[key], True, DIM), (x + 330, y + 88 + i * 30))
-    for kind, key, rect in kf_layout(font):
-        if kind == "choice":
-            _draw_button(screen, pg, font, rect, app.kf_text.get(key, ""),
-                         primary=app.kf_text.get(key) not in (DEFAULT_KF[key],))
+    _draw_veil(screen, pg, KF_PANEL, "ESTIMATOR  --  what the filter models and how it is tuned",
+               "the world is set in noise (N) and model (M); here -- only what the filter "
+               "believes", font)
+    page = app.kf_page
+    for kind, key, rect in kf_layout(font, page):
+        if kind == "tab":
+            _draw_button(screen, pg, font, rect, dict(KF_PAGES)[key], primary=key == page)
+        elif kind == "choice":
+            value = app.kf_text.get(key, "")
+            if kf_enabled(app.kf_text, key):
+                _draw_button(screen, pg, font, rect, value,
+                             primary=value != DEFAULT_KF[key])
+            else:
+                _draw_field(screen, pg, font, rect, value, False, False)
         elif kind == "field":
-            enabled = not key.startswith(("sigma_psi", "sigma_theta", "tau_w")) or \
-                app.kf_text.get("w_model") == "own"
-            if key in ("T_c", "sigma_jig"):
-                enabled = app.kf_text.get("prior") == "calibrate"
             _draw_field(screen, pg, font, rect, app.kf_text.get(key, ""),
-                        key == app.kf_focus, enabled)
+                        key == app.kf_focus, kf_enabled(app.kf_text, key))
         else:
             _draw_button(screen, pg, font, rect, key, primary=key == "apply")
-    notes = ["raw = MPU-6050 turn-on bias, tolerance/sqrt(3): gyro 0.20 rad/s, accel 0.28 m/s^2",
-             "calibrate = stand for T_c before the run (docs/accel_kalman.md §4.3)",
-             "matched = the world's wind parameters;  own = the fields on the right"]
-    if app.est_key != "kalman" and app.est_cmp_key != "kalman":
-        notes.append("kalman+enc is not selected: only the chip changes the map now")
+    for kind, key, ry in kf_page_rows(page):
+        if kind == "head":
+            screen.blit(font.render(key, True, ACCENT), (x + 24, ry))
+        elif kind == "tau":
+            screen.blit(font.render("tau", True, TEXT), (x + 40, ry + 4))
+            screen.blit(font.render(f"{app.noise['tau']:.3f} s  (main slider `comp tau`)",
+                                    True, TEXT), (x + KF_CTRL_X, ry + 4))
+            screen.blit(font.render("gyro+enc = inf,  accel+enc = 0", True, DIM),
+                        (x + KF_HELP_X + 160, ry + 4))
+        else:
+            on = kf_enabled(app.kf_text, key)
+            screen.blit(font.render(KF_LABELS[key], True, TEXT if on else GRID_LINE),
+                        (x + 40, ry + 4))
+            screen.blit(font.render(KF_HELP[key], True, DIM if on else GRID_LINE),
+                        (x + KF_HELP_X, ry + 4))
+    notes = []
+    if page in ("model", "tune") and "kalman" not in (app.est_key, app.est_cmp_key):
+        notes.append("kalman+enc is not selected: of these pages only the chip changes the map now")
+    if page == "comp" and not ({app.est_key, app.est_cmp_key} & {"comp", "gyro", "acc"}):
+        notes.append("no complementary estimator is selected: this page changes nothing now")
+    if app.kf_text.get("encoder") == "off":
+        notes.append("encoder off: the wheel (theta, dtheta) is unobservable -- the LQR wheel "
+                     "gains act on a guess")
     for i, line in enumerate(notes):
-        screen.blit(font.render(line, True, DIM), (x + 24, y + 310 + i * 20))
+        screen.blit(font.render(line, True, (235, 110, 90)), (x + 24, y + h - 120 + i * 20))
     if app.kf_error:
-        screen.blit(font.render(app.kf_error, True, (235, 110, 90)), (x + 24, y + h - 78))
-    hint = "Enter apply   Tab next   Esc close"
+        screen.blit(font.render(app.kf_error, True, (235, 110, 90)), (x + 24, y + h - 72))
+    hint = "Enter apply   Tab next   PgUp/PgDn page   Esc close"
     screen.blit(font.render(hint, True, DIM), (x + w - 24 - font.size(hint)[0], y + h - 39))
 
 
 def kf_click(app, pos, font):
-    for kind, key, (rx, ry, rw, rh) in kf_layout(font):
+    for kind, key, (rx, ry, rw, rh) in kf_layout(font, app.kf_page):
         if rx <= pos[0] < rx + rw and ry <= pos[1] < ry + rh:
-            if kind == "field":
+            if kind == "tab":
+                app.set_kf_page(key)
+            elif kind == "field":
                 app.kf_focus = key
             elif kind == "choice":
+                if not kf_enabled(app.kf_text, key):
+                    return
                 opts = KF_CHOICES[key]
                 cur = app.kf_text.get(key, opts[0])
                 app.kf_text[key] = opts[(opts.index(cur) + 1) % len(opts)]
@@ -3926,14 +4499,20 @@ def kf_submit(app):
 
 
 def kf_key(app, event, pg):
+    pages = [key for key, _ in KF_PAGES]
     if event.key == pg.K_ESCAPE:
         app.kf_open = False
     elif event.key in (pg.K_RETURN, pg.K_KP_ENTER):
         kf_submit(app)
+    elif event.key in (pg.K_PAGEDOWN, pg.K_PAGEUP):
+        step = 1 if event.key == pg.K_PAGEDOWN else -1
+        app.set_kf_page(pages[(pages.index(app.kf_page) + step) % len(pages)])
     elif event.key in (pg.K_TAB, pg.K_DOWN, pg.K_UP):
-        step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
-        i = KF_FIELDS.index(app.kf_focus) if app.kf_focus in KF_FIELDS else -1
-        app.kf_focus = KF_FIELDS[(i + step) % len(KF_FIELDS)]
+        keys = KF_PAGE_FIELDS[app.kf_page]
+        if keys:
+            step = -1 if (event.key == pg.K_UP or event.mod & pg.KMOD_SHIFT) else 1
+            i = keys.index(app.kf_focus) if app.kf_focus in keys else -1
+            app.kf_focus = keys[(i + step) % len(keys)]
     elif app.kf_focus is not None:
         _type_into(app.kf_text, app.kf_focus, event, pg)
     return True
@@ -4058,10 +4637,10 @@ def draw_header(app, screen, pg, font, big):
     if app.cmp_key is not None:
         row.append(("line", GHOST, "compare: " + CONTROLLER_LABEL[app.cmp_key]))
     if app.est_key != "ideal":
-        row.append(("line", ESTIMATE, "estimate: " + ESTIMATOR_LABEL[app.est_key]))
+        row.append(("line", ESTIMATE, "estimate: " + est_label(app, app.est_key)))
     if app.est_cmp_key is not None:
         row.append(("line", GHOST_EST,
-                    "vs est: " + ESTIMATOR_LABEL[app.est_cmp_key]))
+                    "vs est: " + est_label(app, app.est_cmp_key)))
     row.append(("ring", ACCENT, "selected cell"))
     # Ключ к дорожке фаз (ER-016) -- в ту же строку «выбора»: фаза
     # принадлежит выбранному регулятору, а не задаче, и в строке графика u
@@ -4077,7 +4656,7 @@ def draw_header(app, screen, pg, font, big):
     # сделала бы её враньём. Кнопки без цифры доступны мышью.
     n_digits = min(9, len(CONTROLLER_KEYS))
     hint = ("click a cell  |  1-%d main, Shift+1-%d compare  |  E estimator  |  "
-            "[ ] u_max, L no limit  |  W M K P V H B  |  time: <- ->  |  "
+            "[ ] u_max, L no limit  |  W M K P V H B X  |  time: <- ->  |  "
             "SPACE pause  R restart  ESC quit" % (n_digits, n_digits))
     screen.blit(font.render(hint, True, GRID_LINE),
                 (W - 24 - font.size(hint)[0], H - 24))
@@ -4322,6 +4901,8 @@ def run(app, max_frames=None, screenshot=None):
                     app.toggle_view("B")
                 elif event.key == pg.K_b:
                     app.toggle_view("C")
+                elif event.key == pg.K_x:
+                    app.toggle_view("D")
                 elif event.key == pg.K_t:
                     # Дорого (секунды), поэтому по явной просьбе, а не на
                     # каждом движении слайдера.
@@ -4425,8 +5006,19 @@ def build_parser():
                    help="СКО смещения включения гироскопа, рад/с")
     p.add_argument("--tau", type=float, default=0.30,
                    help="постоянная времени комплементарного фильтра, с")
+    p.add_argument("--b0-a", type=float, default=None,
+                   help="СКО смещения включения акселерометра, м/с^2 (по умолчанию 9.8 * b0_g)")
+    # Уход: умолчания -- прежние умолчания IMUSensor (docs/imu_noise.md §6).
+    p.add_argument("--sigma-bg", type=float, default=1e-5,
+                   help="интенсивность ухода гироскопа, рад/с^2/sqrt(Гц)")
+    p.add_argument("--sigma-ba", type=float, default=1e-4,
+                   help="интенсивность ухода акселерометра, м/с^3/sqrt(Гц)")
+    p.add_argument("--tau-g", type=float, default=float("inf"),
+                   help="время корреляции ухода гироскопа, с (inf -- блуждание)")
+    p.add_argument("--tau-a", type=float, default=float("inf"),
+                   help="время корреляции ухода акселерометра, с (inf -- блуждание)")
     p.add_argument("--counts", type=int, default=2048,
-                   help="меток на оборот у моторного энкодера (он во всех вариантах, кроме ideal)")
+                   help="меток на оборот у моторного энкодера (он во всех вариантах, кроме ideal); 0 -- без квантования")
     p.add_argument("--seed", type=int, default=0,
                    help="зерно шума датчика (при --estimator, отличном от ideal)")
     # --- мир, номинал, фильтр Калмана (ER-025, docs/explorer_kalman.md §7) ---
@@ -4451,6 +5043,19 @@ def build_parser():
     p.add_argument("--kf-q-acc", type=float, default=None, help="q_acc фильтра")
     p.add_argument("--kf-iter", type=int, default=None, help="итерации (1 -- EKF)")
     p.add_argument("--kf-drift", action="store_true", help="уход смещения в модели фильтра")
+    # Панель оценивателя (docs/estimator_panel.md): что Калман учитывает и как настроен.
+    p.add_argument("--kf-bias", choices=list(KF_CHOICES["bias_state"]), default=None,
+                   help="смещения ИДУ в состоянии Калмана (off -- фильтр считает их нулём)")
+    p.add_argument("--kf-encoder", choices=list(KF_CHOICES["encoder"]), default=None,
+                   help="энкодер в измерениях Калмана (off -- один ИДУ, колесо ненаблюдаемо)")
+    p.add_argument("--accel-comp", choices=list(KF_CHOICES["accel_comp"]), default=None,
+                   help="компенсация кажущейся вертикали у комплементарных (A31)")
+    p.add_argument("--kf-r-scale", type=float, default=None,
+                   help="шум ИДУ, в который верит фильтр = панель шума x k")
+    p.add_argument("--kf-p0-scale", type=float, default=None,
+                   help="априорное СКО смещений фильтра = b0 x k")
+    p.add_argument("--kf-psi0-std", type=float, default=None, help="psi0_std фильтра, рад")
+    p.add_argument("--kf-dtheta0-std", type=float, default=None, help="dtheta0_std фильтра, рад/с")
     p.add_argument("--eps", type=float, default=0.05,
                    help="bang-eps: реле отдаёт управление ЛКР, когда |psi| < eps, рад")
     p.add_argument("--energy", choices=["tilt", "total"], default="tilt",
